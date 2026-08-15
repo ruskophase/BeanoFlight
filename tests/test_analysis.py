@@ -40,7 +40,13 @@ class EndToEndAnalysisTests(unittest.TestCase):
 
         background = np.full((300, 400, 3), 20, dtype=np.uint8)
         detector = BeanDetector(
-            DetectorSettings(threshold=15, min_area_px=300, max_area_px=5_000)
+            DetectorSettings(
+                threshold=15,
+                min_area_px=300,
+                max_area_px=5_000,
+                min_width_px=10,
+                min_height_px=10,
+            )
         )
         layout = GateLayout(calibration.sorting_line_y())
         engine = AnalysisEngine(calibration, detector, background, gate_layout=layout)

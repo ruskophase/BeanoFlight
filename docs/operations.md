@@ -4,7 +4,7 @@
 2. Confirm that the status line says `exact FastCap timestamps`.
 3. Confirm that the metric calibration has loaded and reports its RMS.
 4. Find a frame without beans and choose **Use current frame as background**.
-   For a more representative model, choose **Choose 20 empty frames for
+   For a more representative model, choose **Choose 11 empty frames for
    background**. Mark each stratified candidate `Empty` or `Contains
    foreground`; only accepted frames enter the median.
 5. Enable **Inspect frozen frame step-by-step**.

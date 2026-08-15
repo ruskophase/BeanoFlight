@@ -106,7 +106,7 @@ class BackgroundSelectionDialog(tk.Toplevel):
         parent: tk.Misc,
         source: RecordingVideoSource,
         *,
-        requested_frames: int = 20,
+        requested_frames: int = 11,
     ) -> None:
         super().__init__(parent)
         self.title("BeanoFlight — choose empty background frames")
@@ -443,7 +443,7 @@ class BeanoFlightApp(tk.Tk):
         )
         ttk.Button(
             parent,
-            text="Choose 20 empty frames for background…",
+            text="Choose 11 empty frames for background…",
             command=self.build_guided_background,
         ).grid(
             row=button_row + 3, column=0, columnspan=2, sticky=tk.EW, pady=3
@@ -596,7 +596,7 @@ class BeanoFlightApp(tk.Tk):
             self.calibration_var.set("No homography.json found — detector inspection only")
         self.status_var.set(
             "Frame 1 is the temporary background; select a clean frame or choose "
-            "20 confirmed-empty frames."
+            "11 confirmed-empty frames."
         )
         self._refresh_display()
 
@@ -676,7 +676,7 @@ class BeanoFlightApp(tk.Tk):
             return
         self.stop_work()
         result = BackgroundSelectionDialog(
-            self, self.source, requested_frames=20
+            self, self.source, requested_frames=11
         ).wait_for_result()
         if result is None:
             self.status_var.set("Background selection cancelled; existing background retained.")

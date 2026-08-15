@@ -49,13 +49,13 @@ pixels, and inspector masks are enlarged to the native display size without
 smoothing so individual processing pixels remain visible.
 
 Use **Use current frame as background** on a genuinely empty frame, or choose
-**Choose 20 empty frames for background**. The guided selector presents frames
-chosen randomly within twenty evenly distributed sections of the recording,
+**Choose 11 empty frames for background**. The guided selector presents frames
+chosen randomly within eleven evenly distributed sections of the recording,
 followed by replacement passes when a candidate contains foreground. Mark each
 candidate empty or containing foreground; only human-confirmed empty frames
 enter the temporal median. The selected indices and random seed are retained
 in the exported analysis. Median calculation is tiled to avoid making a second
-full-size stack of all twenty colour frames. A good background is the most
+full-size stack of all eleven colour frames. A good background is the most
 important prerequisite for useful tuning.
 
 ## Input contract
@@ -112,6 +112,8 @@ beano-flight recording/ --hole-pitch-mm 9.16 --sorting-offset-mm 30
 
 - Static-background OpenCV segmentation with no adaptive exposure or image
   normalization.
+- Native-pixel component defaults of at least 2,000 px area, 50 px width and
+  50 px height.
 - Exact optimal assignment for the expected small set of at most ten beans.
 - Four-state Kalman model: horizontal/vertical position and velocity.
 - Known gravity as the vertical control input, with process noise for drag,

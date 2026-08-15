@@ -26,11 +26,11 @@ class DetectorSettings:
     open_iterations: int = 1
     dilate_kernel: int = 3
     dilate_iterations: int = 0
-    min_area_px: int = 350
+    min_area_px: int = 2_000
     max_area_px: int = 40_000
-    min_width_px: int = 12
+    min_width_px: int = 50
     max_width_px: int = 260
-    min_height_px: int = 12
+    min_height_px: int = 50
     max_height_px: int = 260
     min_solidity: float = 0.55
 
@@ -342,7 +342,7 @@ def temporal_median_background(frames: Iterable[np.ndarray]) -> np.ndarray:
     reference_shape = selected[0].shape
     if any(frame.shape != reference_shape or frame.dtype != np.uint8 for frame in selected):
         raise DetectorError("background frames must have matching uint8 shapes")
-    # Twenty native colour frames are already about 95 MB. Work in row tiles
+    # Eleven native Beano colour frames are already about 52 MB. Work in row tiles
     # so calculating the median does not create another full-size frame stack.
     result = np.empty(reference_shape, dtype=np.uint8)
     tile_rows = 64

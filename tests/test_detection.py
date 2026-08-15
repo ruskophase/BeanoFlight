@@ -51,6 +51,12 @@ class DetectionPipelineTests(unittest.TestCase):
         rendered = render_pipeline_stage(threshold)
         self.assertEqual(rendered.shape, self.frame.shape)
 
+    def test_default_component_minimums_match_review_tuning(self):
+        settings = DetectorSettings()
+        self.assertEqual(settings.min_area_px, 2_000)
+        self.assertEqual(settings.min_width_px, 50)
+        self.assertEqual(settings.min_height_px, 50)
+
     def test_rejected_component_remains_visible_in_final_debug_stage(self):
         settings = DetectorSettings(min_area_px=5_000, max_area_px=10_000)
         result = BeanDetector(settings).inspect(self.frame, self.background)

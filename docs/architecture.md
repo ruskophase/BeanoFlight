@@ -66,9 +66,9 @@ it is never published to inference or sorting consumers.
 
 ## Background models
 
-Recorded-video Review mode uses a temporal median of up to twenty
+Recorded-video Review mode uses a temporal median of up to eleven
 human-confirmed empty frames. Candidate frames are random within evenly spaced
-temporal strata. The first review pass presents one frame from each of twenty
+temporal strata. The first review pass presents one frame from each of eleven
 full-video time bands; three further passes provide replacements for rejected
 frames. This gives coverage across the recording without silently including
 moving beans. The accepted indices and selection seed are analysis provenance.
