@@ -1,0 +1,43 @@
+# Review workflow
+
+1. Open a FastCap recording folder or its `CamL-calibrated.mkv`.
+2. Confirm that the status line says `exact FastCap timestamps`.
+3. Confirm that the metric calibration has loaded and reports its RMS.
+4. Find a frame without beans and choose **Use current frame as background**.
+   If none is available, build the 11-frame temporal median.
+5. Enable **Inspect frozen frame step-by-step**.
+6. Move through the ten OpenCV stages. The caption records every relevant
+   setting used for the displayed result.
+7. Adjust one setting at a time and press **Apply settings**. Kernel Spinboxes
+   move in odd increments so OpenCV always receives a centred morphology
+   kernel.
+8. Pay particular attention to the threshold mask and final accepted/rejected
+   component view. A good mask covers the bean but does not join neighbouring
+   beans or retain background texture.
+9. Turn off the inspector and choose **Analyse clip**.
+10. Step through the completed result. Check for false detections, missed
+    beans, ID switches, implausible velocity and excessively broad gate
+    probabilities.
+11. Export the compact JSON analysis when the result should be compared or
+    discussed.
+
+## Existing FastCap overlays
+
+Current FastCap derivatives contain a 30-pixel information bar at the bottom.
+Test-override media also contains a 38-pixel warning at the top. These are
+static and therefore normally become part of the background, but bean pixels
+behind the burned overlays cannot be recovered. Track prediction bridges the
+small lower blind strip. A future clean machine-analysis derivative is
+recommended.
+
+## Interpreting probability
+
+The thick interval on the sorting line is approximately the predicted 95%
+horizontal interval of the bean centre. Each gate percentage is the Gaussian
+probability that the centre crosses within that 5 mm interval. Gate
+probabilities may sum to less than 100% when the distribution extends beyond
+the displayed virtual gate bank.
+
+These probabilities do not yet model bean width, nozzle plume width, valve
+latency or category-specific sorting policy. They must not be used to actuate
+real hardware in version 0.1.
