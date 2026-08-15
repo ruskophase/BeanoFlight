@@ -3,27 +3,30 @@
 from __future__ import annotations
 
 import queue
+import secrets
 import threading
 import time
 import tkinter as tk
+from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import cv2
-import numpy as np
 from PIL import Image, ImageTk
 
 from .analysis import AnalysisEngine, AnalysisRun, analyse_source, export_run_json
+from .background import BackgroundProvenance, stratified_random_candidates
 from .calibration import (
     CalibrationError,
     MetricPlaneCalibration,
     find_pinkplane_homography,
 )
 from .detection import BeanDetector, DetectorError, DetectorSettings, temporal_median_background
-from .display import render_analysis, render_pipeline_stage
+from .display import draw_birth_margins, render_analysis, render_pipeline_stage
 from .models import FrameAnalysis, PipelineStage
 from .prediction import GateLayout
 from .source import RecordingVideoSource, SourceError
+from .tracking import TrackerSettings
 
 
 VIDEO_TYPES = [
@@ -95,6 +98,134 @@ class ImagePane(ttk.Frame):
         )
 
 
+class BackgroundSelectionDialog(tk.Toplevel):
+    """Collect human-confirmed empty frames from stratified random candidates."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        source: RecordingVideoSource,
+        *,
+        requested_frames: int = 20,
+    ) -> None:
+        super().__init__(parent)
+        self.title("BeanoFlight — choose empty background frames")
+        self.geometry("1280x850")
+        self.minsize(900, 650)
+        self.transient(parent)
+        self.source = source
+        self.target = min(max(1, requested_frames), source.metadata.frame_count)
+        self.seed = secrets.randbits(63)
+        self.candidates = stratified_random_candidates(
+            source.metadata.frame_count,
+            self.target,
+            candidates_per_stratum=4,
+            seed=self.seed,
+        )
+        self.position = 0
+        self.accepted: list[int] = []
+        self.result: tuple[tuple[int, ...], int] | None = None
+        self.detail_var = tk.StringVar()
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        heading = ttk.Frame(self, padding=(12, 10))
+        heading.pack(fill=tk.X)
+        ttk.Label(
+            heading,
+            text="Does this frame contain any bean or other foreground object?",
+            style="Heading.TLabel",
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            heading,
+            textvariable=self.detail_var,
+            style="Muted.TLabel",
+        ).pack(anchor=tk.W, pady=(4, 0))
+        self.image_pane = ImagePane(self)
+        self.image_pane.pack(fill=tk.BOTH, expand=True, padx=12)
+        buttons = ttk.Frame(self, padding=12)
+        buttons.pack(fill=tk.X)
+        ttk.Button(
+            buttons,
+            text="Empty — use this frame",
+            command=self._accept,
+        ).pack(side=tk.LEFT, expand=True, fill=tk.X)
+        ttk.Button(
+            buttons,
+            text="Contains foreground — skip",
+            command=self._reject,
+        ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=8)
+        ttk.Button(buttons, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
+        self.bind("<Key-y>", lambda _event: self._accept())
+        self.bind("<Key-Y>", lambda _event: self._accept())
+        self.bind("<Key-n>", lambda _event: self._reject())
+        self.bind("<Key-N>", lambda _event: self._reject())
+        self.grab_set()
+        self._show_candidate()
+
+    def wait_for_result(self) -> tuple[tuple[int, ...], int] | None:
+        self.wait_window()
+        return self.result
+
+    def _show_candidate(self) -> None:
+        if self.position >= len(self.candidates):
+            self._finish_exhausted()
+            return
+        index = self.candidates[self.position]
+        try:
+            frame = self.source.frame(index)
+        except SourceError as exc:
+            messagebox.showerror("Background selection", str(exc), parent=self)
+            self._cancel()
+            return
+        stage = PipelineStage(
+            "background_candidate",
+            "Background candidate — human decision required",
+            frame,
+            (
+                f"video_frame={index + 1} of {self.source.metadata.frame_count}",
+                f"candidate={self.position + 1} of {len(self.candidates)}",
+                f"confirmed_empty={len(self.accepted)} of {self.target}",
+            ),
+            "Accept only a frame containing no bean or other transient foreground object.",
+        )
+        self.image_pane.set_bgr(render_pipeline_stage(stage))
+        self.detail_var.set(
+            f"Candidate video frame {index + 1:,}. "
+            f"Confirmed empty: {len(self.accepted)} / {self.target}. "
+            "Keyboard shortcuts: Y = empty, N = foreground."
+        )
+
+    def _accept(self) -> None:
+        if self.position >= len(self.candidates):
+            return
+        self.accepted.append(self.candidates[self.position])
+        if len(self.accepted) >= self.target:
+            self.result = (tuple(self.accepted), self.seed)
+            self.destroy()
+            return
+        self.position += 1
+        self._show_candidate()
+
+    def _reject(self) -> None:
+        if self.position >= len(self.candidates):
+            return
+        self.position += 1
+        self._show_candidate()
+
+    def _finish_exhausted(self) -> None:
+        if self.accepted and messagebox.askyesno(
+            "Background selection",
+            f"Only {len(self.accepted)} empty frames were confirmed. Use those frames?",
+            parent=self,
+        ):
+            self.result = (tuple(self.accepted), self.seed)
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+
 class BeanoFlightApp(tk.Tk):
     def __init__(
         self,
@@ -117,7 +248,9 @@ class BeanoFlightApp(tk.Tk):
         self.source: RecordingVideoSource | None = None
         self.calibration: MetricPlaneCalibration | None = None
         self.background = None
+        self.background_provenance = BackgroundProvenance("none", ())
         self.detector_settings = DetectorSettings()
+        self.tracker_settings = TrackerSettings()
         self.run: AnalysisRun | None = None
         self.current_index = 0
         self.pipeline_stages: tuple[PipelineStage, ...] = ()
@@ -141,6 +274,12 @@ class BeanoFlightApp(tk.Tk):
         self.stage_explanation_var = tk.StringVar(value="")
         self.frame_var = tk.IntVar(value=0)
         self._setting_vars: dict[str, tk.StringVar] = {}
+        self.left_margin_var = tk.StringVar(
+            value=str(self.tracker_settings.left_birth_margin_px)
+        )
+        self.right_margin_var = tk.StringVar(
+            value=str(self.tracker_settings.right_birth_margin_px)
+        )
 
         self._configure_styles()
         self._build_layout()
@@ -302,7 +441,11 @@ class BeanoFlightApp(tk.Tk):
         ttk.Button(parent, text="Use current frame as background", command=self.use_current_background).grid(
             row=button_row + 2, column=0, columnspan=2, sticky=tk.EW, pady=3
         )
-        ttk.Button(parent, text="Build 11-frame temporal median", command=self.build_median_background).grid(
+        ttk.Button(
+            parent,
+            text="Choose 20 empty frames for background…",
+            command=self.build_guided_background,
+        ).grid(
             row=button_row + 3, column=0, columnspan=2, sticky=tk.EW, pady=3
         )
         ttk.Label(
@@ -352,8 +495,40 @@ class BeanoFlightApp(tk.Tk):
         ).pack(anchor=tk.W, pady=(14, 0))
 
     def _build_tracks_tab(self, parent: ttk.Frame) -> None:
+        margins = ttk.LabelFrame(parent, text="New-track side margins", padding=8)
+        margins.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(margins, text="Left margin (px)").grid(row=0, column=0, sticky=tk.W)
+        ttk.Spinbox(
+            margins,
+            textvariable=self.left_margin_var,
+            from_=0,
+            to=700,
+            increment=1,
+            width=8,
+        ).grid(row=0, column=1, padx=(6, 12))
+        ttk.Label(margins, text="Right margin (px)").grid(row=0, column=2, sticky=tk.W)
+        ttk.Spinbox(
+            margins,
+            textvariable=self.right_margin_var,
+            from_=0,
+            to=700,
+            increment=1,
+            width=8,
+        ).grid(row=0, column=3, padx=(6, 0))
+        ttk.Button(
+            margins, text="Apply margins", command=self.apply_tracking_margins
+        ).grid(row=1, column=0, columnspan=4, sticky=tk.EW, pady=(8, 0))
+        ttk.Label(
+            margins,
+            text=(
+                "A first bounding box touching either shaded margin is displayed as "
+                "EDGE-REJECTED and receives no bean ID."
+            ),
+            wraplength=380,
+            style="Muted.TLabel",
+        ).grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(7, 0))
         columns = ("id", "status", "x", "y", "vx", "vy", "gate", "prob", "eta")
-        self.track_tree = ttk.Treeview(parent, columns=columns, show="headings", height=19)
+        self.track_tree = ttk.Treeview(parent, columns=columns, show="headings", height=14)
         headings = {
             "id": "ID",
             "status": "State",
@@ -403,6 +578,9 @@ class BeanoFlightApp(tk.Tk):
         self.current_index = 0
         self.run = None
         self.background = source.frame(0).copy()
+        self.background_provenance = BackgroundProvenance(
+            "temporary first frame", (0,)
+        )
         self.timeline.configure(to=max(1, source.metadata.frame_count - 1))
         self.frame_var.set(0)
         timestamp_label = "exact FastCap timestamps" if source.metadata.exact_timestamps else "nominal FPS timestamps"
@@ -416,7 +594,10 @@ class BeanoFlightApp(tk.Tk):
             self._load_calibration(homography)
         else:
             self.calibration_var.set("No homography.json found — detector inspection only")
-        self.status_var.set("Frame 1 is the temporary background; select a clean frame or build a median.")
+        self.status_var.set(
+            "Frame 1 is the temporary background; select a clean frame or choose "
+            "20 confirmed-empty frames."
+        )
         self._refresh_display()
 
     def select_homography(self) -> None:
@@ -482,27 +663,57 @@ class BeanoFlightApp(tk.Tk):
         if self.source is None:
             return
         self.background = self.source.frame(self.current_index).copy()
+        self.background_provenance = BackgroundProvenance(
+            "human-selected single frame", (self.current_index,)
+        )
         self._invalidate_run(
             f"Frame {self.current_index + 1} selected as background; track IDs require reanalysis."
         )
         self._refresh_display()
 
-    def build_median_background(self) -> None:
+    def build_guided_background(self) -> None:
         if self.source is None:
             return
-        count = self.source.metadata.frame_count
-        indices = sorted(
-            {round(value) for value in np.linspace(0, count - 1, min(11, count))}
-        )
+        self.stop_work()
+        result = BackgroundSelectionDialog(
+            self, self.source, requested_frames=20
+        ).wait_for_result()
+        if result is None:
+            self.status_var.set("Background selection cancelled; existing background retained.")
+            return
+        indices, seed = result
         try:
             frames = [self.source.frame(index) for index in indices]
             self.background = temporal_median_background(frames)
         except (SourceError, DetectorError) as exc:
             messagebox.showerror("Background model", str(exc), parent=self)
             return
-        self._invalidate_run(
-            f"Background built from {len(indices)} sampled frames; track IDs require reanalysis."
+        self.background_provenance = BackgroundProvenance(
+            "human-confirmed stratified temporal median", indices, seed
         )
+        self._invalidate_run(
+            f"Background built from {len(indices)} confirmed-empty frames; "
+            "track IDs require reanalysis."
+        )
+        self._refresh_display()
+
+    def apply_tracking_margins(self) -> None:
+        try:
+            left = int(self.left_margin_var.get())
+            right = int(self.right_margin_var.get())
+            settings = replace(
+                self.tracker_settings,
+                left_birth_margin_px=left,
+                right_birth_margin_px=right,
+            )
+            settings.validate()
+            if self.source is not None and left + right >= self.source.metadata.width:
+                raise ValueError("left and right margins leave no usable image width")
+        except ValueError as exc:
+            messagebox.showerror("Tracking margins", str(exc), parent=self)
+            return
+        self.tracker_settings = settings
+        self._invalidate_run("Birth margins changed; track IDs require reanalysis.")
         self._refresh_display()
 
     def toggle_inspector(self) -> None:
@@ -542,7 +753,14 @@ class BeanoFlightApp(tk.Tk):
         stage = self.pipeline_stages[self.stage_index]
         self.stage_var.set(f"Step {self.stage_index + 1} of {len(self.pipeline_stages)} — {stage.name}")
         self.stage_explanation_var.set(stage.explanation)
-        self.image_pane.set_bgr(render_pipeline_stage(stage))
+        rendered = render_pipeline_stage(stage)
+        if stage.key in {"input", "components", "filtered"}:
+            draw_birth_margins(
+                rendered,
+                self.tracker_settings.left_birth_margin_px,
+                self.tracker_settings.right_birth_margin_px,
+            )
+        self.image_pane.set_bgr(rendered)
         self._update_frame_label()
 
     def analyse_clip(self) -> None:
@@ -558,6 +776,8 @@ class BeanoFlightApp(tk.Tk):
         calibration = self.calibration
         source_path = self.source.path
         generation = self._generation
+        tracker_settings = self.tracker_settings
+        background_provenance = self.background_provenance
 
         def worker() -> None:
             source = None
@@ -565,7 +785,11 @@ class BeanoFlightApp(tk.Tk):
                 source = RecordingVideoSource(source_path, cache_frames=1)
                 layout = GateLayout(calibration.sorting_line_y(self.sorting_offset_mm))
                 engine = AnalysisEngine(
-                    calibration, BeanDetector(settings), background, gate_layout=layout
+                    calibration,
+                    BeanDetector(settings),
+                    background,
+                    tracker_settings=tracker_settings,
+                    gate_layout=layout,
                 )
 
                 def progress(done: int, total: int, frame: FrameAnalysis) -> None:
@@ -574,7 +798,13 @@ class BeanoFlightApp(tk.Tk):
                             ("progress", generation, done, total, frame.processing_ms)
                         )
 
-                run = analyse_source(source, engine, stop=self._stop, progress=progress)
+                run = analyse_source(
+                    source,
+                    engine,
+                    stop=self._stop,
+                    progress=progress,
+                    background_provenance=background_provenance,
+                )
                 self._control_queue.put(("done", generation, run))
             except Exception as exc:
                 self._control_queue.put(("error", generation, str(exc)))
@@ -600,6 +830,8 @@ class BeanoFlightApp(tk.Tk):
         source_path = self.source.path
         native_fps = self.source.metadata.fps
         generation = self._generation
+        tracker_settings = self.tracker_settings
+        background_provenance = self.background_provenance
 
         def worker() -> None:
             source = None
@@ -608,7 +840,11 @@ class BeanoFlightApp(tk.Tk):
                 source = RecordingVideoSource(source_path, cache_frames=1)
                 layout = GateLayout(calibration.sorting_line_y(self.sorting_offset_mm))
                 engine = AnalysisEngine(
-                    calibration, BeanDetector(settings), background, gate_layout=layout
+                    calibration,
+                    BeanDetector(settings),
+                    background,
+                    tracker_settings=tracker_settings,
+                    gate_layout=layout,
                 )
                 started = time.perf_counter()
                 for index in range(source.metadata.frame_count):
@@ -636,6 +872,7 @@ class BeanoFlightApp(tk.Tk):
                     source.path,
                     source.metadata.exact_timestamps,
                     tuple(frames),
+                    background_provenance,
                 )
                 self._control_queue.put(("free_done", generation, run))
             except Exception as exc:
@@ -710,7 +947,18 @@ class BeanoFlightApp(tk.Tk):
                 if self.calibration is not None:
                     layout = GateLayout(self.calibration.sorting_line_y(self.sorting_offset_mm))
                     self.image_pane.set_bgr(
-                        render_analysis(frame, analysis, self.calibration, layout)
+                        render_analysis(
+                            frame,
+                            analysis,
+                            self.calibration,
+                            layout,
+                            left_birth_margin_px=(
+                                self.tracker_settings.left_birth_margin_px
+                            ),
+                            right_birth_margin_px=(
+                                self.tracker_settings.right_birth_margin_px
+                            ),
+                        )
                     )
                 self._update_track_table(analysis)
                 self._update_frame_label()
@@ -790,7 +1038,16 @@ class BeanoFlightApp(tk.Tk):
         ):
             analysis = self.run.frames[self.current_index]
             layout = GateLayout(self.calibration.sorting_line_y(self.sorting_offset_mm))
-            self.image_pane.set_bgr(render_analysis(frame, analysis, self.calibration, layout))
+            self.image_pane.set_bgr(
+                render_analysis(
+                    frame,
+                    analysis,
+                    self.calibration,
+                    layout,
+                    left_birth_margin_px=self.tracker_settings.left_birth_margin_px,
+                    right_birth_margin_px=self.tracker_settings.right_birth_margin_px,
+                )
+            )
             self._update_track_table(analysis)
         else:
             stage = PipelineStage(
@@ -800,7 +1057,13 @@ class BeanoFlightApp(tk.Tk):
                 ("No current sequential track result",),
                 "Analyse the clip to assign stable bean IDs.",
             )
-            self.image_pane.set_bgr(render_pipeline_stage(stage))
+            rendered = render_pipeline_stage(stage)
+            draw_birth_margins(
+                rendered,
+                self.tracker_settings.left_birth_margin_px,
+                self.tracker_settings.right_birth_margin_px,
+            )
+            self.image_pane.set_bgr(rendered)
             self._update_track_table(None)
         self._update_frame_label()
 
@@ -810,6 +1073,23 @@ class BeanoFlightApp(tk.Tk):
         if analysis is None:
             return
         predictions = {item.bean_ref: item for item in analysis.predictions}
+        for rejection in analysis.rejections:
+            x_mm, y_mm = rejection.observation.position_mm
+            self.track_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    "—",
+                    "rejected",
+                    f"{x_mm:.1f}",
+                    f"{y_mm:.1f}",
+                    "—",
+                    "—",
+                    "EDGE" if "margin" in rejection.reason else "BIRTH",
+                    "—",
+                    "—",
+                ),
+            )
         for track in analysis.tracks:
             prediction = predictions.get(track.bean_ref)
             if prediction is not None:

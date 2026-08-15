@@ -342,7 +342,15 @@ def temporal_median_background(frames: Iterable[np.ndarray]) -> np.ndarray:
     reference_shape = selected[0].shape
     if any(frame.shape != reference_shape or frame.dtype != np.uint8 for frame in selected):
         raise DetectorError("background frames must have matching uint8 shapes")
-    return np.median(np.stack(selected, axis=0), axis=0).astype(np.uint8)
+    # Twenty native colour frames are already about 95 MB. Work in row tiles
+    # so calculating the median does not create another full-size frame stack.
+    result = np.empty(reference_shape, dtype=np.uint8)
+    tile_rows = 64
+    for start in range(0, reference_shape[0], tile_rows):
+        stop = min(reference_shape[0], start + tile_rows)
+        tile = np.stack([frame[start:stop] for frame in selected], axis=0)
+        result[start:stop] = np.median(tile, axis=0).astype(np.uint8)
+    return result
 
 
 def _morph(image: np.ndarray, operation: int, kernel_size: int, iterations: int) -> np.ndarray:

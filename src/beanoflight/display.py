@@ -61,6 +61,8 @@ def render_analysis(
     layout: GateLayout,
     *,
     gravity_mm_s2: float = 9_810.0,
+    left_birth_margin_px: int = 0,
+    right_birth_margin_px: int = 0,
 ) -> np.ndarray:
     height, width = frame_bgr.shape[:2]
     line_centre = calibration.mm_to_pixel((0.0, layout.line_y_mm))
@@ -68,6 +70,9 @@ def render_analysis(
     output_height = min(max(output_height, height), height * 2)
     rendered = np.full((output_height, width, 3), (13, 16, 20), dtype=np.uint8)
     rendered[:height] = frame_bgr
+    draw_birth_margins(
+        rendered[:height], left_birth_margin_px, right_birth_margin_px
+    )
     if output_height > height:
         cv2.line(rendered, (0, height), (width - 1, height), (90, 100, 112), 1)
         cv2.putText(
@@ -87,8 +92,40 @@ def render_analysis(
         for track in analysis.tracks
         if track.history and track.history[-1].frame_index == analysis.frame_index
     }
+    rejected_centres = {
+        rejection.observation.detection.centroid_px for rejection in analysis.rejections
+    }
+    for rejection in analysis.rejections:
+        detection = rejection.observation.detection
+        x, y, component_width, component_height = detection.bbox_px
+        rejection_label = (
+            "EDGE-REJECTED" if "margin" in rejection.reason else "BIRTH-REJECTED"
+        )
+        cv2.rectangle(
+            rendered,
+            (x, y),
+            (x + component_width - 1, y + component_height - 1),
+            (45, 55, 245),
+            3,
+        )
+        cv2.putText(
+            rendered,
+            f"{rejection_label}: {rejection.reason.upper()}",
+            (
+                x + 4,
+                y - 7 if y >= 45 else min(rendered.shape[0] - 10, y + component_height + 20),
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.43,
+            (45, 55, 245),
+            2,
+            cv2.LINE_AA,
+        )
     for detection in analysis.detections:
-        if detection.centroid_px in assigned_centres:
+        if (
+            detection.centroid_px in assigned_centres
+            or detection.centroid_px in rejected_centres
+        ):
             continue
         x, y, component_width, component_height = detection.bbox_px
         cv2.rectangle(
@@ -128,6 +165,59 @@ def render_analysis(
         cv2.LINE_AA,
     )
     return rendered
+
+
+def draw_birth_margins(
+    image_bgr: np.ndarray, left_margin_px: int, right_margin_px: int
+) -> np.ndarray:
+    """Shade display-only lateral regions where new tracks cannot be born."""
+
+    height, width = image_bgr.shape[:2]
+    left = max(0, min(width, int(left_margin_px)))
+    right = max(0, min(width - left, int(right_margin_px)))
+    if left <= 0 and right <= 0:
+        return image_bgr
+    overlay = image_bgr.copy()
+    if left > 0:
+        cv2.rectangle(overlay, (0, 0), (left - 1, height - 1), (20, 35, 150), -1)
+        cv2.line(image_bgr, (left, 0), (left, height - 1), (40, 70, 255), 2)
+    if right > 0:
+        boundary = width - right
+        cv2.rectangle(
+            overlay, (boundary, 0), (width - 1, height - 1), (20, 35, 150), -1
+        )
+        cv2.line(
+            image_bgr, (boundary, 0), (boundary, height - 1), (40, 70, 255), 2
+        )
+    cv2.addWeighted(overlay, 0.32, image_bgr, 0.68, 0.0, image_bgr)
+    label_y = min(height - 8, 24)
+    if left > 0:
+        cv2.putText(
+            image_bgr,
+            f"NO BIRTH {left}px",
+            (5, label_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (110, 130, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    if right > 0:
+        label = f"NO BIRTH {right}px"
+        (text_width, _text_height), _baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1
+        )
+        cv2.putText(
+            image_bgr,
+            label,
+            (max(5, width - text_width - 5), label_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (110, 130, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    return image_bgr
 
 
 def _draw_track(

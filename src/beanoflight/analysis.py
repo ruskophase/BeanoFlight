@@ -9,6 +9,7 @@ from pathlib import Path
 from threading import Event
 from typing import Callable
 
+from .background import BackgroundProvenance
 from .calibration import MetricPlaneCalibration
 from .detection import BeanDetector
 from .events import EventBus
@@ -27,6 +28,7 @@ class AnalysisRun:
     source_path: Path
     exact_timestamps: bool
     frames: tuple[FrameAnalysis, ...]
+    background: BackgroundProvenance = BackgroundProvenance("unspecified", ())
 
     @property
     def mean_processing_ms(self) -> float:
@@ -62,6 +64,7 @@ class AnalysisEngine:
         self.tracker = TrackManager(
             top_y_mm=calibration.top_y_mm,
             bottom_y_mm=calibration.bottom_y_mm,
+            image_width_px=calibration.image_size_px[0],
             settings=self.tracker_settings,
             events=events,
         )
@@ -96,6 +99,7 @@ class AnalysisEngine:
             frame_index=frame_index,
             timestamp_ns=timestamp_ns,
             detections=detection_result.detections,
+            rejections=self.tracker.last_rejections,
             tracks=tracks,
             predictions=predictions,
             processing_ms=processing_ms,
@@ -108,6 +112,7 @@ def analyse_source(
     *,
     stop: Event | None = None,
     progress: ProgressCallback | None = None,
+    background_provenance: BackgroundProvenance | None = None,
 ) -> AnalysisRun:
     cancellation = stop or Event()
     frames: list[FrameAnalysis] = []
@@ -125,6 +130,7 @@ def analyse_source(
         source_path=source.path,
         exact_timestamps=source.metadata.exact_timestamps,
         frames=tuple(frames),
+        background=background_provenance or BackgroundProvenance("unspecified", ()),
     )
 
 
@@ -136,6 +142,11 @@ def export_run_json(run: AnalysisRun, path: Path) -> None:
         "run_id": run.run_id,
         "source_path": str(run.source_path),
         "exact_timestamps": run.exact_timestamps,
+        "background": {
+            "method": run.background.method,
+            "frame_indices": list(run.background.frame_indices),
+            "candidate_seed": run.background.candidate_seed,
+        },
         "performance": {
             "mean_processing_ms": run.mean_processing_ms,
             "p95_processing_ms": run.p95_processing_ms,
@@ -152,6 +163,14 @@ def _frame_json(frame: FrameAnalysis) -> dict[str, object]:
         "frame_index": frame.frame_index,
         "timestamp_ns": frame.timestamp_ns,
         "processing_ms": frame.processing_ms,
+        "rejections": [
+            {
+                "reason": rejection.reason,
+                "centroid_px": list(rejection.observation.detection.centroid_px),
+                "bbox_px": list(rejection.observation.detection.bbox_px),
+            }
+            for rejection in frame.rejections
+        ],
         "tracks": [
             {
                 "bean_id": str(track.bean_ref),

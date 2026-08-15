@@ -11,7 +11,14 @@ from typing import Sequence
 import numpy as np
 
 from .events import EventBus
-from .models import BeanEvent, BeanRef, Observation, TrackSnapshot, TrackStatus
+from .models import (
+    BeanEvent,
+    BeanRef,
+    DetectionRejection,
+    Observation,
+    TrackSnapshot,
+    TrackStatus,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +33,8 @@ class TrackerSettings:
     birth_zone_depth_mm: float = 26.0
     release_height_above_fov_mm: float = 20.0
     exit_margin_mm: float = 8.0
+    left_birth_margin_px: int = 50
+    right_birth_margin_px: int = 50
     require_top_birth: bool = True
 
     def validate(self) -> None:
@@ -43,6 +52,8 @@ class TrackerSettings:
             raise ValueError("tracker hit/miss counts are invalid")
         if self.appearance_weight < 0:
             raise ValueError("appearance weight cannot be negative")
+        if self.left_birth_margin_px < 0 or self.right_birth_margin_px < 0:
+            raise ValueError("birth margins cannot be negative")
 
 
 class _Track:
@@ -177,6 +188,7 @@ class TrackManager:
         *,
         top_y_mm: float,
         bottom_y_mm: float,
+        image_width_px: int = 1456,
         settings: TrackerSettings | None = None,
         run_id: str | None = None,
         events: EventBus | None = None,
@@ -185,44 +197,79 @@ class TrackManager:
         self.settings.validate()
         if bottom_y_mm <= top_y_mm:
             raise ValueError("FoV bottom must lie below its top")
+        if image_width_px <= 0:
+            raise ValueError("image width must be positive")
+        if (
+            self.settings.left_birth_margin_px + self.settings.right_birth_margin_px
+            >= image_width_px
+        ):
+            raise ValueError("birth margins leave no usable image width")
         self.top_y_mm = float(top_y_mm)
         self.bottom_y_mm = float(bottom_y_mm)
+        self.image_width_px = int(image_width_px)
         self.run_id = run_id or uuid.uuid4().hex
         self.events = events
         self._next_sequence = 1
+        self._next_suppression = 1
         self._active: dict[BeanRef, _Track] = {}
+        self._suppressed: dict[BeanRef, tuple[_Track, str]] = {}
+        self.last_rejections: tuple[DetectionRejection, ...] = ()
 
     @property
     def active_count(self) -> int:
         return len(self._active)
+
+    @property
+    def suppressed_count(self) -> int:
+        return len(self._suppressed)
 
     def update(
         self, observations: Sequence[Observation], timestamp_ns: int
     ) -> tuple[TrackSnapshot, ...]:
         if any(observation.timestamp_ns != timestamp_ns for observation in observations):
             raise ValueError("all observations must use the frame timestamp")
+        rejections: list[DetectionRejection] = []
         tracks = list(self._active.values())
-        for track in tracks:
+        suppressed_items = list(self._suppressed.values())
+        suppressed_tracks = [item[0] for item in suppressed_items]
+        association_tracks = [*tracks, *suppressed_tracks]
+        for track in association_tracks:
             track.predict(timestamp_ns, self.settings)
-        costs = np.full((len(tracks), len(observations)), math.inf, dtype=np.float64)
-        for track_index, track in enumerate(tracks):
+        costs = np.full(
+            (len(association_tracks), len(observations)), math.inf, dtype=np.float64
+        )
+        for track_index, track in enumerate(association_tracks):
             for observation_index, observation in enumerate(observations):
                 costs[track_index, observation_index] = track.match_cost(
                     observation, self.settings
                 )
         matches = _optimal_assignment(costs)
-        matched_tracks = {track_index for track_index, _ in matches}
+        matched_association_tracks = {track_index for track_index, _ in matches}
         matched_observations = {observation_index for _, observation_index in matches}
         emitted: list[TrackSnapshot] = []
         for track_index, observation_index in matches:
-            track = tracks[track_index]
-            previous_status = track.status
-            track.update(observations[observation_index], self.settings)
-            if previous_status == TrackStatus.TENTATIVE and track.status == TrackStatus.CONFIRMED:
-                self._publish("confirmed", track, timestamp_ns)
+            track = association_tracks[track_index]
+            if track_index < len(tracks):
+                previous_status = track.status
+                track.update(observations[observation_index], self.settings)
+                if (
+                    previous_status == TrackStatus.TENTATIVE
+                    and track.status == TrackStatus.CONFIRMED
+                ):
+                    self._publish("confirmed", track, timestamp_ns)
+            else:
+                suppressed_index = track_index - len(tracks)
+                reason = suppressed_items[suppressed_index][1]
+                track.update(observations[observation_index], self.settings)
+                rejections.append(
+                    DetectionRejection(
+                        observations[observation_index],
+                        f"continuation of {reason}",
+                    )
+                )
 
         for track_index, track in enumerate(tracks):
-            if track_index in matched_tracks:
+            if track_index in matched_association_tracks:
                 continue
             track.miss()
             out_of_view = track.state[1] > self.bottom_y_mm + self.settings.exit_margin_mm
@@ -237,12 +284,35 @@ class TrackManager:
                 self._publish(track.status.value, track, timestamp_ns)
                 self._active.pop(track.bean_ref, None)
 
+        for suppressed_index, track in enumerate(suppressed_tracks):
+            association_index = len(tracks) + suppressed_index
+            if association_index in matched_association_tracks:
+                continue
+            track.miss()
+            out_of_view = track.state[1] > self.bottom_y_mm + self.settings.exit_margin_mm
+            expired = track.misses > self.settings.maximum_missed_frames
+            if out_of_view or expired:
+                self._suppressed.pop(track.bean_ref, None)
+
         for observation_index, observation in enumerate(observations):
             if observation_index in matched_observations:
+                continue
+            edge_reason = self._edge_rejection_reason(observation)
+            if edge_reason is not None:
+                rejections.append(DetectionRejection(observation, edge_reason))
+                suppression_ref = BeanRef(self.run_id, -self._next_suppression)
+                self._next_suppression += 1
+                suppression = _Track(
+                    suppression_ref, observation, self.settings, self.top_y_mm
+                )
+                self._suppressed[suppression_ref] = (suppression, edge_reason)
                 continue
             if self.settings.require_top_birth and (
                 observation.position_mm[1] > self.top_y_mm + self.settings.birth_zone_depth_mm
             ):
+                rejections.append(
+                    DetectionRejection(observation, "outside top birth region")
+                )
                 continue
             bean_ref = BeanRef(self.run_id, self._next_sequence)
             self._next_sequence += 1
@@ -250,8 +320,23 @@ class TrackManager:
             self._active[bean_ref] = track
             self._publish("created", track, timestamp_ns)
 
+        self.last_rejections = tuple(rejections)
         active_snapshots = [track.snapshot() for track in self._active.values()]
         return tuple(sorted((*active_snapshots, *emitted), key=lambda value: value.bean_ref))
+
+    def _edge_rejection_reason(self, observation: Observation) -> str | None:
+        x, _y, width, _height = observation.detection.bbox_px
+        touches_left = x < self.settings.left_birth_margin_px
+        touches_right = (
+            x + width > self.image_width_px - self.settings.right_birth_margin_px
+        )
+        if touches_left and touches_right:
+            return "left and right birth margins"
+        if touches_left:
+            return "left birth margin"
+        if touches_right:
+            return "right birth margin"
+        return None
 
     def _publish(self, kind: str, track: _Track, timestamp_ns: int) -> None:
         if self.events is None:
@@ -272,8 +357,8 @@ def _optimal_assignment(costs: np.ndarray) -> tuple[tuple[int, int], ...]:
     if costs.ndim != 2:
         raise ValueError("assignment costs must be a matrix")
     track_count, detection_count = costs.shape
-    if max(track_count, detection_count) > 16:
-        raise ValueError("small-set assignment supports at most 16 tracks/detections")
+    if detection_count > 16:
+        raise ValueError("small-set assignment supports at most 16 detections")
     unmatched_cost = 1.0
 
     @lru_cache(maxsize=None)

@@ -4,7 +4,9 @@
 2. Confirm that the status line says `exact FastCap timestamps`.
 3. Confirm that the metric calibration has loaded and reports its RMS.
 4. Find a frame without beans and choose **Use current frame as background**.
-   If none is available, build the 11-frame temporal median.
+   For a more representative model, choose **Choose 20 empty frames for
+   background**. Mark each stratified candidate `Empty` or `Contains
+   foreground`; only accepted frames enter the median.
 5. Enable **Inspect frozen frame step-by-step**.
 6. Move through the ten OpenCV stages. The caption records every relevant
    setting used for the displayed result.
@@ -20,6 +22,18 @@
     probabilities.
 11. Export the compact JSON analysis when the result should be compared or
     discussed.
+
+## Side-margin review
+
+The default left and right new-track margins are 50 pixels and are editable in
+**Tracks & gates**. Their shaded red regions are display-only. A detection whose
+first bounding box overlaps either region is labelled `EDGE-REJECTED` and is
+recorded without a bean ID. This is preferable to calling it occluded: its
+centroid, size, crop and appearance are already incomplete at first sight.
+
+An existing track is allowed to enter a margin without changing ID. Review
+those cases carefully because a partial edge measurement can still increase
+trajectory uncertainty.
 
 ## Existing FastCap overlays
 

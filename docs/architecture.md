@@ -51,6 +51,36 @@ bean. A new ID is tentative until its second observation. Missing confirmed
 tracks become occluded and are propagated briefly; a track becomes exited when
 its prediction passes the calibrated lower boundary plus margin.
 
+The left and right birth margins are a separate acceptance rule. Detection is
+still performed and displayed inside those regions, but an unmatched first
+observation is rejected if any part of its bounding box enters a margin. It is
+not called occluded because no trustworthy complete track has existed yet. If
+an already-valid track later enters a side margin, normal association keeps its
+ID; this avoids renaming a bean as it drifts laterally.
+
+An edge rejection creates a short-lived internal suppression trajectory with
+no public `BeanRef`. It consumes later observations from the same edge-entering
+bean so that moving fully out of the margin cannot cause a delayed new ID. The
+suppression expires after the same bounded miss/exit rules as a normal track;
+it is never published to inference or sorting consumers.
+
+## Background models
+
+Recorded-video Review mode uses a temporal median of up to twenty
+human-confirmed empty frames. Candidate frames are random within evenly spaced
+temporal strata. The first review pass presents one frame from each of twenty
+full-video time bands; three further passes provide replacements for rejected
+frames. This gives coverage across the recording without silently including
+moving beans. The accepted indices and selection seed are analysis provenance.
+
+The later live source should begin with an explicit background-acquisition
+period while bean feed is stopped. Continuous adaptation can then use a slow
+per-pixel model only where a dilated foreground mask and every active or
+recently missed track agree that the scene is clear. Updates should freeze
+during a busy scene, exposure/illumination change, or camera movement. This
+prevents a stationary or slow bean from being learned into the background and
+keeps live adaptation separable from the version 0.1 recorded-video model.
+
 ## Asynchronous extension points
 
 `EventBus` provides bounded non-blocking subscriber queues. Events currently

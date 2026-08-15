@@ -48,9 +48,15 @@ width, height, centroids and bounding boxes are still reported in native image
 pixels, and inspector masks are enlarged to the native display size without
 smoothing so individual processing pixels remain visible.
 
-Use **Use current frame as background** on a genuinely empty frame, or build an
-11-frame temporal median when no single empty frame is available. A good
-background is the most important prerequisite for useful tuning.
+Use **Use current frame as background** on a genuinely empty frame, or choose
+**Choose 20 empty frames for background**. The guided selector presents frames
+chosen randomly within twenty evenly distributed sections of the recording,
+followed by replacement passes when a candidate contains foreground. Mark each
+candidate empty or containing foreground; only human-confirmed empty frames
+enter the temporal median. The selected indices and random seed are retained
+in the exported analysis. Median calculation is tiled to avoid making a second
+full-size stack of all twenty colour frames. A good background is the most
+important prerequisite for useful tuning.
 
 ## Input contract
 
@@ -112,6 +118,9 @@ beano-flight recording/ --hole-pitch-mm 9.16 --sorting-offset-mm 30
   rotation and imperfect centroid measurements.
 - Immediate run-scoped ID, followed by tentative, confirmed, occluded, exited
   or cancelled lifecycle states.
+- Configurable 50-pixel left and right birth margins. A first bounding box
+  touching a margin is explicitly edge-rejected and receives no ID; a valid
+  existing track is not renamed if it later enters a margin.
 - Twenty-one virtual 5 mm gates, with `G0` centred on image `x = 0`.
 - Gaussian crossing probabilities and a default 35% virtual actuation
   threshold.
@@ -128,7 +137,8 @@ make test
 PYTHONPATH=src python3 -m compileall -q src
 ```
 
-The test suite covers metric fitting, every diagnostic detector stage, exact
-timestamps, global assignment, ID lifecycle, async enrichment and sorting-gate
-probabilities. Representative real recordings will be added as regression
-fixtures after the first detector-tuning session.
+The test suite covers metric fitting, every diagnostic detector stage, guided
+background sampling, edge rejection and suppression, exact timestamps, global
+assignment, ID lifecycle, async enrichment and sorting-gate probabilities.
+Representative real recordings will be added as regression fixtures after the
+first detector-tuning session.

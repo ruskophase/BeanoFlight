@@ -44,6 +44,12 @@ class Observation:
 
 
 @dataclass(frozen=True, slots=True)
+class DetectionRejection:
+    observation: Observation
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class PipelineStage:
     key: str
     name: str
@@ -108,6 +114,7 @@ class FrameAnalysis:
     frame_index: int
     timestamp_ns: int
     detections: tuple[Detection, ...]
+    rejections: tuple[DetectionRejection, ...]
     tracks: tuple[TrackSnapshot, ...]
     predictions: tuple[CrossingPrediction, ...]
     processing_ms: float
