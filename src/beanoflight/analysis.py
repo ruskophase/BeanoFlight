@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event
-from typing import Callable
+from typing import Protocol
 
 from .background import BackgroundProvenance
 from .calibration import MetricPlaneCalibration
@@ -16,10 +17,13 @@ from .events import EventBus
 from .models import FrameAnalysis, Observation
 from .prediction import GateLayout, TrajectoryPredictor
 from .source import RecordingVideoSource
-from .tracking import TrackManager, TrackerSettings
-
+from .tracking import TrackerSettings, TrackManager
 
 ProgressCallback = Callable[[int, int, FrameAnalysis], None]
+
+
+class RegistryWriter(Protocol):
+    def update_tracks(self, updates): ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,7 +32,9 @@ class AnalysisRun:
     source_path: Path
     exact_timestamps: bool
     frames: tuple[FrameAnalysis, ...]
-    background: BackgroundProvenance = BackgroundProvenance("unspecified", ())
+    background: BackgroundProvenance = field(
+        default_factory=lambda: BackgroundProvenance("unspecified", ())
+    )
 
     @property
     def mean_processing_ms(self) -> float:
@@ -54,6 +60,7 @@ class AnalysisEngine:
         tracker_settings: TrackerSettings | None = None,
         gate_layout: GateLayout | None = None,
         events: EventBus | None = None,
+        registry: RegistryWriter | None = None,
     ) -> None:
         self.calibration = calibration
         self.detector = detector
@@ -61,6 +68,7 @@ class AnalysisEngine:
         self.tracker_settings = tracker_settings or TrackerSettings()
         self.gate_layout = gate_layout or GateLayout(calibration.sorting_line_y())
         self.events = events
+        self.registry = registry
         self.tracker = TrackManager(
             top_y_mm=calibration.top_y_mm,
             bottom_y_mm=calibration.bottom_y_mm,
@@ -94,6 +102,28 @@ class AnalysisEngine:
             for track in tracks
             if (prediction := self.predictor.predict(track)) is not None
         )
+        if self.registry is not None:
+            prediction_by_ref = {
+                prediction.bean_ref: prediction for prediction in predictions
+            }
+            self.registry.update_tracks(
+                tuple(
+                    (
+                        track,
+                        prediction_by_ref.get(track.bean_ref),
+                        ":".join(
+                            (
+                                "track",
+                                track.bean_ref.run_id,
+                                str(track.bean_ref.sequence),
+                                str(frame_index),
+                                track.status.value,
+                            )
+                        ),
+                    )
+                    for track in tracks
+                )
+            )
         processing_ms = (time.perf_counter_ns() - started) / 1_000_000.0
         return FrameAnalysis(
             frame_index=frame_index,

@@ -55,3 +55,18 @@ the displayed virtual gate bank.
 These probabilities do not yet model bean width, nozzle plume width, valve
 latency or category-specific sorting policy. They must not be used to actuate
 real hardware in version 0.1.
+
+## Registry service check
+
+The live registry can be started independently of the review GUI:
+
+```bash
+beano-registry --database ./beanoflight.db
+```
+
+Its default local endpoints are
+`ipc:///tmp/beanoflight-registry-commands.ipc` and
+`ipc:///tmp/beanoflight-registry-events.ipc`. Production systemd deployment
+should place these sockets in a service-owned runtime directory and the SQLite
+database on local persistent storage. Do not place a WAL database on a network
+filesystem.

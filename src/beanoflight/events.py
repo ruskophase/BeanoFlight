@@ -5,10 +5,9 @@ from __future__ import annotations
 import queue
 import threading
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Any
 
 from .models import BeanEvent, BeanRef
+from .registry_models import Enrichment
 
 
 class EventBus:
@@ -39,15 +38,6 @@ class EventBus:
                     destination.put_nowait(event)
                 except queue.Full:
                     pass
-
-
-@dataclass(frozen=True, slots=True)
-class Enrichment:
-    source: str
-    kind: str
-    value: Any
-    timestamp_ns: int
-    version: str = ""
 
 
 class BeanStore:

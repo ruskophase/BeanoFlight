@@ -126,3 +126,6 @@ class BeanEvent:
     bean_ref: BeanRef
     timestamp_ns: int
     payload: dict[str, Any] = field(default_factory=dict)
+    revision: int = 0
+    event_id: str = ""
+    stream_sequence: int = 0

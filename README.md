@@ -22,6 +22,23 @@ uses a bounded display queue, keeps full-frame history out of the analysis
 result, and reports per-frame processing latency. This is the initial stand-in
 for a future live CamL frame source.
 
+## BeanRegistry
+
+BeanoFlight includes the live system's process-safe bean-state boundary. The
+`BeanRegistry` is the single owner of current identities, track revisions,
+predictions, ML enrichments and sorting decisions. It can run in-process or as
+the `beano-registry` service with SQLite WAL persistence and acknowledged
+ZeroMQ command/query calls.
+
+```bash
+beano-registry --database /var/lib/beanoflight/beanoflight.db
+```
+
+The service also publishes bounded state notifications for monitoring. Every
+event has a persistent stream sequence; critical consumers recover through the
+`events_since` query rather than assuming publish/subscribe delivery. Frame
+images are never written to the registry or its database.
+
 ## OpenCV pipeline inspector
 
 Turn on **Inspect frozen frame step-by-step** in the **Pipeline steps** tab.
@@ -128,6 +145,7 @@ beano-flight recording/ --hole-pitch-mm 9.16 --sorting-offset-mm 30
   threshold.
 
 See [architecture.md](docs/architecture.md),
+[bean-registry.md](docs/bean-registry.md),
 [metric-calibration.md](docs/metric-calibration.md), and
 [operations.md](docs/operations.md) for the implementation and review
 contracts.
@@ -141,6 +159,7 @@ PYTHONPATH=src python3 -m compileall -q src
 
 The test suite covers metric fitting, every diagnostic detector stage, guided
 background sampling, edge rejection and suppression, exact timestamps, global
-assignment, ID lifecycle, async enrichment and sorting-gate probabilities.
+assignment, ID lifecycle, registry revision/idempotency rules, SQLite recovery,
+ZeroMQ IPC, async enrichment and sorting-gate probabilities.
 Representative real recordings will be added as regression fixtures after the
 first detector-tuning session.

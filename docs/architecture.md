@@ -83,10 +83,22 @@ keeps live adaptation separable from the version 0.1 recorded-video model.
 
 ## Asynchronous extension points
 
-`EventBus` provides bounded non-blocking subscriber queues. Events currently
-include creation, confirmation, exit and cancellation. A later cropper can
-subscribe to creation/update events, submit an image tensor to ResNet, and add
-the result to `BeanStore`. A sorting decision process can combine the newest
-track prediction with those enrichments without sharing mutable objects.
+`BeanRegistry` is now the authoritative materialized state for public bean
+identities. `AnalysisEngine` accepts either an in-process registry or a
+ZeroMQ-backed registry client and submits every current track/prediction with
+an idempotent event ID. ResNet workers add versioned enrichments; a sorting
+worker adds and later acknowledges its decision. Neither can mutate tracker
+state.
+
+SQLite WAL stores normalized observations, track states, predictions,
+enrichments, decisions and an ordered event journal. ZeroMQ request/reply is
+the acknowledged write/query path. PUB/SUB is deliberately limited to bounded
+replaceable notifications. Each notification carries a persistent global
+stream sequence, so a critical consumer uses `events_since(cursor)` to recover
+any gap before proceeding.
+
+The original `EventBus` and `BeanStore` remain small same-process adapters for
+simple workers and backwards compatibility. They are not the live
+multi-process source of truth. See `bean-registry.md` for the process contract.
 
 No hardware output is present in version 0.1. Gate selection is diagnostic.

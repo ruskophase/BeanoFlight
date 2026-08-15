@@ -10,6 +10,7 @@ from beanoflight.analysis import AnalysisEngine
 from beanoflight.calibration import MetricPlaneCalibration
 from beanoflight.detection import BeanDetector, DetectorSettings
 from beanoflight.prediction import GateLayout
+from beanoflight.registry import BeanRegistry
 
 
 class EndToEndAnalysisTests(unittest.TestCase):
@@ -49,7 +50,14 @@ class EndToEndAnalysisTests(unittest.TestCase):
             )
         )
         layout = GateLayout(calibration.sorting_line_y())
-        engine = AnalysisEngine(calibration, detector, background, gate_layout=layout)
+        registry = BeanRegistry()
+        engine = AnalysisEngine(
+            calibration,
+            detector,
+            background,
+            gate_layout=layout,
+            registry=registry,
+        )
         results = []
         for index, y in enumerate((30, 103, 184)):
             frame = background.copy()
@@ -63,6 +71,10 @@ class EndToEndAnalysisTests(unittest.TestCase):
         self.assertEqual(results[-1].tracks[0].hits, 3)
         self.assertEqual(len(results[-1].predictions), 1)
         self.assertGreater(results[-1].predictions[0].crossing_timestamp_ns, results[-1].timestamp_ns)
+        registry_record = registry.get(ids[-1])
+        self.assertEqual(registry_record.revision, 3)
+        self.assertEqual(registry_record.track.hits, 3)
+        self.assertEqual(registry_record.prediction, results[-1].predictions[0])
 
 
 if __name__ == "__main__":
