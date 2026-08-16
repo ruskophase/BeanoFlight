@@ -43,6 +43,11 @@ def parser() -> argparse.ArgumentParser:
         default=2_000,
         help="SQLite lock wait limit in milliseconds",
     )
+    result.add_argument(
+        "--log-track-updates",
+        action="store_true",
+        help="also print high-volume per-frame track.updated activity",
+    )
     return result
 
 
@@ -63,12 +68,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             registry,
             command_endpoint=arguments.commands,
             event_endpoint=arguments.events,
+            event_observer=lambda event: _print_event(
+                event, include_track_updates=arguments.log_track_updates
+            ),
         )
         print(f"BeanRegistry database: {repository.path}", flush=True)
         print(f"BeanRegistry commands: {arguments.commands}", flush=True)
         print(f"BeanRegistry events: {arguments.events}", flush=True)
         server.serve_forever(stop)
     return 0
+
+
+def _print_event(event, *, include_track_updates: bool) -> None:
+    if event.kind == "track.updated" and not include_track_updates:
+        return
+    print(
+        f"#{event.stream_sequence:06d} {event.kind:24} "
+        f"{event.bean_ref} revision={event.revision}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

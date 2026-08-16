@@ -6,7 +6,7 @@ import json
 import queue
 import threading
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import zmq
 
@@ -14,9 +14,15 @@ from .models import BeanEvent, BeanRef, TrackStatus
 from .registry import BeanRegistry
 from .registry_models import (
     REGISTRY_SCHEMA,
+    ActuationResult,
     BeanRecord,
     Enrichment,
+    InferenceJob,
+    InferenceStatus,
+    RunSession,
     SortingDecision,
+    actuation_from_dict,
+    actuation_to_dict,
     bean_ref_from_dict,
     bean_ref_to_dict,
     decision_from_dict,
@@ -25,11 +31,15 @@ from .registry_models import (
     enrichment_to_dict,
     event_from_dict,
     event_to_dict,
+    inference_job_from_dict,
+    inference_job_to_dict,
     observation_to_dict,
     prediction_from_dict,
     prediction_to_dict,
     record_from_dict,
     record_to_dict,
+    run_session_from_dict,
+    run_session_to_dict,
     track_from_dict,
     track_to_dict,
 )
@@ -59,12 +69,14 @@ class ZeroMQRegistryServer:
         event_endpoint: str,
         context: zmq.Context | None = None,
         event_capacity: int = 4_096,
+        event_observer: Callable[[BeanEvent], None] | None = None,
     ) -> None:
         self.registry = registry
         self.command_endpoint = command_endpoint
         self.event_endpoint = event_endpoint
         self.context = context or zmq.Context.instance()
         self._event_queue = registry.subscribe(capacity=event_capacity)
+        self.event_observer = event_observer
 
     def serve_forever(
         self,
@@ -138,10 +150,26 @@ class ZeroMQRegistryServer:
     ) -> object:
         if operation == "ping":
             return {"service": "BeanRegistry", "schema": REGISTRY_SCHEMA}
-        if operation == "get":
-            record = self.registry.get(
-                bean_ref_from_dict(_object(payload["bean_ref"]))
+        if operation == "put_session":
+            expected_value = payload.get("expected_revision")
+            session = self.registry.put_session(
+                run_session_from_dict(_object(payload["session"])),
+                expected_revision=(
+                    None if expected_value is None else int(expected_value)
+                ),
             )
+            return run_session_to_dict(session)
+        if operation == "get_session":
+            return run_session_to_dict(
+                self.registry.get_session(str(payload["run_id"]))
+            )
+        if operation == "list_sessions":
+            return [
+                run_session_to_dict(session)
+                for session in self.registry.list_sessions()
+            ]
+        if operation == "get":
+            record = self.registry.get(bean_ref_from_dict(_object(payload["bean_ref"])))
             return record_to_dict(record)
         if operation in {"list", "list_active"}:
             run_id_value = payload.get("run_id")
@@ -153,7 +181,9 @@ class ZeroMQRegistryServer:
                 statuses = (
                     None
                     if statuses_value is None
-                    else tuple(TrackStatus(str(item)) for item in _array(statuses_value))
+                    else tuple(
+                        TrackStatus(str(item)) for item in _array(statuses_value)
+                    )
                 )
                 records = self.registry.list_records(run_id=run_id, statuses=statuses)
             return [record_to_dict(record, include_history=False) for record in records]
@@ -208,6 +238,30 @@ class ZeroMQRegistryServer:
                 event_id=str(payload.get("event_id") or request_id),
             )
             return record_to_dict(record, include_history=False)
+        if operation == "submit_inference_job":
+            job = inference_job_from_dict(_object(payload["job"]))
+            record = self.registry.submit_inference_job(
+                job, event_id=str(payload.get("event_id") or request_id)
+            )
+            return record_to_dict(record, include_history=False)
+        if operation == "update_inference_job":
+            record = self.registry.update_inference_job(
+                bean_ref_from_dict(_object(payload["bean_ref"])),
+                str(payload["job_id"]),
+                InferenceStatus(str(payload["status"])),
+                int(payload["timestamp_ns"]),
+                detail=str(payload.get("detail", "")),
+                event_id=str(payload.get("event_id") or request_id),
+            )
+            return record_to_dict(record, include_history=False)
+        if operation == "complete_inference_job":
+            record = self.registry.complete_inference_job(
+                bean_ref_from_dict(_object(payload["bean_ref"])),
+                str(payload["job_id"]),
+                enrichment_from_dict(_object(payload["enrichment"])),
+                event_id=str(payload.get("event_id") or request_id),
+            )
+            return record_to_dict(record, include_history=False)
         if operation == "set_sorting_decision":
             record = self.registry.set_sorting_decision(
                 bean_ref_from_dict(_object(payload["bean_ref"])),
@@ -223,6 +277,13 @@ class ZeroMQRegistryServer:
                 event_id=str(payload.get("event_id") or request_id),
             )
             return record_to_dict(record, include_history=False)
+        if operation == "record_actuation":
+            record = self.registry.record_actuation(
+                bean_ref_from_dict(_object(payload["bean_ref"])),
+                actuation_from_dict(_object(payload["actuation"])),
+                event_id=str(payload.get("event_id") or request_id),
+            )
+            return record_to_dict(record, include_history=False)
         raise ValueError(f"unknown registry operation: {operation}")
 
     def _publish_waiting(self, socket: zmq.Socket) -> None:
@@ -233,6 +294,8 @@ class ZeroMQRegistryServer:
                 return
             envelope = {"schema": REGISTRY_SCHEMA, "event": event_to_dict(event)}
             socket.send_multipart((event.kind.encode("utf-8"), _encode(envelope)))
+            if self.event_observer is not None:
+                self.event_observer(event)
 
 
 class ZeroMQRegistryClient:
@@ -253,6 +316,32 @@ class ZeroMQRegistryClient:
 
     def ping(self) -> dict[str, object]:
         return _object(self._request("ping", {}))
+
+    def put_session(
+        self, session: RunSession, *, expected_revision: int | None = None
+    ) -> RunSession:
+        return run_session_from_dict(
+            _object(
+                self._request(
+                    "put_session",
+                    {
+                        "session": run_session_to_dict(session),
+                        "expected_revision": expected_revision,
+                    },
+                )
+            )
+        )
+
+    def get_session(self, run_id: str) -> RunSession:
+        return run_session_from_dict(
+            _object(self._request("get_session", {"run_id": run_id}))
+        )
+
+    def list_sessions(self) -> tuple[RunSession, ...]:
+        return tuple(
+            run_session_from_dict(_object(item))
+            for item in _array(self._request("list_sessions", {}))
+        )
 
     def get(self, bean_ref: BeanRef) -> BeanRecord:
         return record_from_dict(
@@ -276,9 +365,7 @@ class ZeroMQRegistryClient:
     def list_active(self, *, run_id: str | None = None) -> tuple[BeanRecord, ...]:
         return tuple(
             record_from_dict(_object(item))
-            for item in _array(
-                self._request("list_active", {"run_id": run_id})
-            )
+            for item in _array(self._request("list_active", {"run_id": run_id}))
         )
 
     def events_since(
@@ -332,9 +419,7 @@ class ZeroMQRegistryClient:
                 {
                     "track": encoded_track,
                     "prediction": (
-                        None
-                        if prediction is None
-                        else prediction_to_dict(prediction)
+                        None if prediction is None else prediction_to_dict(prediction)
                     ),
                     "event_id": event_id or uuid.uuid4().hex,
                 }
@@ -372,6 +457,69 @@ class ZeroMQRegistryClient:
                         "bean_ref": bean_ref_to_dict(bean_ref),
                         "enrichment": enrichment_to_dict(enrichment),
                         "event_id": identifier,
+                    },
+                )
+            )
+        )
+
+    def submit_inference_job(
+        self, job: InferenceJob, *, event_id: str | None = None
+    ) -> BeanRecord:
+        return record_from_dict(
+            _object(
+                self._request(
+                    "submit_inference_job",
+                    {
+                        "job": inference_job_to_dict(job),
+                        "event_id": event_id or job.job_id,
+                    },
+                )
+            )
+        )
+
+    def update_inference_job(
+        self,
+        bean_ref: BeanRef,
+        job_id: str,
+        status: InferenceStatus,
+        timestamp_ns: int,
+        *,
+        detail: str = "",
+        event_id: str | None = None,
+    ) -> BeanRecord:
+        return record_from_dict(
+            _object(
+                self._request(
+                    "update_inference_job",
+                    {
+                        "bean_ref": bean_ref_to_dict(bean_ref),
+                        "job_id": job_id,
+                        "status": status.value,
+                        "timestamp_ns": timestamp_ns,
+                        "detail": detail,
+                        "event_id": event_id or uuid.uuid4().hex,
+                    },
+                )
+            )
+        )
+
+    def complete_inference_job(
+        self,
+        bean_ref: BeanRef,
+        job_id: str,
+        enrichment: Enrichment,
+        *,
+        event_id: str | None = None,
+    ) -> BeanRecord:
+        return record_from_dict(
+            _object(
+                self._request(
+                    "complete_inference_job",
+                    {
+                        "bean_ref": bean_ref_to_dict(bean_ref),
+                        "job_id": job_id,
+                        "enrichment": enrichment_to_dict(enrichment),
+                        "event_id": event_id or f"complete:{job_id}",
                     },
                 )
             )
@@ -420,6 +568,26 @@ class ZeroMQRegistryClient:
             )
         )
 
+    def record_actuation(
+        self,
+        bean_ref: BeanRef,
+        result: ActuationResult,
+        *,
+        event_id: str | None = None,
+    ) -> BeanRecord:
+        return record_from_dict(
+            _object(
+                self._request(
+                    "record_actuation",
+                    {
+                        "bean_ref": bean_ref_to_dict(bean_ref),
+                        "actuation": actuation_to_dict(result),
+                        "event_id": event_id or f"actuation:{result.decision_id}",
+                    },
+                )
+            )
+        )
+
     def close(self) -> None:
         if self._socket is not None:
             self._socket.close(0)
@@ -461,7 +629,9 @@ class ZeroMQRegistryClient:
         if response.get("schema") != REGISTRY_SCHEMA:
             raise RegistryTransportError("invalid BeanRegistry response schema")
         if response.get("request_id") != request_id:
-            raise RegistryTransportError("BeanRegistry response ID does not match request")
+            raise RegistryTransportError(
+                "BeanRegistry response ID does not match request"
+            )
         if not response.get("ok"):
             error = _object(response.get("error", {}))
             raise RegistryRemoteError(
@@ -533,7 +703,9 @@ def _encode(value: object) -> bytes:
             value, allow_nan=False, separators=(",", ":"), sort_keys=True
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
-        raise RegistryTransportError(f"registry message is not finite JSON: {exc}") from exc
+        raise RegistryTransportError(
+            f"registry message is not finite JSON: {exc}"
+        ) from exc
 
 
 def _object(value: object) -> Mapping[str, object]:

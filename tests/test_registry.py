@@ -18,7 +18,15 @@ from beanoflight.registry import (
     RegistryConflictError,
     StaleRegistryUpdateError,
 )
-from beanoflight.registry_models import Enrichment, SortingDecision
+from beanoflight.registry_models import (
+    ActuationResult,
+    Enrichment,
+    InferenceJob,
+    InferenceStatus,
+    RunSession,
+    RunState,
+    SortingDecision,
+)
 from beanoflight.registry_sqlite import SQLiteBeanRepository
 
 
@@ -47,8 +55,7 @@ def track(
 ) -> TrackSnapshot:
     item = observation(frame_index, timestamp_ns, y_mm)
     covariance = tuple(
-        tuple(0.04 if row == column else 0.0 for column in range(4))
-        for row in range(4)
+        tuple(0.04 if row == column else 0.0 for column in range(4)) for row in range(4)
     )
     return TrackSnapshot(
         bean_ref=bean_ref,
@@ -64,6 +71,116 @@ def track(
 
 
 class BeanRegistryTests(unittest.TestCase):
+    def test_run_clock_inference_job_and_actuation_contract(self):
+        registry = BeanRegistry()
+        bean_ref = BeanRef("simulation-run", 1)
+        session = registry.put_session(
+            RunSession(
+                "simulation-run",
+                0,
+                RunState.CREATED,
+                "/recording",
+                "mkv",
+                100,
+                60.0,
+                30.0,
+                1_000,
+                1_000,
+                10_000,
+                False,
+                20,
+                20,
+                {"seed": 7},
+            ),
+            expected_revision=0,
+        )
+        session = registry.put_session(
+            replace(session, state=RunState.RUNNING, updated_timestamp_ns=21),
+            expected_revision=1,
+        )
+        self.assertEqual(session.source_to_monotonic_ns(2_000), 12_000)
+        self.assertEqual(session.monotonic_to_source_ns(12_000), 2_000)
+        paused = replace(
+            session,
+            state=RunState.PAUSED,
+            clock_source_timestamp_ns=2_000,
+            clock_monotonic_ns=12_000,
+        )
+        self.assertEqual(paused.monotonic_to_source_ns(99_000), 2_000)
+        with self.assertRaises(RegistryConflictError):
+            registry.put_session(
+                replace(session, source_path="/different-recording"),
+                expected_revision=session.revision,
+            )
+
+        registry.update_track(track(bean_ref, 0, 100, -25.0), event_id="track")
+        job = InferenceJob(
+            "job-1",
+            bean_ref,
+            InferenceStatus.SUBMITTED,
+            "CamL",
+            0,
+            100,
+            1,
+            300,
+            300,
+            False,
+            100,
+            100,
+        )
+        registry.submit_inference_job(job)
+        registry.update_inference_job(
+            bean_ref,
+            job.job_id,
+            InferenceStatus.ACCEPTED,
+            105,
+            event_id="accept-job",
+        )
+        with self.assertRaises(StaleRegistryUpdateError):
+            registry.complete_inference_job(
+                bean_ref,
+                job.job_id,
+                Enrichment(
+                    "mock-inferencer",
+                    "classification",
+                    {"category": "mould"},
+                    104,
+                    result_id="too-early",
+                ),
+            )
+        completed = registry.complete_inference_job(
+            bean_ref,
+            job.job_id,
+            Enrichment(
+                "mock-inferencer",
+                "classification",
+                {"category": "mould"},
+                120,
+                "mock-v1",
+                job.job_id,
+                0.91,
+            ),
+        )
+        self.assertEqual(completed.inference_jobs[0].status, InferenceStatus.COMPLETED)
+        self.assertEqual(completed.enrichments[0].result_id, job.job_id)
+
+        decision = SortingDecision(
+            "decision-1",
+            "sorter",
+            125,
+            180,
+            (0,),
+            close_timestamp_ns=190,
+            crossing_timestamp_ns=185,
+            based_on_revision=completed.revision,
+        )
+        registry.set_sorting_decision(bean_ref, decision)
+        actuated = registry.record_actuation(
+            bean_ref,
+            ActuationResult("decision-1", "virtual-actuator", 181, 191, True),
+        )
+        self.assertTrue(actuated.actuation.success)
+
     def test_revisioned_lifecycle_enrichment_and_sorting_decision(self):
         registry = BeanRegistry()
         events = registry.subscribe()
@@ -119,13 +236,9 @@ class BeanRegistryTests(unittest.TestCase):
         )
         self.assertEqual(decided.revision, 4)
         self.assertEqual(acknowledged.revision, 5)
-        self.assertEqual(
-            acknowledged.decision.acknowledged_timestamp_ns, 181_000_000
-        )
+        self.assertEqual(acknowledged.decision.acknowledged_timestamp_ns, 181_000_000)
         journal = registry.events_since(0)
-        self.assertEqual(
-            [event.stream_sequence for event in journal], [1, 2, 3, 4, 5]
-        )
+        self.assertEqual([event.stream_sequence for event in journal], [1, 2, 3, 4, 5])
         self.assertEqual(registry.events_since(3), journal[3:])
         with self.assertRaises(RegistryConflictError):
             registry.set_sorting_decision(
@@ -140,35 +253,109 @@ class BeanRegistryTests(unittest.TestCase):
         with self.assertRaises(StaleRegistryUpdateError):
             registry.update_track(track(bean_ref, 0, 100, -20.0))
         with self.assertRaises(RegistryConflictError):
-            registry.update_track(
-                track(bean_ref, 2, 300, 0.0), event_id="track-event"
-            )
+            registry.update_track(track(bean_ref, 2, 300, 0.0), event_id="track-event")
         with self.assertRaises(RegistryConflictError):
-            registry.update_track(
-                track(BeanRef("run", -1), 0, 100, -20.0)
-            )
+            registry.update_track(track(BeanRef("run", -1), 0, 100, -20.0))
 
     def test_terminal_track_cannot_be_resurrected(self):
         registry = BeanRegistry()
         bean_ref = BeanRef("run", 1)
         registry.update_track(track(bean_ref, 0, 100, -20.0))
-        registry.update_track(
-            track(bean_ref, 1, 200, 40.0, status=TrackStatus.EXITED)
-        )
+        registry.update_track(track(bean_ref, 1, 200, 40.0, status=TrackStatus.EXITED))
         with self.assertRaises(RegistryConflictError):
             registry.update_track(track(bean_ref, 2, 300, 50.0))
 
     def test_only_evicts_terminal_records_after_decision_acknowledgement(self):
         registry = BeanRegistry()
         bean_ref = BeanRef("run", 1)
-        exited = track(
-            bean_ref, 2, 300, 40.0, status=TrackStatus.EXITED
-        )
+        exited = track(bean_ref, 2, 300, 40.0, status=TrackStatus.EXITED)
         registry.update_track(exited)
         self.assertEqual(registry.evict_completed(before_timestamp_ns=301), 1)
 
 
 class SQLiteRegistryTests(unittest.TestCase):
+    def test_schema_one_session_is_migrated_in_place(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "version-one.db"
+            with sqlite3.connect(path) as connection:
+                connection.execute(
+                    "CREATE TABLE sessions("
+                    "run_id TEXT PRIMARY KEY, created_timestamp_ns INTEGER NOT NULL)"
+                )
+                connection.execute("INSERT INTO sessions VALUES ('old-run', 42)")
+                connection.execute("PRAGMA user_version=1")
+            with SQLiteBeanRepository(path) as repository:
+                session = repository.load_session("old-run")
+                self.assertEqual(session.run_id, "old-run")
+                self.assertEqual(session.source_kind, "implicit")
+                self.assertEqual(session.created_timestamp_ns, 42)
+                with sqlite3.connect(path) as connection:
+                    self.assertEqual(
+                        connection.execute("PRAGMA user_version").fetchone()[0], 2
+                    )
+
+    def test_session_and_async_state_survive_restart(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "beanoflight.db"
+            session = RunSession(
+                "run-session",
+                0,
+                RunState.RUNNING,
+                "/recording",
+                "raw-bundle",
+                601,
+                60.0,
+                60.0,
+                100,
+                100,
+                1_000,
+                False,
+                10,
+                11,
+                {"crop_size_px": 300},
+            )
+            with SQLiteBeanRepository(path) as repository:
+                registry = BeanRegistry(repository)
+                expected = registry.put_session(session)
+                bean_ref = BeanRef(session.run_id, 1)
+                registry.update_track(track(bean_ref, 0, 100, -25.0))
+                job = InferenceJob(
+                    "job",
+                    bean_ref,
+                    InferenceStatus.SUBMITTED,
+                    "CamL",
+                    0,
+                    100,
+                    1,
+                    300,
+                    300,
+                    False,
+                    100,
+                    100,
+                )
+                registry.submit_inference_job(job)
+                registry.complete_inference_job(
+                    bean_ref,
+                    job.job_id,
+                    Enrichment(
+                        "mock", "classification", "broken", 120, result_id="job"
+                    ),
+                )
+                decision = SortingDecision(
+                    "decision", "sorter", 125, 180, (0,), close_timestamp_ns=190
+                )
+                registry.set_sorting_decision(bean_ref, decision)
+                expected_record = registry.record_actuation(
+                    bean_ref,
+                    ActuationResult("decision", "virtual", 181, 191, True),
+                )
+            with SQLiteBeanRepository(path) as repository:
+                reopened = BeanRegistry(repository)
+                restored = reopened.get_session(session.run_id)
+                self.assertEqual(restored, expected)
+                self.assertEqual(repository.list_sessions(), (expected,))
+                self.assertEqual(reopened.get(bean_ref), expected_record)
+
     def test_frame_batch_rolls_back_registry_and_database_together(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "beanoflight.db"
@@ -231,9 +418,7 @@ class SQLiteRegistryTests(unittest.TestCase):
                     [event.stream_sequence for event in reopened.events_since(1)],
                     [2, 3, 4, 5],
                 )
-                self.assertEqual(
-                    reopened.event_identity("track-1")[0], bean_ref
-                )
+                self.assertEqual(reopened.event_identity("track-1")[0], bean_ref)
                 with sqlite3.connect(path) as connection:
                     observation_count = connection.execute(
                         "SELECT COUNT(*) FROM observations"

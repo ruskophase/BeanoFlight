@@ -14,7 +14,7 @@ from .background import BackgroundProvenance
 from .calibration import MetricPlaneCalibration
 from .detection import BeanDetector
 from .events import EventBus
-from .models import FrameAnalysis, Observation
+from .models import BeanRef, FrameAnalysis, Observation
 from .prediction import GateLayout, TrajectoryPredictor
 from .source import RecordingVideoSource
 from .tracking import TrackerSettings, TrackManager
@@ -69,6 +69,7 @@ class AnalysisEngine:
         self.gate_layout = gate_layout or GateLayout(calibration.sorting_line_y())
         self.events = events
         self.registry = registry
+        self.last_registry_revisions: dict[BeanRef, int] = {}
         self.tracker = TrackManager(
             top_y_mm=calibration.top_y_mm,
             bottom_y_mm=calibration.bottom_y_mm,
@@ -106,7 +107,7 @@ class AnalysisEngine:
             prediction_by_ref = {
                 prediction.bean_ref: prediction for prediction in predictions
             }
-            self.registry.update_tracks(
+            records = self.registry.update_tracks(
                 tuple(
                     (
                         track,
@@ -124,6 +125,11 @@ class AnalysisEngine:
                     for track in tracks
                 )
             )
+            self.last_registry_revisions = {
+                record.bean_ref: record.revision for record in records
+            }
+        else:
+            self.last_registry_revisions = {}
         processing_ms = (time.perf_counter_ns() - started) / 1_000_000.0
         return FrameAnalysis(
             frame_index=frame_index,

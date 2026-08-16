@@ -5,9 +5,9 @@ the live sorter. Other processes send commands or queries; they do not mutate
 Python objects or write SQLite tables directly.
 
 ```text
-Capture/shared frames -> Detector/Tracker -> BeanRegistry <- ResNet result
-                                               |
-                                               +-> sorting decision/ack
+Capture/shared frames -> Detector/Tracker -> BeanRegistry <- inference result
+       |                                       |
+       +-- bounded image crop -> inferencer    +-> sorting decision/result
                                                +-> monitoring events
                                                +-> SQLite WAL history
 ```
@@ -18,10 +18,11 @@ The public key is the full `BeanRef(run_id, sequence)`. The display may shorten
 the run UUID, but IPC and SQLite never do. Internal negative edge-suppression
 references are not submitted to the registry.
 
-The tracker exclusively owns lifecycle and kinematic state. ResNet and other
-workers may only append an `Enrichment`. The sorter may set a decision and
-acknowledge it; an acknowledged decision cannot be replaced. Each accepted
-change increments the bean's registry revision.
+The tracker exclusively owns lifecycle and kinematic state. Inference and other
+workers may only complete registered jobs and append an `Enrichment`. The
+sorter may set one decision; an actuator may acknowledge it and record one
+result. Completed outcomes cannot be replaced. Each accepted change increments
+the bean's registry revision.
 
 Every mutating command carries a caller-stable event ID. Repeating the same
 command is idempotent, including after a registry restart. Reusing an event ID,
@@ -29,14 +30,16 @@ enrichment result ID or decision ID for different content is rejected.
 
 ## Durable schema
 
-`SQLiteBeanRepository` enables WAL mode and schema version 1. It owns these
-normalized tables:
+`SQLiteBeanRepository` enables WAL mode and schema version 2. Version 1
+databases are migrated in place. It owns these normalized tables:
 
-- `sessions` and `beans` for identity and current lifecycle;
+- `sessions` and `beans` for run clocks, identity and current lifecycle;
 - `observations` and `track_states` for measurements and Kalman state;
 - `predictions` for sorting-line distributions and gate probabilities;
+- `inference_jobs` for crop provenance and delivery/completion status;
 - `enrichments` for versioned ML or property results;
 - `sorting_decisions` for proposed actions and acknowledgements;
+- `actuation_results` for observed virtual or physical gate cycles;
 - `registry_events` for the ordered, idempotent event journal.
 
 The state change and its event journal entry commit in one transaction. Full
@@ -116,6 +119,8 @@ merges it into the short in-memory history, while SQLite inserts only the new
 observation. Query and event responses omit observation history unless a full
 `get` is explicitly requested.
 
-Camera frames and image crops belong in a bounded shared-memory pool. A future
-crop request should carry a frame-slot generation plus bounding box; the
-registry stores the resulting properties, not image bytes.
+The recorded-source simulator sends one bounded, contiguous BGR crop over a
+separate ZeroMQ socket and never through the registry. The live implementation
+should replace that copy with a bounded shared-memory pool whose request carries
+a frame-slot generation plus bounding box. In both cases the registry stores
+job provenance and resulting properties, not image bytes.

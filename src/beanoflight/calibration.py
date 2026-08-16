@@ -5,13 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import cv2
 import numpy as np
-
 
 METRIC_SCHEMA = "beanoflight-metric-plane/v1"
 PINKPLANE_SCHEMAS = {"pinkplane-homography/v2"}
@@ -65,7 +65,9 @@ class MetricPlaneCalibration:
         values = np.asarray(tuple(points), dtype=np.float64)
         if values.size == 0:
             return ()
-        mapped = cv2.perspectiveTransform(values.reshape(-1, 1, 2), self.pixel_to_mm_matrix)
+        mapped = cv2.perspectiveTransform(
+            values.reshape(-1, 1, 2), self.pixel_to_mm_matrix
+        )
         return tuple((float(x), float(y)) for x, y in mapped.reshape(-1, 2))
 
     def measurement_covariance(
@@ -125,7 +127,7 @@ class MetricPlaneCalibration:
         *,
         image_size_px: tuple[int, int] = (1456, 1088),
         hole_pitch_mm: float = 9.16,
-    ) -> "MetricPlaneCalibration":
+    ) -> MetricPlaneCalibration:
         path = path.expanduser().resolve()
         if not math.isfinite(hole_pitch_mm) or hole_pitch_mm <= 0:
             raise CalibrationError("hole pitch must be positive")
@@ -134,8 +136,13 @@ class MetricPlaneCalibration:
             payload = json.loads(encoded)
         except (OSError, json.JSONDecodeError) as exc:
             raise CalibrationError(f"cannot read PinkPlane calibration: {exc}") from exc
-        if not isinstance(payload, dict) or payload.get("schema") not in PINKPLANE_SCHEMAS:
-            raise CalibrationError("metric conversion requires a PinkPlane v2 homography")
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") not in PINKPLANE_SCHEMAS
+        ):
+            raise CalibrationError(
+                "metric conversion requires a PinkPlane v2 homography"
+            )
         mapping = payload.get("mapping", {})
         if mapping.get("coordinate_domain") != "undistorted":
             raise CalibrationError("PinkPlane coordinates must be undistorted")
@@ -176,7 +183,9 @@ class MetricPlaneCalibration:
             inverse = _normalise_homography(np.linalg.inv(matrix))
         except np.linalg.LinAlgError as exc:
             raise CalibrationError("metric-plane mapping is singular") from exc
-        projected = cv2.perspectiveTransform(points.reshape(-1, 1, 2), matrix).reshape(-1, 2)
+        projected = cv2.perspectiveTransform(points.reshape(-1, 1, 2), matrix).reshape(
+            -1, 2
+        )
         centred_grid = grid - np.asarray(centre_grid)[None, :]
         errors = np.linalg.norm(projected - centred_grid, axis=1)
         top_y = _project(matrix, ((width - 1) * 0.5, 0.0))[1]
@@ -199,16 +208,25 @@ def _project(matrix: np.ndarray, point: tuple[float, float]) -> tuple[float, flo
     homogeneous = matrix @ np.asarray((point[0], point[1], 1.0), dtype=np.float64)
     if not np.all(np.isfinite(homogeneous)) or abs(float(homogeneous[2])) < 1e-12:
         raise CalibrationError("point maps to projective infinity")
-    return float(homogeneous[0] / homogeneous[2]), float(homogeneous[1] / homogeneous[2])
+    return float(homogeneous[0] / homogeneous[2]), float(
+        homogeneous[1] / homogeneous[2]
+    )
 
 
 def find_pinkplane_homography(video_path: Path) -> Path | None:
     """Locate the FastCap-copied homography beside a selected derivative."""
 
-    directory = video_path.resolve().parent
-    candidate = directory / "homography.json"
-    if candidate.is_file():
-        return candidate
+    resolved = video_path.resolve()
+    directories = (
+        (resolved / "postprocess", resolved / "calibration/geometry")
+        if resolved.is_dir()
+        else (resolved.parent,)
+    )
+    for directory in directories:
+        candidate = directory / "homography.json"
+        if candidate.is_file():
+            return candidate
+    directory = directories[0]
     report = directory / "report.json"
     if report.is_file():
         try:

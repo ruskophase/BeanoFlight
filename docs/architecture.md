@@ -21,9 +21,11 @@ integer is convenient inside a process, while the composite value remains
 unique when results from multiple recordings are combined.
 
 Review analysis stores only compact detections, states, covariance and short
-observation histories. It never stores decoded full frames. Free-run has a
-two-item display queue; if Tk cannot display every image, stale display images
-are discarded without skipping tracking input.
+observation histories. It never stores decoded full frames. Simulation has a
+latest-only display queue; if Tk cannot display every image, stale preview
+images are discarded without skipping tracking input. Crop transport has its
+own bounded queue, so inference backpressure is explicit and does not retain an
+unbounded collection of images.
 
 ## Coordinate and timing domains
 
@@ -50,6 +52,11 @@ the FoV. This accommodates the large inter-frame movement of a freely falling
 bean. A new ID is tentative until its second observation. Missing confirmed
 tracks become occluded and are propagated briefly; a track becomes exited when
 its prediction passes the calibrated lower boundary plus margin.
+
+`exited` ends image association, not flight prediction. The final propagated
+state continues to predict the sorting line 30 mm below the FoV, so a result
+arriving just after image exit can still produce a safe decision. Only a
+tentative track that becomes `cancelled` has no downstream prediction.
 
 The left and right birth margins are a separate acceptance rule. Detection is
 still performed and displayed inside those regions, but an unmatched first
@@ -86,12 +93,14 @@ keeps live adaptation separable from the version 0.1 recorded-video model.
 `BeanRegistry` is now the authoritative materialized state for public bean
 identities. `AnalysisEngine` accepts either an in-process registry or a
 ZeroMQ-backed registry client and submits every current track/prediction with
-an idempotent event ID. ResNet workers add versioned enrichments; a sorting
-worker adds and later acknowledges its decision. Neither can mutate tracker
-state.
+an idempotent event ID. Inference workers complete registered crop jobs and add
+versioned enrichments; a sorting worker adds an immutable decision, and a
+virtual or physical actuator records its observed result. Neither can mutate
+tracker state.
 
-SQLite WAL stores normalized observations, track states, predictions,
-enrichments, decisions and an ordered event journal. ZeroMQ request/reply is
+SQLite WAL stores run clocks, normalized observations, track states,
+predictions, crop-job metadata, enrichments, decisions, actuation results and
+an ordered event journal. ZeroMQ request/reply is
 the acknowledged write/query path. PUB/SUB is deliberately limited to bounded
 replaceable notifications. Each notification carries a persistent global
 stream sequence, so a critical consumer uses `events_since(cursor)` to recover
@@ -101,4 +110,5 @@ The original `EventBus` and `BeanStore` remain small same-process adapters for
 simple workers and backwards compatibility. They are not the live
 multi-process source of truth. See `bean-registry.md` for the process contract.
 
-No hardware output is present in version 0.1. Gate selection is diagnostic.
+No physical hardware output is present in version 0.1. Gate selection and
+actuation are diagnostic virtual operations.

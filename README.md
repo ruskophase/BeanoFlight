@@ -7,20 +7,22 @@ image positions into millimetres using PinkPlane's 9.16 mm hole grid, assigns
 stable bean IDs, and predicts where and when each bean will cross a virtual
 sorting line.
 
-The first release is deliberately a human-verification tool. It does not
-operate valves.
+The first release is deliberately a human-verification and software-simulation
+tool. It does not operate physical valves.
 
-## Review and Free-run modes
+## Review and Simulation modes
 
 **Review** is the default. Analyse a clip once, then move freely through the
 frames. Each bean is shown with its ID, lifecycle state, measured path,
 predicted path, 95% crossing interval, best virtual gate, probability and
 arrival time.
 
-**Free-run** processes the recording sequentially at its native frame rate. It
-uses a bounded display queue, keeps full-frame history out of the analysis
-result, and reports per-frame processing latency. This is the initial stand-in
-for a future live CamL frame source.
+**Simulation** replays the recording sequentially at a selected rate, including
+60 FPS or unlimited. Preview can be disabled, the display queue is latest-only,
+and full-frame history is never retained. Every eligible bean is cropped to a
+configurable 300 x 300 lossless BGR image and sent over a bounded ZeroMQ path.
+Source-read and detector/tracker latency are reported separately. This is the
+recorded-source stand-in for a future live CamL frame source.
 
 ## BeanRegistry
 
@@ -38,6 +40,41 @@ The service also publishes bounded state notifications for monitoring. Every
 event has a persistent stream sequence; critical consumers recover through the
 `events_since` query rather than assuming publish/subscribe delivery. Frame
 images are never written to the registry or its database.
+
+The simulation adds persistent run sessions, crop-job status, classification,
+sorting decisions and virtual actuation results. It still stores no images.
+
+## Asynchronous simulation
+
+Five independently startable GUI/service processes exercise the process
+boundaries intended for the machine:
+
+```bash
+beano-registry --database ./beanoflight-simulation.db
+beano-registry-monitor
+beano-mock-inferencer
+beano-sorter
+beano-flight /recordings/example
+```
+
+In BeanoFlight, select 11 empty background frames, choose **Simulation**, set
+the replay rate and preview option, then press **Run**. The mock inferencer
+delays each crop and adds a deterministic random category/confidence. The
+sorter applies its configurable policy and shows virtual 5 mm gates in black
+or red while active.
+
+`beano-simulation /recordings/example` is a convenience launcher; each button
+still creates an independent operating-system process. For repeatable headless
+acceptance runs against already-running services, use:
+
+```bash
+beano-system-test /recordings/example \
+  --background-frames 70,100,140,180,200,240,300,390,440,500,550 \
+  --target-fps 60
+```
+
+See [simulation.md](docs/simulation.md) for the data flow, crop policy, clock
+contract and operating sequence.
 
 ## OpenCV pipeline inspector
 
@@ -82,6 +119,10 @@ Select any of:
 - a FastCap recording directory;
 - its `postprocess` directory;
 - `CamL-calibrated.mkv` directly.
+
+Simulation also offers **Open RAW bundle**. It uses BeanoFastCap's calibration
+processor directly and requires the complete bundle. The calibrated MKV is the
+preferred fast review input; RAW replay is the parity/reference path.
 
 When `pairs.csv` is beside the video, video frame `n` uses that row's
 `left_timestamp_ns`. If the sidecar is absent or invalid, BeanoFlight clearly
@@ -160,6 +201,7 @@ PYTHONPATH=src python3 -m compileall -q src
 The test suite covers metric fitting, every diagnostic detector stage, guided
 background sampling, edge rejection and suppression, exact timestamps, global
 assignment, ID lifecycle, registry revision/idempotency rules, SQLite recovery,
-ZeroMQ IPC, async enrichment and sorting-gate probabilities.
+byte-exact crop IPC, async mock inference, sorting decisions and virtual gate
+actuation.
 Representative real recordings will be added as regression fixtures after the
 first detector-tuning session.

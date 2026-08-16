@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 import uuid
 from collections import OrderedDict, deque
@@ -15,11 +16,18 @@ from typing import Protocol
 from .events import EventBus
 from .models import BeanEvent, BeanRef, CrossingPrediction, TrackSnapshot, TrackStatus
 from .registry_models import (
+    ActuationResult,
     BeanRecord,
     Enrichment,
+    InferenceJob,
+    InferenceStatus,
+    RunSession,
+    RunState,
     SortingDecision,
+    actuation_to_dict,
     decision_to_dict,
     enrichment_to_dict,
+    inference_job_to_dict,
     observation_to_dict,
     prediction_to_dict,
     record_to_dict,
@@ -67,6 +75,12 @@ class RegistryRepository(Protocol):
 
     def batch(self) -> AbstractContextManager[None]: ...
 
+    def save_session(self, session: RunSession) -> None: ...
+
+    def load_session(self, run_id: str) -> RunSession | None: ...
+
+    def list_sessions(self) -> tuple[RunSession, ...]: ...
+
 
 class BeanRegistry:
     """Single-writer materialized state with validated worker enrichments."""
@@ -83,6 +97,7 @@ class BeanRegistry:
         self.events = events or EventBus()
         self._lock = threading.RLock()
         self._records: dict[BeanRef, BeanRecord] = {}
+        self._sessions: dict[str, RunSession] = {}
         self._processed: OrderedDict[str, tuple[BeanRef, str]] = OrderedDict()
         self._idempotency_capacity = max(128, int(idempotency_capacity))
         self._journal: deque[BeanEvent] = deque(
@@ -92,6 +107,78 @@ class BeanRegistry:
 
     def subscribe(self, *, capacity: int = 1_024):
         return self.events.subscribe(capacity=capacity)
+
+    def put_session(
+        self, session: RunSession, *, expected_revision: int | None = None
+    ) -> RunSession:
+        """Create or update a replay/live session with optimistic revision checks."""
+
+        _validate_session(session)
+        with self._lock:
+            previous = self._get_session_locked(session.run_id)
+            current_revision = 0 if previous is None else previous.revision
+            if expected_revision is not None and expected_revision != current_revision:
+                raise StaleRegistryUpdateError(
+                    f"run revision is {current_revision}, expected {expected_revision}"
+                )
+            if previous is not None:
+                _validate_run_transition(previous.state, session.state)
+                immutable_previous = (
+                    previous.source_path,
+                    previous.source_kind,
+                    previous.frame_count,
+                    previous.source_fps,
+                    previous.source_start_timestamp_ns,
+                )
+                immutable_incoming = (
+                    session.source_path,
+                    session.source_kind,
+                    session.frame_count,
+                    session.source_fps,
+                    session.source_start_timestamp_ns,
+                )
+                if immutable_incoming != immutable_previous:
+                    raise RegistryConflictError(
+                        "run source identity and timing cannot change after creation"
+                    )
+            stored = replace(
+                session,
+                revision=current_revision + 1,
+                created_timestamp_ns=(
+                    session.created_timestamp_ns
+                    if previous is None
+                    else previous.created_timestamp_ns
+                ),
+            )
+            # Validate settings before changing either persistence or hot state.
+            try:
+                json.dumps(stored.settings, allow_nan=False, separators=(",", ":"))
+            except (TypeError, ValueError) as exc:
+                raise RegistryConflictError(
+                    f"run settings must be finite JSON data: {exc}"
+                ) from exc
+            if self.repository is not None:
+                self.repository.save_session(stored)
+            self._sessions[stored.run_id] = stored
+            return stored
+
+    def get_session(self, run_id: str) -> RunSession:
+        with self._lock:
+            session = self._get_session_locked(run_id)
+            if session is None:
+                raise BeanNotFoundError(f"unknown run {run_id!r}")
+            return session
+
+    def list_sessions(self) -> tuple[RunSession, ...]:
+        with self._lock:
+            if self.repository is not None:
+                for session in self.repository.list_sessions():
+                    self._sessions.setdefault(session.run_id, session)
+            return tuple(
+                sorted(
+                    self._sessions.values(), key=lambda item: item.created_timestamp_ns
+                )
+            )
 
     def update_track(
         self,
@@ -110,9 +197,7 @@ class BeanRegistry:
 
     def update_tracks(
         self,
-        updates: Sequence[
-            tuple[TrackSnapshot, CrossingPrediction | None, str | None]
-        ],
+        updates: Sequence[tuple[TrackSnapshot, CrossingPrediction | None, str | None]],
     ) -> tuple[BeanRecord, ...]:
         """Commit one camera frame's track updates in a shared transaction."""
 
@@ -126,9 +211,7 @@ class BeanRegistry:
             previous_journal = deque(self._journal, maxlen=self._journal.maxlen)
             previous_sequence = self._stream_sequence
             transaction = (
-                nullcontext()
-                if self.repository is None
-                else self.repository.batch()
+                nullcontext() if self.repository is None else self.repository.batch()
             )
             try:
                 with transaction:
@@ -204,11 +287,11 @@ class BeanRegistry:
             prediction=prediction,
             enrichments=() if previous is None else previous.enrichments,
             decision=None if previous is None else previous.decision,
+            inference_jobs=() if previous is None else previous.inference_jobs,
+            actuation=None if previous is None else previous.actuation,
         )
         kind = _track_event_kind(previous, track.status)
-        event = self._event(
-            identifier, kind, record, track.timestamp_ns, fingerprint
-        )
+        event = self._event(identifier, kind, record, track.timestamp_ns, fingerprint)
         return record, self._commit(record, event)
 
     def add_enrichment(
@@ -222,9 +305,7 @@ class BeanRegistry:
         result_id = enrichment.result_id or uuid.uuid4().hex
         enrichment = replace(enrichment, result_id=result_id)
         identifier = event_id or result_id
-        fingerprint = _fingerprint(
-            "add_enrichment", enrichment_to_dict(enrichment)
-        )
+        fingerprint = _fingerprint("add_enrichment", enrichment_to_dict(enrichment))
         with self._lock:
             duplicate = self._duplicate(identifier, bean_ref, fingerprint)
             if duplicate is not None:
@@ -258,6 +339,190 @@ class BeanRegistry:
         self.events.publish(event)
         return record
 
+    def submit_inference_job(
+        self, job: InferenceJob, *, event_id: str | None = None
+    ) -> BeanRecord:
+        _validate_inference_job(job)
+        if job.status != InferenceStatus.SUBMITTED:
+            raise RegistryConflictError("a new inference job must be submitted")
+        identifier = event_id or job.job_id
+        fingerprint = _fingerprint("submit_inference_job", inference_job_to_dict(job))
+        with self._lock:
+            duplicate = self._duplicate(identifier, job.bean_ref, fingerprint)
+            if duplicate is not None:
+                return duplicate
+            previous = self._require_locked(job.bean_ref)
+            matching = tuple(
+                item for item in previous.inference_jobs if item.job_id == job.job_id
+            )
+            if matching:
+                if matching[0] != job:
+                    raise RegistryConflictError(
+                        "an inference job ID was reused with different content"
+                    )
+                return previous
+            if job.source_registry_revision > previous.revision:
+                raise RegistryConflictError(
+                    "inference job refers to a future bean revision"
+                )
+            record = replace(
+                previous,
+                revision=previous.revision + 1,
+                updated_timestamp_ns=max(
+                    previous.updated_timestamp_ns, job.updated_timestamp_ns
+                ),
+                inference_jobs=(*previous.inference_jobs, job),
+            )
+            event = self._event(
+                identifier,
+                "inference.submitted",
+                record,
+                job.updated_timestamp_ns,
+                fingerprint,
+            )
+            event = self._commit(record, event)
+        self.events.publish(event)
+        return record
+
+    def update_inference_job(
+        self,
+        bean_ref: BeanRef,
+        job_id: str,
+        status: InferenceStatus,
+        timestamp_ns: int,
+        *,
+        detail: str = "",
+        event_id: str | None = None,
+    ) -> BeanRecord:
+        identifier = event_id or uuid.uuid4().hex
+        fingerprint = _fingerprint(
+            "update_inference_job",
+            {
+                "job_id": job_id,
+                "status": status.value,
+                "timestamp_ns": int(timestamp_ns),
+                "detail": detail,
+            },
+        )
+        with self._lock:
+            duplicate = self._duplicate(identifier, bean_ref, fingerprint)
+            if duplicate is not None:
+                return duplicate
+            previous = self._require_locked(bean_ref)
+            jobs = list(previous.inference_jobs)
+            index = next(
+                (index for index, item in enumerate(jobs) if item.job_id == job_id),
+                None,
+            )
+            if index is None:
+                raise RegistryConflictError("inference job does not exist")
+            job = jobs[index]
+            _validate_inference_transition(job.status, status)
+            if timestamp_ns < job.updated_timestamp_ns:
+                raise StaleRegistryUpdateError(
+                    "inference update predates current job state"
+                )
+            updated = replace(
+                job,
+                status=status,
+                updated_timestamp_ns=int(timestamp_ns),
+                detail=detail,
+            )
+            if updated == job:
+                return previous
+            jobs[index] = updated
+            record = replace(
+                previous,
+                revision=previous.revision + 1,
+                updated_timestamp_ns=max(previous.updated_timestamp_ns, timestamp_ns),
+                inference_jobs=tuple(jobs),
+            )
+            event = self._event(
+                identifier,
+                f"inference.{status.value}",
+                record,
+                timestamp_ns,
+                fingerprint,
+            )
+            event = self._commit(record, event)
+        self.events.publish(event)
+        return record
+
+    def complete_inference_job(
+        self,
+        bean_ref: BeanRef,
+        job_id: str,
+        enrichment: Enrichment,
+        *,
+        event_id: str | None = None,
+    ) -> BeanRecord:
+        """Atomically complete one job and append its classification result."""
+
+        _validate_enrichment(enrichment)
+        if not enrichment.result_id:
+            enrichment = replace(enrichment, result_id=job_id)
+        identifier = event_id or f"complete:{job_id}"
+        fingerprint = _fingerprint(
+            "complete_inference_job",
+            {"job_id": job_id, "enrichment": enrichment_to_dict(enrichment)},
+        )
+        with self._lock:
+            duplicate = self._duplicate(identifier, bean_ref, fingerprint)
+            if duplicate is not None:
+                return duplicate
+            previous = self._require_locked(bean_ref)
+            jobs = list(previous.inference_jobs)
+            index = next(
+                (index for index, item in enumerate(jobs) if item.job_id == job_id),
+                None,
+            )
+            if index is None:
+                raise RegistryConflictError("inference job does not exist")
+            job = jobs[index]
+            _validate_inference_transition(job.status, InferenceStatus.COMPLETED)
+            if enrichment.timestamp_ns < job.updated_timestamp_ns:
+                raise StaleRegistryUpdateError(
+                    "inference completion predates the current job state"
+                )
+            matching = tuple(
+                item
+                for item in previous.enrichments
+                if item.result_id == enrichment.result_id
+            )
+            if matching and matching[0] != enrichment:
+                raise RegistryConflictError(
+                    "an enrichment result ID was reused with different content"
+                )
+            jobs[index] = replace(
+                job,
+                status=InferenceStatus.COMPLETED,
+                updated_timestamp_ns=enrichment.timestamp_ns,
+            )
+            enrichments = (
+                previous.enrichments
+                if matching
+                else (*previous.enrichments, enrichment)
+            )
+            record = replace(
+                previous,
+                revision=previous.revision + 1,
+                updated_timestamp_ns=max(
+                    previous.updated_timestamp_ns, enrichment.timestamp_ns
+                ),
+                inference_jobs=tuple(jobs),
+                enrichments=enrichments,
+            )
+            event = self._event(
+                identifier,
+                "inference.completed",
+                record,
+                enrichment.timestamp_ns,
+                fingerprint,
+            )
+            event = self._commit(record, event)
+        self.events.publish(event)
+        return record
+
     def set_sorting_decision(
         self,
         bean_ref: BeanRef,
@@ -269,14 +534,16 @@ class BeanRegistry:
         identifier = event_id or decision.decision_id or uuid.uuid4().hex
         if not decision.decision_id:
             decision = replace(decision, decision_id=identifier)
-        fingerprint = _fingerprint(
-            "set_sorting_decision", decision_to_dict(decision)
-        )
+        fingerprint = _fingerprint("set_sorting_decision", decision_to_dict(decision))
         with self._lock:
             duplicate = self._duplicate(identifier, bean_ref, fingerprint)
             if duplicate is not None:
                 return duplicate
             previous = self._require_locked(bean_ref)
+            if decision.based_on_revision > previous.revision:
+                raise RegistryConflictError(
+                    "sorting decision refers to a future bean revision"
+                )
             if previous.decision is not None:
                 if previous.decision.decision_id == decision.decision_id:
                     if previous.decision != decision:
@@ -358,6 +625,54 @@ class BeanRegistry:
         self.events.publish(event)
         return record
 
+    def record_actuation(
+        self,
+        bean_ref: BeanRef,
+        result: ActuationResult,
+        *,
+        event_id: str | None = None,
+    ) -> BeanRecord:
+        _validate_actuation(result)
+        identifier = event_id or f"actuation:{result.decision_id}"
+        fingerprint = _fingerprint("record_actuation", actuation_to_dict(result))
+        with self._lock:
+            duplicate = self._duplicate(identifier, bean_ref, fingerprint)
+            if duplicate is not None:
+                return duplicate
+            previous = self._require_locked(bean_ref)
+            if (
+                previous.decision is None
+                or previous.decision.decision_id != result.decision_id
+            ):
+                raise RegistryConflictError(
+                    "actuation does not match the sorting decision"
+                )
+            if previous.actuation is not None:
+                if previous.actuation != result:
+                    raise RegistryConflictError(
+                        "an actuation result was already recorded with different content"
+                    )
+                return previous
+            record = replace(
+                previous,
+                revision=previous.revision + 1,
+                updated_timestamp_ns=max(
+                    previous.updated_timestamp_ns,
+                    result.actual_close_timestamp_ns,
+                ),
+                actuation=result,
+            )
+            event = self._event(
+                identifier,
+                "sorting.actuated" if result.success else "sorting.failed",
+                record,
+                result.actual_close_timestamp_ns,
+                fingerprint,
+            )
+            event = self._commit(record, event)
+        self.events.publish(event)
+        return record
+
     def get(self, bean_ref: BeanRef) -> BeanRecord:
         with self._lock:
             return self._require_locked(bean_ref)
@@ -423,12 +738,21 @@ class BeanRegistry:
                 and record.updated_timestamp_ns < before_timestamp_ns
                 and (
                     record.decision is None
+                    or record.actuation is not None
                     or record.decision.acknowledged_timestamp_ns is not None
                 )
             )
             for bean_ref in targets:
                 self._records.pop(bean_ref, None)
             return len(targets)
+
+    def _get_session_locked(self, run_id: str) -> RunSession | None:
+        session = self._sessions.get(run_id)
+        if session is None and self.repository is not None:
+            session = self.repository.load_session(run_id)
+            if session is not None:
+                self._sessions[run_id] = session
+        return session
 
     def _get_locked(self, bean_ref: BeanRef) -> BeanRecord | None:
         record = self._records.get(bean_ref)
@@ -517,9 +841,7 @@ class BeanRegistry:
         )
         return event
 
-    def _remember(
-        self, event_id: str, bean_ref: BeanRef, fingerprint: str
-    ) -> None:
+    def _remember(self, event_id: str, bean_ref: BeanRef, fingerprint: str) -> None:
         self._processed[event_id] = (bean_ref, fingerprint)
         self._processed.move_to_end(event_id)
         while len(self._processed) > self._idempotency_capacity:
@@ -549,9 +871,7 @@ def _merge_track_history(
     return replace(incoming, history=(*previous.history, *additions))
 
 
-def _track_event_kind(
-    previous: BeanRecord | None, status: TrackStatus
-) -> str:
+def _track_event_kind(previous: BeanRecord | None, status: TrackStatus) -> str:
     if previous is None:
         return "bean.created"
     if status == TrackStatus.EXITED:
@@ -569,7 +889,110 @@ def _validate_enrichment(enrichment: Enrichment) -> None:
     if enrichment.timestamp_ns < 0:
         raise RegistryConflictError("enrichment timestamp cannot be negative")
     if enrichment.confidence is not None and not 0.0 <= enrichment.confidence <= 1.0:
-        raise RegistryConflictError("enrichment confidence must be between zero and one")
+        raise RegistryConflictError(
+            "enrichment confidence must be between zero and one"
+        )
+
+
+def _validate_session(session: RunSession) -> None:
+    if not session.run_id.strip():
+        raise RegistryConflictError("run ID is required")
+    if not session.source_path.strip() or not session.source_kind.strip():
+        raise RegistryConflictError("run source path and kind are required")
+    if session.revision < 0:
+        raise RegistryConflictError("run revision cannot be negative")
+    if session.frame_count <= 0 or session.source_fps <= 0:
+        raise RegistryConflictError("run frame count and source FPS must be positive")
+    if not math.isfinite(session.source_fps) or not math.isfinite(session.target_fps):
+        raise RegistryConflictError("run FPS values must be finite")
+    if session.target_fps < 0:
+        raise RegistryConflictError("target FPS cannot be negative")
+    if (
+        min(
+            session.source_start_timestamp_ns,
+            session.clock_source_timestamp_ns,
+            session.clock_monotonic_ns,
+            session.created_timestamp_ns,
+            session.updated_timestamp_ns,
+        )
+        < 0
+    ):
+        raise RegistryConflictError("run timestamps cannot be negative")
+    if session.updated_timestamp_ns < session.created_timestamp_ns:
+        raise RegistryConflictError("run update cannot predate run creation")
+
+
+def _validate_run_transition(previous: RunState, incoming: RunState) -> None:
+    allowed = {
+        RunState.CREATED: {RunState.CREATED, RunState.RUNNING, RunState.FAILED},
+        RunState.RUNNING: {
+            RunState.RUNNING,
+            RunState.PAUSED,
+            RunState.COMPLETED,
+            RunState.FAILED,
+        },
+        RunState.PAUSED: {
+            RunState.PAUSED,
+            RunState.RUNNING,
+            RunState.COMPLETED,
+            RunState.FAILED,
+        },
+        RunState.COMPLETED: set(),
+        RunState.FAILED: set(),
+    }
+    if incoming not in allowed[previous]:
+        raise RegistryConflictError(
+            f"invalid run transition {previous.value} -> {incoming.value}"
+        )
+
+
+def _validate_inference_job(job: InferenceJob) -> None:
+    if not job.job_id.strip() or not job.camera_id.strip():
+        raise RegistryConflictError("inference job and camera IDs are required")
+    if not job.bean_ref.run_id.strip() or job.bean_ref.sequence <= 0:
+        raise RegistryConflictError("inference job requires a public bean reference")
+    if job.frame_index < 0 or job.source_registry_revision <= 0:
+        raise RegistryConflictError(
+            "inference frame and bean revision must be positive"
+        )
+    if job.crop_width_px <= 0 or job.crop_height_px <= 0:
+        raise RegistryConflictError("inference crop dimensions must be positive")
+    if (
+        min(
+            job.capture_timestamp_ns,
+            job.submitted_timestamp_ns,
+            job.updated_timestamp_ns,
+        )
+        < 0
+    ):
+        raise RegistryConflictError("inference timestamps cannot be negative")
+
+
+def _validate_inference_transition(
+    previous: InferenceStatus, incoming: InferenceStatus
+) -> None:
+    allowed = {
+        InferenceStatus.SUBMITTED: {
+            InferenceStatus.SUBMITTED,
+            InferenceStatus.ACCEPTED,
+            InferenceStatus.COMPLETED,
+            InferenceStatus.FAILED,
+            InferenceStatus.DROPPED,
+        },
+        InferenceStatus.ACCEPTED: {
+            InferenceStatus.ACCEPTED,
+            InferenceStatus.COMPLETED,
+            InferenceStatus.FAILED,
+            InferenceStatus.DROPPED,
+        },
+        InferenceStatus.COMPLETED: {InferenceStatus.COMPLETED},
+        InferenceStatus.FAILED: {InferenceStatus.FAILED},
+        InferenceStatus.DROPPED: {InferenceStatus.DROPPED},
+    }
+    if incoming not in allowed[previous]:
+        raise RegistryConflictError(
+            f"invalid inference transition {previous.value} -> {incoming.value}"
+        )
 
 
 def _validate_status_transition(previous: TrackStatus, incoming: TrackStatus) -> None:
@@ -605,8 +1028,24 @@ def _validate_decision(decision: SortingDecision) -> None:
         raise RegistryConflictError("sorting decision timestamp cannot be negative")
     if decision.actuation_timestamp_ns < decision.timestamp_ns:
         raise RegistryConflictError("actuation cannot predate its sorting decision")
+    if (
+        decision.close_timestamp_ns is not None
+        and decision.close_timestamp_ns < decision.actuation_timestamp_ns
+    ):
+        raise RegistryConflictError("valve close cannot predate valve open")
+    if decision.based_on_revision < 0:
+        raise RegistryConflictError("decision bean revision cannot be negative")
     if len(set(decision.gate_indices)) != len(decision.gate_indices):
         raise RegistryConflictError("sorting decision gate indices must be unique")
+
+
+def _validate_actuation(result: ActuationResult) -> None:
+    if not result.decision_id.strip() or not result.source.strip():
+        raise RegistryConflictError("actuation decision ID and source are required")
+    if result.actual_open_timestamp_ns < 0:
+        raise RegistryConflictError("actuation open timestamp cannot be negative")
+    if result.actual_close_timestamp_ns < result.actual_open_timestamp_ns:
+        raise RegistryConflictError("actuation close cannot predate open")
 
 
 def _fingerprint(operation: str, value: object) -> str:

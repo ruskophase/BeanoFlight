@@ -52,7 +52,10 @@ class TrajectoryPredictor:
         self.process_acceleration_sigma_mm_s2 = process_acceleration_sigma_mm_s2
 
     def predict(self, track: TrackSnapshot) -> CrossingPrediction | None:
-        if track.status in (TrackStatus.EXITED, TrackStatus.CANCELLED):
+        # EXITED means the bean has left the image, not the machine. Its final
+        # propagated state is specifically what downstream sorting needs for
+        # the line below the FoV. Only an unconfirmed/cancelled track is invalid.
+        if track.status == TrackStatus.CANCELLED:
             return None
         x, y, vx, vy = track.state
         dt = _crossing_time(y, vy, self.layout.line_y_mm, self.gravity_mm_s2)

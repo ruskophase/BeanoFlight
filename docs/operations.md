@@ -70,3 +70,21 @@ Its default local endpoints are
 should place these sockets in a service-owned runtime directory and the SQLite
 database on local persistent storage. Do not place a WAL database on a network
 filesystem.
+
+## Multi-process simulation check
+
+Start `beano-simulation` for a convenience control panel, or run the registry,
+monitor, mock inferencer, sorter and BeanoFlight in separate terminals. Select
+the same command and crop endpoints in each GUI. Start the registry first;
+BeanoFlight refuses to begin Simulation if its ping is not acknowledged.
+
+Disable preview for throughput checks. BeanoFlight reports source-read and
+analysis time separately: on an FFV1 recording, software decoding may be the
+limiting stage even when the future live-camera detector path is within its
+16.67 ms budget. Inspect the registry monitor for a complete chain of
+`inference.submitted`, `inference.accepted`, `inference.completed`,
+`sorting.decision`, and, where policy selects a gate, `sorting.actuated`.
+
+The headless `beano-system-test` requires exactly 11 explicit, visually
+confirmed empty-frame indices and prints a JSON performance summary on
+completion. It uses the same replay core as the GUI.

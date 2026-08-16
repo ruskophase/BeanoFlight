@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from beanoflight.models import BeanRef, TrackSnapshot, TrackStatus
 from beanoflight.prediction import GateLayout, TrajectoryPredictor
@@ -30,6 +31,11 @@ class PredictionTests(unittest.TestCase):
         self.assertEqual(best.gate.index, 0)
         self.assertGreater(best.probability, 0.4)
         self.assertGreater(prediction.crossing_timestamp_ns, track.timestamp_ns)
+        exited_prediction = TrajectoryPredictor(GateLayout(67.0)).predict(
+            replace(track, status=TrackStatus.EXITED)
+        )
+        self.assertIsNotNone(exited_prediction)
+        self.assertEqual(exited_prediction.bean_ref, track.bean_ref)
 
     def test_gate_layout_requires_central_odd_gate(self):
         with self.assertRaises(ValueError):
