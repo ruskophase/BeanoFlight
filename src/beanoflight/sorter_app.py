@@ -14,8 +14,9 @@ from .sorter import SorterActivity, SorterService, SorterSettings
 
 class SorterApp(tk.Tk):
     def __init__(self, registry_endpoint: str) -> None:
-        super().__init__()
-        self.title("BeanoFlight — Sorter and Virtual Gates")
+        super().__init__(className="Beano Sorter")
+        self.title("BeanoSorter — Virtual Gates")
+        self.iconname("BeanoSorter")
         self.geometry("1150x720")
         self.minsize(900, 600)
         self.protocol("WM_DELETE_WINDOW", self._close)

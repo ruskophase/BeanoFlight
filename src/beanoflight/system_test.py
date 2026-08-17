@@ -28,9 +28,9 @@ def _background_indices(value: str) -> tuple[int, ...]:
         raise argparse.ArgumentTypeError(
             "background frames must be comma-separated integers"
         ) from exc
-    if len(result) != 11 or len(set(result)) != 11 or min(result, default=-1) < 0:
+    if len(result) != 3 or len(set(result)) != 3 or min(result, default=-1) < 0:
         raise argparse.ArgumentTypeError(
-            "exactly 11 distinct non-negative background frame indices are required"
+            "exactly 3 distinct non-negative background frame indices are required"
         )
     return result
 
@@ -48,8 +48,8 @@ def parser() -> argparse.ArgumentParser:
         "--background-frames",
         required=True,
         type=_background_indices,
-        metavar="I0,I1,...,I10",
-        help="11 human-confirmed empty zero-based frame indices",
+        metavar="I0,I1,I2",
+        help="3 human-confirmed empty zero-based frame indices",
     )
     result.add_argument("--homography", type=Path)
     result.add_argument("--prefer-raw", action="store_true")
@@ -84,7 +84,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         source = open_replay_source(
             arguments.recording,
             prefer_raw=arguments.prefer_raw,
-            cache_frames=11,
+            cache_frames=3,
         )
         invalid = tuple(
             index

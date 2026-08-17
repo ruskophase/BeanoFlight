@@ -19,11 +19,21 @@ from .mock_inference import (
 )
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
 
+RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
+
+
+def crop_preview_image(image_bgr) -> Image.Image:
+    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    image = Image.fromarray(rgb)
+    image.thumbnail((440, 440), RESAMPLE)
+    return image
+
 
 class MockInferencerApp(tk.Tk):
     def __init__(self, registry_endpoint: str, crop_endpoint: str) -> None:
-        super().__init__()
-        self.title("BeanoFlight — Mock Inferencer")
+        super().__init__(className="Mock Inferencer")
+        self.title("Mock Inferencer")
+        self.iconname("Mock Inferencer")
         self.geometry("1050x700")
         self.minsize(850, 580)
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -145,13 +155,16 @@ class MockInferencerApp(tk.Tk):
                 item = self._activities.get_nowait()
             except queue.Empty:
                 break
-            if item.crop is not None:
-                self._show_crop(item.crop)
             message = f"{item.kind:10} {item.bean_id} {item.category}"
             if item.confidence is not None:
                 message += f" {item.confidence:.1%}"
             if item.detail:
                 message += f" · {item.detail}"
+            if item.crop is not None:
+                try:
+                    self._show_crop(item.crop)
+                except Exception as exc:  # noqa: BLE001 - keep activity polling alive
+                    message += f" · preview error: {exc}"
             self.activity.configure(state=tk.NORMAL)
             self.activity.insert("1.0", message + "\n")
             if int(self.activity.index("end-1c").split(".")[0]) > 300:
@@ -172,9 +185,7 @@ class MockInferencerApp(tk.Tk):
         self.after(50, self._poll)
 
     def _show_crop(self, image_bgr) -> None:
-        rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(rgb)
-        image.thumbnail((440, 440), Image.Resampling.LANCZOS)
+        image = crop_preview_image(image_bgr)
         self._photo = ImageTk.PhotoImage(image)
         self.image_label.configure(image=self._photo)
 

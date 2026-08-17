@@ -4,9 +4,10 @@
 2. Confirm that the status line says `exact FastCap timestamps`.
 3. Confirm that the metric calibration has loaded and reports its RMS.
 4. Find a frame without beans and choose **Use current frame as background**.
-   For a more representative model, choose **Choose 11 empty frames for
+   For a more representative model, choose **Choose 3 empty frames for
    background**. Mark each stratified candidate `Empty` or `Contains
-   foreground`; only accepted frames enter the median.
+   foreground`; only accepted frames enter the median. `U`/`Y` means use and
+   `N` means do not use, in either upper or lower case.
 5. Enable **Inspect frozen frame step-by-step**.
 6. Move through the ten OpenCV stages. The caption records every relevant
    setting used for the displayed result.
@@ -85,6 +86,6 @@ limiting stage even when the future live-camera detector path is within its
 `inference.submitted`, `inference.accepted`, `inference.completed`,
 `sorting.decision`, and, where policy selects a gate, `sorting.actuated`.
 
-The headless `beano-system-test` requires exactly 11 explicit, visually
+The headless `beano-system-test` requires exactly 3 explicit, visually
 confirmed empty-frame indices and prints a JSON performance summary on
 completion. It uses the same replay core as the GUI.

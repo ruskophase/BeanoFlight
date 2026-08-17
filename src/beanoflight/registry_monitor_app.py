@@ -14,8 +14,9 @@ from .registry_service import DEFAULT_COMMAND_ENDPOINT
 
 class RegistryMonitorApp(tk.Tk):
     def __init__(self, registry_endpoint: str) -> None:
-        super().__init__()
-        self.title("BeanoFlight — BeanRegistry Monitor")
+        super().__init__(className="BeanRegistry Monitor")
+        self.title("BeanRegistry Monitor")
+        self.iconname("BeanRegistry Monitor")
         self.geometry("1500x800")
         self.minsize(1050, 620)
         self.protocol("WM_DELETE_WINDOW", self._close)

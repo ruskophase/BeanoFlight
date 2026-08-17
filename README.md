@@ -57,7 +57,7 @@ beano-sorter
 beano-flight /recordings/example
 ```
 
-In BeanoFlight, select 11 empty background frames, choose **Simulation**, set
+In BeanoFlight, select 3 empty background frames, choose **Simulation**, set
 the replay rate and preview option, then press **Run**. The mock inferencer
 delays each crop and adds a deterministic random category/confidence. The
 sorter applies its configurable policy and shows virtual 5 mm gates in black
@@ -69,7 +69,7 @@ acceptance runs against already-running services, use:
 
 ```bash
 beano-system-test /recordings/example \
-  --background-frames 70,100,140,180,200,240,300,390,440,500,550 \
+  --background-frames 43,222,347 \
   --target-fps 60
 ```
 
@@ -103,14 +103,15 @@ pixels, and inspector masks are enlarged to the native display size without
 smoothing so individual processing pixels remain visible.
 
 Use **Use current frame as background** on a genuinely empty frame, or choose
-**Choose 11 empty frames for background**. The guided selector presents frames
-chosen randomly within eleven evenly distributed sections of the recording,
+**Choose 3 empty frames for background**. The guided selector presents frames
+chosen randomly within three evenly distributed sections of the recording,
 followed by replacement passes when a candidate contains foreground. Mark each
 candidate empty or containing foreground; only human-confirmed empty frames
-enter the temporal median. The selected indices and random seed are retained
-in the exported analysis. Median calculation is tiled to avoid making a second
-full-size stack of all eleven colour frames. A good background is the most
-important prerequisite for useful tuning.
+enter the temporal median. The dialog also accepts upper- or lower-case `U`/`Y`
+to use a frame and `N` to skip it. The selected indices and random seed are
+retained in the exported analysis. Median calculation is tiled to avoid making
+a second full-size stack of all three colour frames. A good background is the
+most important prerequisite for useful tuning.
 
 ## Input contract
 

@@ -45,6 +45,15 @@ VIDEO_TYPES = [
 RESAMPLE = getattr(Image, "Resampling", Image).BILINEAR
 
 
+def background_key_action(keysym: str) -> str | None:
+    key = keysym.lower()
+    if key in {"u", "y"}:
+        return "use"
+    if key == "n":
+        return "skip"
+    return None
+
+
 class ImagePane(ttk.Frame):
     def __init__(self, parent: tk.Misc) -> None:
         super().__init__(parent)
@@ -114,7 +123,7 @@ class BackgroundSelectionDialog(tk.Toplevel):
         parent: tk.Misc,
         source: ReplaySource,
         *,
-        requested_frames: int = 11,
+        requested_frames: int = 3,
     ) -> None:
         super().__init__(parent)
         self.title("BeanoFlight — choose empty background frames")
@@ -154,21 +163,26 @@ class BackgroundSelectionDialog(tk.Toplevel):
         buttons.pack(fill=tk.X)
         ttk.Button(
             buttons,
-            text="Empty — use this frame",
+            text="Empty — use this frame [U/Y]",
             command=self._accept,
         ).pack(side=tk.LEFT, expand=True, fill=tk.X)
         ttk.Button(
             buttons,
-            text="Contains foreground — skip",
+            text="Contains foreground — skip [N]",
             command=self._reject,
         ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=8)
         ttk.Button(buttons, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
-        self.bind("<Key-y>", lambda _event: self._accept())
-        self.bind("<Key-Y>", lambda _event: self._accept())
-        self.bind("<Key-n>", lambda _event: self._reject())
-        self.bind("<Key-N>", lambda _event: self._reject())
+        self.bind("<KeyPress>", self._key_pressed)
         self.grab_set()
+        self.after_idle(self.focus_force)
         self._show_candidate()
+
+    def _key_pressed(self, event: tk.Event) -> None:
+        action = background_key_action(str(event.keysym))
+        if action == "use":
+            self._accept()
+        elif action == "skip":
+            self._reject()
 
     def wait_for_result(self) -> tuple[tuple[int, ...], int] | None:
         self.wait_window()
@@ -200,7 +214,7 @@ class BackgroundSelectionDialog(tk.Toplevel):
         self.detail_var.set(
             f"Candidate video frame {index + 1:,}. "
             f"Confirmed empty: {len(self.accepted)} / {self.target}. "
-            "Keyboard shortcuts: Y = empty, N = foreground."
+            "Keyboard shortcuts (upper or lower case): U/Y = use, N = do not use."
         )
 
     def _accept(self) -> None:
@@ -243,8 +257,9 @@ class BeanoFlightApp(tk.Tk):
         hole_pitch_mm: float = 9.16,
         sorting_offset_mm: float = 30.0,
     ) -> None:
-        super().__init__()
-        self.title("BeanoFlight — bean tracking and trajectory review")
+        super().__init__(className="BeanoFlight")
+        self.title("BeanoFlight")
+        self.iconname("BeanoFlight")
         self.geometry("1800x920")
         self.minsize(1350, 760)
         self.configure(background="#12161b")
@@ -586,7 +601,7 @@ class BeanoFlightApp(tk.Tk):
         ).grid(row=button_row + 2, column=0, columnspan=2, sticky=tk.EW, pady=3)
         ttk.Button(
             parent,
-            text="Choose 11 empty frames for background…",
+            text="Choose 3 empty frames for background…",
             command=self.build_guided_background,
         ).grid(row=button_row + 3, column=0, columnspan=2, sticky=tk.EW, pady=3)
         ttk.Label(
@@ -818,7 +833,7 @@ class BeanoFlightApp(tk.Tk):
             )
         self.status_var.set(
             "Frame 1 is the temporary background; select a clean frame or choose "
-            "11 confirmed-empty frames."
+            "3 confirmed-empty frames."
         )
         self._refresh_display()
 
@@ -910,7 +925,7 @@ class BeanoFlightApp(tk.Tk):
             return
         self.stop_work()
         result = BackgroundSelectionDialog(
-            self, self.source, requested_frames=11
+            self, self.source, requested_frames=3
         ).wait_for_result()
         if result is None:
             self.status_var.set(

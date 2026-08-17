@@ -58,7 +58,7 @@ Then start the replay GUI:
 beano-flight /path/to/fastcap-bundle
 ```
 
-Choose exactly 11 human-confirmed empty frames. In **Simulation**, choose a
+Choose exactly 3 human-confirmed empty frames. In **Simulation**, choose a
 target rate, disable preview for the fairest throughput measurement, and run.
 Use **Unlimited** to measure the sustainable rate without deliberate sleeps.
 A 60 FPS target preserves source time at real-time scale but cannot compensate
@@ -69,7 +69,7 @@ For the supplied exploratory recording, one useful confirmed-empty candidate
 set is:
 
 ```text
-70, 100, 140, 180, 200, 240, 300, 390, 440, 500, 550
+43, 222, 347
 ```
 
 These are zero-based indices and should still be visually checked. Test-override
@@ -79,8 +79,8 @@ hidden beneath the overlay cannot be recovered.
 The matching headless invocation is:
 
 ```bash
-beano-system-test /path/to/20260813T051947.479248Z-beans \
-  --background-frames 70,100,140,180,200,240,300,390,440,500,550 \
+beano-system-test /path/to/20260816T134132.801241Z-beans \
+  --background-frames 43,222,347 \
   --target-fps 60
 ```
 

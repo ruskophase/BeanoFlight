@@ -16,8 +16,9 @@ from .registry_service import DEFAULT_COMMAND_ENDPOINT, DEFAULT_EVENT_ENDPOINT
 
 class SimulationLauncherApp(tk.Tk):
     def __init__(self, initial_recording: Path | None = None) -> None:
-        super().__init__()
-        self.title("BeanoFlight — Simulation Launcher")
+        super().__init__(className="BeanoFlight Simulation")
+        self.title("BeanoFlight Simulation Launcher")
+        self.iconname("BeanoFlight Simulation")
         self.geometry("800x500")
         self.minsize(700, 430)
         self.protocol("WM_DELETE_WINDOW", self._close)

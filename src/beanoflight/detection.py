@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from typing import Iterable
 
 import cv2
 import numpy as np
@@ -52,11 +52,13 @@ class DetectorSettings:
             (self.min_height_px, self.max_height_px),
         ):
             if low <= 0 or high <= low:
-                raise DetectorError("component minimums must be positive and below maximums")
+                raise DetectorError(
+                    "component minimums must be positive and below maximums"
+                )
         if not 0.0 <= self.min_solidity <= 1.0:
             raise DetectorError("minimum solidity must be between 0 and 1")
 
-    def updated(self, **values: object) -> "DetectorSettings":
+    def updated(self, **values: object) -> DetectorSettings:
         result = replace(self, **values)
         result.validate()
         return result
@@ -114,7 +116,9 @@ class BeanDetector:
                         (native_width, native_height),
                         interpolation=cv2.INTER_NEAREST,
                     )
-                stages.append(PipelineStage(key, name, displayed.copy(), values, explanation))
+                stages.append(
+                    PipelineStage(key, name, displayed.copy(), values, explanation)
+                )
 
         stage(
             "input",
@@ -142,7 +146,9 @@ class BeanDetector:
             or self._background_blurred is None
         ):
             processing_background = (
-                cv2.resize(background_bgr, processing_size, interpolation=cv2.INTER_AREA)
+                cv2.resize(
+                    background_bgr, processing_size, interpolation=cv2.INTER_AREA
+                )
                 if scale < 0.999
                 else background_bgr
             )
@@ -155,7 +161,10 @@ class BeanDetector:
             "blur",
             "3. Gaussian blur",
             blurred,
-            (f"kernel={settings.blur_kernel}x{settings.blur_kernel}", "sigma=OpenCV automatic"),
+            (
+                f"kernel={settings.blur_kernel}x{settings.blur_kernel}",
+                "sigma=OpenCV automatic",
+            ),
             "Suppresses sensor noise before differencing.",
         )
         difference = cv2.absdiff(blurred, background_blurred)
@@ -177,7 +186,10 @@ class BeanDetector:
             "Converts background difference into foreground candidates.",
         )
         closed = _morph(
-            thresholded, cv2.MORPH_CLOSE, settings.close_kernel, settings.close_iterations
+            thresholded,
+            cv2.MORPH_CLOSE,
+            settings.close_kernel,
+            settings.close_iterations,
         )
         stage(
             "close",
@@ -238,8 +250,14 @@ class BeanDetector:
                 component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
             contour_area = float(sum(cv2.contourArea(contour) for contour in contours))
-            hull_points = np.vstack(contours) if contours else np.empty((0, 1, 2), np.int32)
-            hull_area = float(cv2.contourArea(cv2.convexHull(hull_points))) if len(hull_points) else 0.0
+            hull_points = (
+                np.vstack(contours) if contours else np.empty((0, 1, 2), np.int32)
+            )
+            hull_area = (
+                float(cv2.contourArea(cv2.convexHull(hull_points)))
+                if len(hull_points)
+                else 0.0
+            )
             solidity = contour_area / hull_area if hull_area > 0 else 0.0
             native_x = max(0, round(x / scale))
             native_y = max(0, round(y / scale))
@@ -331,7 +349,9 @@ class BeanDetector:
         )
         return DetectionResult(tuple(detections), tuple(stages))
 
-    def inspect(self, frame_bgr: np.ndarray, background_bgr: np.ndarray) -> DetectionResult:
+    def inspect(
+        self, frame_bgr: np.ndarray, background_bgr: np.ndarray
+    ) -> DetectionResult:
         return self.detect(frame_bgr, background_bgr, inspect=True)
 
 
@@ -340,10 +360,12 @@ def temporal_median_background(frames: Iterable[np.ndarray]) -> np.ndarray:
     if not selected:
         raise DetectorError("at least one frame is required for a background")
     reference_shape = selected[0].shape
-    if any(frame.shape != reference_shape or frame.dtype != np.uint8 for frame in selected):
+    if any(
+        frame.shape != reference_shape or frame.dtype != np.uint8 for frame in selected
+    ):
         raise DetectorError("background frames must have matching uint8 shapes")
-    # Eleven native Beano colour frames are already about 52 MB. Work in row tiles
-    # so calculating the median does not create another full-size frame stack.
+    # Native Beano colour frames are large. Work in row tiles so calculating the
+    # median does not create another full-size frame stack.
     result = np.empty(reference_shape, dtype=np.uint8)
     tile_rows = 64
     for start in range(0, reference_shape[0], tile_rows):
@@ -353,7 +375,9 @@ def temporal_median_background(frames: Iterable[np.ndarray]) -> np.ndarray:
     return result
 
 
-def _morph(image: np.ndarray, operation: int, kernel_size: int, iterations: int) -> np.ndarray:
+def _morph(
+    image: np.ndarray, operation: int, kernel_size: int, iterations: int
+) -> np.ndarray:
     if iterations == 0:
         return image.copy()
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
