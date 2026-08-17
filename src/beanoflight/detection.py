@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from .models import Detection, PipelineStage
+from .source import RawReplayFrame
 
 
 class DetectorError(ValueError):
@@ -353,6 +354,156 @@ class BeanDetector:
         self, frame_bgr: np.ndarray, background_bgr: np.ndarray
     ) -> DetectionResult:
         return self.detect(frame_bgr, background_bgr, inspect=True)
+
+
+class RawGreenDetector:
+    """Bean segmentation on the compact green plane of an RGGB RAW frame."""
+
+    def __init__(self, settings: DetectorSettings | None = None) -> None:
+        self.settings = settings or DetectorSettings()
+        self.settings.validate()
+        self._background_source: np.ndarray | None = None
+        self._background_blurred: np.ndarray | None = None
+        self._processing_size: tuple[int, int] | None = None
+
+    def detect(
+        self,
+        frame: RawReplayFrame,
+        background_gray: np.ndarray,
+        *,
+        inspect: bool = False,
+    ) -> DetectionResult:
+        if inspect:
+            raise DetectorError(
+                "the pipeline inspector uses calibrated Review frames, not RAW replay"
+            )
+        gray = frame.detection_gray
+        if not isinstance(gray, np.ndarray) or gray.dtype != np.uint8 or gray.ndim != 2:
+            raise DetectorError("RAW detection frame must contain an 8-bit green plane")
+        if (
+            not isinstance(background_gray, np.ndarray)
+            or background_gray.dtype != np.uint8
+            or background_gray.shape != gray.shape
+        ):
+            raise DetectorError("RAW background must match the frame green plane")
+        settings = self.settings
+        native_width, native_height = frame.native_size_px
+        processing_size = (
+            max(1, round(native_width * settings.processing_scale)),
+            max(1, round(native_height * settings.processing_scale)),
+        )
+        if gray.shape[::-1] == processing_size:
+            processing_gray = gray
+        else:
+            processing_gray = cv2.resize(
+                gray, processing_size, interpolation=cv2.INTER_AREA
+            )
+        blur_size = (settings.blur_kernel, settings.blur_kernel)
+        blurred = cv2.GaussianBlur(processing_gray, blur_size, 0)
+        if (
+            self._background_source is not background_gray
+            or self._processing_size != processing_size
+            or self._background_blurred is None
+        ):
+            processing_background = (
+                background_gray
+                if background_gray.shape[::-1] == processing_size
+                else cv2.resize(
+                    background_gray, processing_size, interpolation=cv2.INTER_AREA
+                )
+            )
+            self._background_blurred = cv2.GaussianBlur(
+                processing_background, blur_size, 0
+            )
+            self._background_source = background_gray
+            self._processing_size = processing_size
+        difference = cv2.absdiff(blurred, self._background_blurred)
+        _unused, foreground = cv2.threshold(
+            difference, settings.threshold, 255, cv2.THRESH_BINARY
+        )
+        foreground = _morph(
+            foreground,
+            cv2.MORPH_CLOSE,
+            settings.close_kernel,
+            settings.close_iterations,
+        )
+        foreground = _morph(
+            foreground,
+            cv2.MORPH_OPEN,
+            settings.open_kernel,
+            settings.open_iterations,
+        )
+        foreground = _morph(
+            foreground,
+            cv2.MORPH_DILATE,
+            settings.dilate_kernel,
+            settings.dilate_iterations,
+        )
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            foreground, connectivity=8
+        )
+        scale_x = processing_size[0] / native_width
+        scale_y = processing_size[1] / native_height
+        detections: list[Detection] = []
+        for label in range(1, count):
+            x, y, width, height, area = (int(value) for value in stats[label])
+            native_x = max(0, round(x / scale_x))
+            native_y = max(0, round(y / scale_y))
+            native_width_component = max(1, round(width / scale_x))
+            native_height_component = max(1, round(height / scale_y))
+            native_area = max(1, round(area / (scale_x * scale_y)))
+            if not (
+                settings.min_area_px <= native_area <= settings.max_area_px
+                and settings.min_width_px
+                <= native_width_component
+                <= settings.max_width_px
+                and settings.min_height_px
+                <= native_height_component
+                <= settings.max_height_px
+            ):
+                continue
+            roi_labels = labels[y : y + height, x : x + width]
+            component_mask = np.asarray(roi_labels == label, dtype=np.uint8) * 255
+            contours, _hierarchy = cv2.findContours(
+                component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            contour_area = float(sum(cv2.contourArea(item) for item in contours))
+            hull_points = (
+                np.vstack(contours) if contours else np.empty((0, 1, 2), np.int32)
+            )
+            hull_area = (
+                float(cv2.contourArea(cv2.convexHull(hull_points)))
+                if len(hull_points)
+                else 0.0
+            )
+            solidity = contour_area / hull_area if hull_area > 0 else 0.0
+            if solidity < settings.min_solidity:
+                continue
+            mean_gray = float(
+                cv2.mean(
+                    processing_gray[y : y + height, x : x + width],
+                    mask=component_mask,
+                )[0]
+            )
+            detections.append(
+                Detection(
+                    centroid_px=(
+                        float(centroids[label][0] / scale_x),
+                        float(centroids[label][1] / scale_y),
+                    ),
+                    bbox_px=(
+                        native_x,
+                        native_y,
+                        native_width_component,
+                        native_height_component,
+                    ),
+                    area_px=native_area,
+                    solidity=float(solidity),
+                    mean_bgr=(mean_gray, mean_gray, mean_gray),
+                )
+            )
+        detections.sort(key=lambda value: (value.centroid_px[1], value.centroid_px[0]))
+        return DetectionResult(tuple(detections), ())
 
 
 def temporal_median_background(frames: Iterable[np.ndarray]) -> np.ndarray:

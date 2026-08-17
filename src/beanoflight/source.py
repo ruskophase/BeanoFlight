@@ -5,14 +5,18 @@ from __future__ import annotations
 import csv
 import json
 import math
+import mmap
+import os
 import sys
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 import cv2
+import numpy as np
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mkv", ".avi", ".mov", ".mp4", ".m4v", ".webm"}
 
@@ -41,6 +45,31 @@ class ReplaySource(Protocol):
     def frame(self, index: int): ...
 
     def close(self) -> None: ...
+
+
+@dataclass(slots=True)
+class RawReplayFrame:
+    """One mmap-backed Bayer frame plus its compact detection representation."""
+
+    index: int
+    path: Path
+    detection_gray: np.ndarray
+    native_size_px: tuple[int, int]
+    _mapping: mmap.mmap | None
+    _mosaic: np.ndarray | None
+
+    @property
+    def mosaic(self) -> np.ndarray:
+        if self._mosaic is None:
+            raise SourceError("RAW replay frame has already been released")
+        return self._mosaic
+
+    def close(self) -> None:
+        self._mosaic = None
+        mapping = self._mapping
+        self._mapping = None
+        if mapping is not None:
+            mapping.close()
 
 
 def resolve_caml_video(path: Path) -> Path:
@@ -155,6 +184,14 @@ class RecordingVideoSource:
         self._capture = None
         self._cache.clear()
 
+    @staticmethod
+    def release_frame(_frame) -> None:
+        return
+
+    @staticmethod
+    def preview_frame(frame):
+        return frame
+
     def __enter__(self) -> RecordingVideoSource:  # noqa: PYI034 - Python 3.10
         return self
 
@@ -235,6 +272,14 @@ class RawBundleVideoSource:
     def close(self) -> None:
         self._cache.clear()
 
+    @staticmethod
+    def release_frame(_frame) -> None:
+        return
+
+    @staticmethod
+    def preview_frame(frame):
+        return frame
+
     def __enter__(self) -> RawBundleVideoSource:  # noqa: PYI034 - Python 3.10
         return self
 
@@ -245,6 +290,431 @@ class RawBundleVideoSource:
         if not 0 <= index < len(self._rows):
             raise SourceError(f"frame {index} is outside the RAW bundle")
         return self._rows[index]
+
+
+class MMapRawVideoSource:
+    """Fast CamL replay from mmap-backed RG10 frames.
+
+    Detection uses the two native green samples in every 2x2 Bayer cell.  The
+    full mosaic remains mapped only until crop selection for that frame has
+    completed, so buffering does not expand RAW frames into full BGR images.
+    """
+
+    source_kind = "raw-mmap-green"
+
+    def __init__(self, bundle: Path) -> None:
+        root = resolve_raw_bundle(bundle)
+        metadata_path = root / "metadata/CamL.csv"
+        profile_path = root / "calibration/CamL/profile.json"
+        try:
+            rows = _read_raw_metadata(metadata_path)
+            recording = _read_json(root / "recording.json")
+            profile = _read_json(profile_path)
+            capture = profile["capture"]
+            calibration = profile["calibration"]
+            width = int(capture["width"])
+            height = int(capture["height"])
+            stride = int(capture["bytes_per_line"])
+            bit_shift = int(capture.get("bit_shift", 0))
+            white_level = float(capture["decoded_white_level"])
+            dark_level = float(calibration.get("dark_level_median", 0.0))
+            fps = float(recording.get("plan", {}).get("frame_rate_hz", 0.0))
+            cfa = str(capture["cfa"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise SourceError(f"cannot open memory-mapped RAW bundle: {exc}") from exc
+        if not rows or fps <= 0:
+            raise SourceError("RAW bundle reports no CamL frames or invalid FPS")
+        if width <= 0 or height <= 0 or stride < width * 2 or stride % 2:
+            raise SourceError("CamL RAW dimensions or stride are invalid")
+        if width % 2 or height % 2:
+            raise SourceError("green-plane replay requires even RAW dimensions")
+        if cfa != "RGGB":
+            raise SourceError(
+                f"fast CamL replay currently requires RGGB, received {cfa}"
+            )
+        if bit_shift < 0 or bit_shift > 15 or white_level <= dark_level:
+            raise SourceError("CamL RAW signal levels are invalid")
+
+        self.path = root
+        self.profile_path = profile_path
+        self.profile = profile
+        self._rows = rows
+        self._width = width
+        self._height = height
+        self._stride = stride
+        self._bit_shift = bit_shift
+        self._expected_bytes = height * stride
+        self._active: dict[int, RawReplayFrame] = {}
+        self._camera_matrix = np.asarray(calibration["camera_matrix"], dtype=np.float64)
+        self._distortion = np.asarray(
+            calibration["distortion_coefficients"], dtype=np.float64
+        )
+        if self._camera_matrix.shape != (3, 3) or self._distortion.size < 4:
+            raise SourceError("CamL lens calibration has invalid dimensions")
+
+        levels = np.arange(round(white_level) + 1, dtype=np.float32)
+        linear = np.clip(
+            (levels - dark_level) / max(white_level - dark_level, 1.0), 0.0, 1.0
+        )
+        srgb = np.where(
+            linear <= 0.0031308,
+            linear * 12.92,
+            1.055 * np.power(linear, 1.0 / 2.4) - 0.055,
+        )
+        self._detection_lut = np.clip(srgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        self._crop_processor = RawCropProcessor(profile_path, profile)
+        self.metadata = SourceMetadata(root, width, height, len(rows), fps, True)
+        self.pipeline_metadata = {
+            "input": "memory-mapped RG10",
+            "detection": f"{width // 2}x{height // 2} sRGB green plane",
+            "colour": "calibrated inference crops only",
+            "pixel_coordinate_domain": "distorted RAW",
+            "metric_coordinate_domain": "point-undistorted PinkPlane",
+        }
+
+    def timestamp_ns(self, index: int) -> int:
+        return self._row(index)[0]
+
+    def frame(self, index: int) -> RawReplayFrame:
+        _timestamp, relative = self._row(index)
+        path = (self.path / relative).resolve()
+        if self.path not in path.parents:
+            raise SourceError(f"RAW frame path escapes recording bundle: {relative}")
+        try:
+            descriptor = path.stat()
+        except OSError as exc:
+            raise SourceError(f"cannot stat RAW frame {index + 1}: {exc}") from exc
+        if descriptor.st_size != self._expected_bytes:
+            raise SourceError(
+                f"RAW frame {index + 1} has {descriptor.st_size} bytes; "
+                f"expected {self._expected_bytes}"
+            )
+        descriptor_fd = os.open(path, os.O_RDONLY)
+        try:
+            mapping = mmap.mmap(
+                descriptor_fd, self._expected_bytes, access=mmap.ACCESS_READ
+            )
+        except Exception:
+            os.close(descriptor_fd)
+            raise
+        os.close(descriptor_fd)
+        try:
+            words = np.ndarray(
+                (self._height, self._stride // 2), dtype="<u2", buffer=mapping
+            )
+            mosaic = words[:, : self._width]
+            green_stored = cv2.addWeighted(
+                mosaic[0::2, 1::2], 0.5, mosaic[1::2, 0::2], 0.5, 0.0
+            )
+            decoded = (
+                np.right_shift(green_stored, self._bit_shift)
+                if self._bit_shift
+                else green_stored
+            )
+            decoded = np.minimum(decoded, len(self._detection_lut) - 1)
+            detection_gray = np.ascontiguousarray(self._detection_lut[decoded])
+            frame = RawReplayFrame(
+                index,
+                path,
+                detection_gray,
+                (self._width, self._height),
+                mapping,
+                mosaic,
+            )
+        except Exception:
+            mapping.close()
+            raise
+        self._active[id(frame)] = frame
+        return frame
+
+    def build_background(self, indices: tuple[int, ...]) -> np.ndarray:
+        if not indices:
+            raise SourceError("at least one RAW background frame is required")
+        frames: list[np.ndarray] = []
+        for index in indices:
+            frame = self.frame(index)
+            try:
+                frames.append(frame.detection_gray.copy())
+            finally:
+                self.release_frame(frame)
+        return np.median(np.stack(frames, axis=0), axis=0).astype(np.uint8)
+
+    def extract_crop(
+        self,
+        frame: RawReplayFrame,
+        centroid_px: tuple[float, float],
+        size_px: int,
+        *,
+        allow_padding: bool,
+    ) -> tuple[np.ndarray | None, bool]:
+        return self._crop_processor.extract(
+            frame.mosaic,
+            centroid_px,
+            size_px,
+            allow_padding=allow_padding,
+        )
+
+    def prepare_crop(
+        self,
+        frame: RawReplayFrame,
+        centroid_px: tuple[float, float],
+        size_px: int,
+        *,
+        allow_padding: bool,
+    ) -> tuple[Callable[[], np.ndarray], int, int, bool] | None:
+        return self._crop_processor.prepare(
+            frame.mosaic,
+            centroid_px,
+            size_px,
+            allow_padding=allow_padding,
+        )
+
+    def undistort_point(self, point: tuple[float, float]) -> tuple[float, float]:
+        points = np.asarray(point, dtype=np.float64).reshape(1, 1, 2)
+        mapped = cv2.undistortPoints(
+            points,
+            self._camera_matrix,
+            self._distortion,
+            P=self._camera_matrix,
+        ).reshape(2)
+        return float(mapped[0]), float(mapped[1])
+
+    def preview_frame(self, frame: RawReplayFrame) -> np.ndarray:
+        gray = cv2.resize(
+            frame.detection_gray,
+            (self._width, self._height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    def release_frame(self, frame) -> None:
+        if isinstance(frame, RawReplayFrame):
+            self._active.pop(id(frame), None)
+            frame.close()
+
+    def close(self) -> None:
+        for frame in tuple(self._active.values()):
+            frame.close()
+        self._active.clear()
+
+    def __enter__(self) -> MMapRawVideoSource:  # noqa: PYI034 - Python 3.10
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.close()
+
+    def _row(self, index: int) -> tuple[int, Path]:
+        if not 0 <= index < len(self._rows):
+            raise SourceError(f"frame {index} is outside the RAW bundle")
+        return self._rows[index]
+
+
+class RawCropProcessor:
+    """Apply the frozen colour calibration to only a requested Bayer crop."""
+
+    _CFA_BY_OFFSET: ClassVar[dict[tuple[int, int], str]] = {
+        (0, 0): "RGGB",
+        (0, 1): "GRBG",
+        (1, 0): "GBRG",
+        (1, 1): "BGGR",
+    }
+
+    def __init__(self, profile_path: Path, profile: dict[str, object]) -> None:
+        capture = profile["capture"]
+        calibration = profile["calibration"]
+        artifacts = profile["artifacts"]
+        processing = profile.get("processing", {})
+        self._bit_shift = int(capture.get("bit_shift", 0))
+        self._white_level = float(capture["decoded_white_level"])
+        self._dark_level = float(calibration.get("dark_level_median", 0.0))
+        self._wb = (
+            np.asarray(calibration["wb_gains_rgb"], dtype=np.float32)
+            if calibration.get("wb_enabled", False)
+            else None
+        )
+        self._matrix = (
+            np.asarray(calibration["color_matrix_rgb"], dtype=np.float32)
+            if calibration.get("color_matrix_enabled", False)
+            else None
+        )
+        self._algorithm = str(processing.get("demosaic", "edge_aware"))
+        expected_shape = (int(capture["height"]), int(capture["width"]))
+        root = profile_path.parent
+
+        def artifact(name: str) -> np.ndarray:
+            descriptor = artifacts[name]
+            path = (root / descriptor["path"]).resolve()
+            if root not in path.parents:
+                raise SourceError(f"calibration artifact escapes CamL pack: {name}")
+            return np.load(path, mmap_mode="r")
+
+        self._dark = artifact("master_dark")
+        self._flat = artifact("flat_gain")
+        defects = artifact("defect_map")
+        if any(
+            value.shape != expected_shape for value in (self._dark, self._flat, defects)
+        ):
+            raise SourceError("CamL calibration artifact dimensions do not match RAW")
+        self._defects = defects.astype(bool)
+
+    def extract(
+        self,
+        mosaic: np.ndarray,
+        centroid_px: tuple[float, float],
+        size_px: int,
+        *,
+        allow_padding: bool,
+    ) -> tuple[np.ndarray | None, bool]:
+        prepared = self.prepare(
+            mosaic,
+            centroid_px,
+            size_px,
+            allow_padding=allow_padding,
+        )
+        if prepared is None:
+            return None, False
+        materialize, _width, _height, padded = prepared
+        return materialize(), padded
+
+    def prepare(
+        self,
+        mosaic: np.ndarray,
+        centroid_px: tuple[float, float],
+        size_px: int,
+        *,
+        allow_padding: bool,
+    ) -> tuple[Callable[[], np.ndarray], int, int, bool] | None:
+        if size_px <= 0:
+            raise ValueError("crop size must be positive")
+        centre_x, centre_y = round(centroid_px[0]), round(centroid_px[1])
+        left = centre_x - size_px // 2
+        top = centre_y - size_px // 2
+        right = left + size_px
+        bottom = top + size_px
+        height, width = mosaic.shape
+        complete = left >= 0 and top >= 0 and right <= width and bottom <= height
+        if not complete and not allow_padding:
+            return None
+        source_left = max(0, left)
+        source_top = max(0, top)
+        source_right = min(width, right)
+        source_bottom = min(height, bottom)
+        if source_left >= source_right or source_top >= source_bottom:
+            return None
+
+        halo = 4
+        roi_left = max(0, source_left - halo)
+        roi_top = max(0, source_top - halo)
+        roi_right = min(width, source_right + halo)
+        roi_bottom = min(height, source_bottom + halo)
+        raw = np.ascontiguousarray(mosaic[roi_top:roi_bottom, roi_left:roi_right])
+
+        def materialize() -> np.ndarray:
+            return self._process(
+                raw,
+                roi_left=roi_left,
+                roi_top=roi_top,
+                source_left=source_left,
+                source_top=source_top,
+                source_right=source_right,
+                source_bottom=source_bottom,
+                crop_left=left,
+                crop_top=top,
+                crop_size=size_px,
+                padded=not complete,
+            )
+
+        return materialize, size_px, size_px, not complete
+
+    def _process(
+        self,
+        raw: np.ndarray,
+        *,
+        roi_left: int,
+        roi_top: int,
+        source_left: int,
+        source_top: int,
+        source_right: int,
+        source_bottom: int,
+        crop_left: int,
+        crop_top: int,
+        crop_size: int,
+        padded: bool,
+    ) -> np.ndarray:
+        roi_bottom = roi_top + raw.shape[0]
+        roi_right = roi_left + raw.shape[1]
+        decoded = (
+            np.right_shift(raw, self._bit_shift).astype(np.float32)
+            if self._bit_shift
+            else raw.astype(np.float32)
+        )
+        decoded -= self._dark[roi_top:roi_bottom, roi_left:roi_right]
+        defect = self._defects[roi_top:roi_bottom, roi_left:roi_right]
+        if np.any(defect):
+            for row in (0, 1):
+                for column in (0, 1):
+                    plane = decoded[row::2, column::2]
+                    plane_mask = defect[row::2, column::2]
+                    if np.any(plane_mask):
+                        median = cv2.medianBlur(plane, 3)
+                        plane[plane_mask] = median[plane_mask]
+        decoded *= self._flat[roi_top:roi_bottom, roi_left:roi_right]
+        pattern = self._CFA_BY_OFFSET[(roi_top % 2, roi_left % 2)]
+        suffix = "_EA" if self._algorithm == "edge_aware" else ""
+        code_name = f"COLOR_Bayer{pattern}2RGB{suffix}"
+        code = getattr(cv2, code_name, getattr(cv2, f"COLOR_Bayer{pattern}2RGB"))
+        rgb = cv2.cvtColor(
+            np.clip(decoded, 0, 65535).round().astype(np.uint16), code
+        ).astype(np.float32)
+        rgb /= max(self._white_level - self._dark_level, 1.0)
+        if self._wb is not None:
+            rgb *= self._wb.reshape(1, 1, 3)
+        if self._matrix is not None:
+            rgb = np.einsum("...c,dc->...d", rgb, self._matrix)
+        rgb = np.clip(rgb, 0.0, 1.0)
+        rgb = np.where(
+            rgb <= 0.0031308,
+            rgb * 12.92,
+            1.055 * np.power(rgb, 1.0 / 2.4) - 0.055,
+        )
+        rgb8 = np.clip(rgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        crop = rgb8[
+            source_top - roi_top : source_bottom - roi_top,
+            source_left - roi_left : source_right - roi_left,
+            ::-1,
+        ]
+        if not padded:
+            return np.ascontiguousarray(crop)
+        output = np.zeros((crop_size, crop_size, 3), dtype=np.uint8)
+        output[
+            source_top - crop_top : source_bottom - crop_top,
+            source_left - crop_left : source_right - crop_left,
+        ] = crop
+        return output
+
+
+def resolve_raw_bundle(path: Path) -> Path:
+    """Resolve a bundle root from the root itself or its CamL derivative."""
+
+    resolved = path.expanduser().resolve()
+    candidates = [resolved] if resolved.is_dir() else []
+    if resolved.is_file():
+        candidates.extend((resolved.parent, resolved.parent.parent))
+    for candidate in candidates:
+        if (
+            (candidate / "metadata/CamL.csv").is_file()
+            and (candidate / "calibration/CamL/profile.json").is_file()
+            and (candidate / "recording.json").is_file()
+        ):
+            return candidate
+    raise SourceError("recording has no complete CamL RAW bundle")
+
+
+def find_raw_bundle(path: Path) -> Path | None:
+    try:
+        return resolve_raw_bundle(path)
+    except SourceError:
+        return None
 
 
 def open_replay_source(

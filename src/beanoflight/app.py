@@ -25,6 +25,7 @@ from .detection import (
     BeanDetector,
     DetectorError,
     DetectorSettings,
+    RawGreenDetector,
     temporal_median_background,
 )
 from .display import draw_birth_margins, render_analysis, render_pipeline_stage
@@ -34,7 +35,13 @@ from .prediction import GateLayout
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
 from .registry_zmq import ZeroMQRegistryClient
 from .replay import CropDispatcher, ReplayRunner, ReplaySettings
-from .source import ReplaySource, SourceError, open_replay_source
+from .source import (
+    MMapRawVideoSource,
+    ReplaySource,
+    SourceError,
+    find_raw_bundle,
+    open_replay_source,
+)
 from .tracking import TrackerSettings
 
 VIDEO_TYPES = [
@@ -306,6 +313,7 @@ class BeanoFlightApp(tk.Tk):
             value=str(self.tracker_settings.right_birth_margin_px)
         )
         self.target_fps_var = tk.StringVar(value="60")
+        self.fast_raw_var = tk.BooleanVar(value=True)
         self.preview_enabled_var = tk.BooleanVar(value=False)
         self.prebuffer_enabled_var = tk.BooleanVar(value=True)
         self.prebuffer_frames_var = tk.StringVar(value="60")
@@ -742,16 +750,21 @@ class BeanoFlightApp(tk.Tk):
         ).grid(row=1, column=1, sticky=tk.EW, pady=3)
         ttk.Checkbutton(
             parent,
-            text="Show live playback (uses extra CPU)",
-            variable=self.preview_enabled_var,
+            text="Use memory-mapped RAW fast path",
+            variable=self.fast_raw_var,
         ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=5)
         ttk.Checkbutton(
             parent,
-            text="Prebuffer decoded frames before playback",
-            variable=self.prebuffer_enabled_var,
+            text="Show live playback (uses extra CPU)",
+            variable=self.preview_enabled_var,
         ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=5)
-        ttk.Label(parent, text="Decoded prebuffer (frames)").grid(
-            row=4, column=0, sticky=tk.W, pady=3
+        ttk.Checkbutton(
+            parent,
+            text="Prebuffer mapped/decoded frames before playback",
+            variable=self.prebuffer_enabled_var,
+        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=5)
+        ttk.Label(parent, text="Replay prebuffer (frames)").grid(
+            row=5, column=0, sticky=tk.W, pady=3
         )
         ttk.Spinbox(
             parent,
@@ -759,9 +772,9 @@ class BeanoFlightApp(tk.Tk):
             from_=10,
             to=120,
             width=18,
-        ).grid(row=4, column=1, sticky=tk.EW, pady=3)
+        ).grid(row=5, column=1, sticky=tk.EW, pady=3)
         ttk.Label(parent, text="Maximum replay frames").grid(
-            row=5, column=0, sticky=tk.W, pady=3
+            row=6, column=0, sticky=tk.W, pady=3
         )
         ttk.Spinbox(
             parent,
@@ -769,9 +782,9 @@ class BeanoFlightApp(tk.Tk):
             from_=1,
             to=1000,
             width=18,
-        ).grid(row=5, column=1, sticky=tk.EW, pady=3)
+        ).grid(row=6, column=1, sticky=tk.EW, pady=3)
         ttk.Label(parent, text="Square crop size (px)").grid(
-            row=6, column=0, sticky=tk.W, pady=3
+            row=7, column=0, sticky=tk.W, pady=3
         )
         ttk.Spinbox(
             parent,
@@ -780,9 +793,9 @@ class BeanoFlightApp(tk.Tk):
             to=1024,
             increment=2,
             width=18,
-        ).grid(row=6, column=1, sticky=tk.EW, pady=3)
+        ).grid(row=7, column=1, sticky=tk.EW, pady=3)
         ttk.Label(parent, text="Crops per bean").grid(
-            row=7, column=0, sticky=tk.W, pady=3
+            row=8, column=0, sticky=tk.W, pady=3
         )
         ttk.Spinbox(
             parent,
@@ -790,33 +803,33 @@ class BeanoFlightApp(tk.Tk):
             from_=1,
             to=5,
             width=18,
-        ).grid(row=7, column=1, sticky=tk.EW, pady=3)
+        ).grid(row=8, column=1, sticky=tk.EW, pady=3)
         ttk.Label(parent, text="Registry command endpoint").grid(
-            row=8, column=0, sticky=tk.W, pady=3
-        )
-        ttk.Entry(parent, textvariable=self.registry_endpoint_var).grid(
-            row=8, column=1, sticky=tk.EW, pady=3
-        )
-        ttk.Label(parent, text="Inference crop endpoint").grid(
             row=9, column=0, sticky=tk.W, pady=3
         )
-        ttk.Entry(parent, textvariable=self.inference_endpoint_var).grid(
+        ttk.Entry(parent, textvariable=self.registry_endpoint_var).grid(
             row=9, column=1, sticky=tk.EW, pady=3
         )
+        ttk.Label(parent, text="Inference crop endpoint").grid(
+            row=10, column=0, sticky=tk.W, pady=3
+        )
+        ttk.Entry(parent, textvariable=self.inference_endpoint_var).grid(
+            row=10, column=1, sticky=tk.EW, pady=3
+        )
         ttk.Separator(parent).grid(
-            row=10, column=0, columnspan=2, sticky=tk.EW, pady=12
+            row=11, column=0, columnspan=2, sticky=tk.EW, pady=12
         )
         ttk.Label(
             parent,
             text=(
-                "Simulation streams frame results without retaining the clip. A bounded "
-                "decoded-frame buffer overlaps input work with analysis, while crops are "
-                "sent to the external inferencer. Unlimited uses a logical rather than "
-                "wall-clock valve schedule."
+                "Simulation streams results without retaining the clip. The RAW fast "
+                "path buffers compact green planes and colour-processes only crops. "
+                "Crops are sent to the external inferencer. Unlimited uses a logical "
+                "rather than wall-clock valve schedule."
             ),
             wraplength=390,
             style="Muted.TLabel",
-        ).grid(row=11, column=0, columnspan=2, sticky=tk.W)
+        ).grid(row=12, column=0, columnspan=2, sticky=tk.W)
         parent.columnconfigure(1, weight=1)
 
     def open_video(self) -> None:
@@ -849,6 +862,7 @@ class BeanoFlightApp(tk.Tk):
             old_source.close()
         self.source = source
         self.source_prefer_raw = source.source_kind == "raw-bundle"
+        self.fast_raw_var.set(find_raw_bundle(source.path) is not None)
         self.current_index = 0
         self.run = None
         self.background = source.frame(0).copy()
@@ -1144,6 +1158,16 @@ class BeanoFlightApp(tk.Tk):
         except ValueError as exc:
             messagebox.showerror("Simulation settings", str(exc), parent=self)
             return
+        use_fast_raw = self.fast_raw_var.get()
+        raw_bundle = find_raw_bundle(self.source.path) if use_fast_raw else None
+        if use_fast_raw and raw_bundle is None:
+            messagebox.showerror(
+                "Simulation input",
+                "The memory-mapped fast path needs a complete recording bundle "
+                "with CamL RAW frames. Turn it off to replay the calibrated video.",
+                parent=self,
+            )
+            return
         self.stop_work()
         self._stop.clear()
         self._pause.clear()
@@ -1157,26 +1181,45 @@ class BeanoFlightApp(tk.Tk):
         tracker_settings = self.tracker_settings
         registry_endpoint = self.registry_endpoint_var.get().strip()
         inference_endpoint = self.inference_endpoint_var.get().strip()
+        background_indices = self.background_provenance.frame_indices or (0,)
 
         def worker() -> None:
             source = None
             registry = None
             try:
-                source = open_replay_source(
-                    source_path, prefer_raw=prefer_raw, cache_frames=1
-                )
+                if raw_bundle is not None:
+                    source = MMapRawVideoSource(raw_bundle)
+                    simulation_background = source.build_background(background_indices)
+                    detector = RawGreenDetector(settings)
+
+                    def position_mapper(point):
+                        return calibration.pixel_to_mm(source.undistort_point(point))
+
+                    deferred_crop_extractor = source.prepare_crop
+                else:
+                    source = open_replay_source(
+                        source_path, prefer_raw=prefer_raw, cache_frames=1
+                    )
+                    simulation_background = background
+                    detector = BeanDetector(settings)
+                    position_mapper = None
+                    deferred_crop_extractor = None
                 registry = ZeroMQRegistryClient(registry_endpoint, timeout_ms=2_000)
                 registry.ping()
                 layout = GateLayout(calibration.sorting_line_y(self.sorting_offset_mm))
                 engine = AnalysisEngine(
                     calibration,
-                    BeanDetector(settings),
-                    background,
+                    detector,
+                    simulation_background,
                     tracker_settings=tracker_settings,
                     gate_layout=layout,
                     registry=registry,
+                    position_mapper=position_mapper,
                 )
-                selector = BeanCropSelector(crop_settings)
+                selector = BeanCropSelector(
+                    crop_settings,
+                    deferred_extractor=deferred_crop_extractor,
+                )
                 dispatcher = CropDispatcher(
                     registry_endpoint,
                     inference_endpoint,
@@ -1242,8 +1285,14 @@ class BeanoFlightApp(tk.Tk):
             if replay_settings.prebuffer_frames
             else "streaming decode"
         )
+        source_status = (
+            "memory-mapped RAW green-plane input"
+            if raw_bundle is not None
+            else "calibrated video input"
+        )
         self.status_var.set(
-            f"Simulation starting at {rate}; {buffer_status}; live playback "
+            f"Simulation starting at {rate}; {source_status}; {buffer_status}; "
+            "live playback "
             f"{'enabled' if replay_settings.preview_enabled else 'disabled'}…"
         )
 

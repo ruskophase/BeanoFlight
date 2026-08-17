@@ -46,7 +46,8 @@ class ZeroMQCropClient:
             raise CropTransportError("create one crop client per sending thread")
         image = payload.image_bgr
         if (
-            image.dtype != np.uint8
+            not isinstance(image, np.ndarray)
+            or image.dtype != np.uint8
             or image.ndim != 3
             or image.shape[2] != 3
             or image.shape[0] != payload.job.crop_height_px

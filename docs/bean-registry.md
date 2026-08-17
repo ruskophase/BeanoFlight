@@ -119,8 +119,10 @@ merges it into the short in-memory history, while SQLite inserts only the new
 observation. Query and event responses omit observation history unless a full
 `get` is explicitly requested.
 
-The recorded-source simulator sends one bounded, contiguous BGR crop over a
-separate ZeroMQ socket and never through the registry. The live implementation
+The optimized recorded-source simulator copies one bounded Bayer ROI while its
+source mapping is live, then calibrates it asynchronously into a contiguous BGR
+crop and sends it over a separate ZeroMQ socket, never through the registry.
+The live implementation
 should replace that copy with a bounded shared-memory pool whose request carries
 a frame-slot generation plus bounding box. In both cases the registry stores
 job provenance and resulting properties, not image bytes.

@@ -80,11 +80,13 @@ the same command and crop endpoints in each GUI. Start the registry first;
 BeanoFlight refuses to begin Simulation if its ping is not acknowledged.
 
 Disable preview for throughput checks. BeanoFlight reports source-read and
-analysis time separately: on an FFV1 recording, software decoding may be the
-limiting stage even when the future live-camera detector path is within its
-16.67 ms budget. The default 60-frame decoded prebuffer starts before the replay
-clock and then overlaps decoding with analysis. Set the maximum replay length
-between 1 and 1,000 frames. Inspect the registry monitor for a complete chain of
+analysis time separately. For a complete recording bundle, keep the
+memory-mapped RAW fast path enabled: it detects on the native green plane and
+colour-processes only asynchronous inference crops. The FFV1 route remains a
+useful fallback and review reference, but software decoding can be its limiting
+stage. The default 60-frame prebuffer starts before the replay clock and then
+overlaps RAW preparation or video decoding with analysis. Set the maximum replay
+length between 1 and 1,000 frames. Inspect the registry monitor for a complete chain of
 `inference.submitted`, `inference.accepted`, `inference.completed`,
 `sorting.decision`, and, where policy selects a gate, `sorting.actuated`.
 
@@ -96,4 +98,4 @@ work only and do not stop the corresponding service.
 
 The headless `beano-system-test` requires exactly 3 explicit, visually
 confirmed empty-frame indices and prints a JSON performance summary on
-completion. It uses the same replay core as the GUI.
+completion. Add `--optimized-raw` to use the same fast path as the GUI.

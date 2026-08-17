@@ -11,13 +11,18 @@ from pathlib import Path
 from .analysis import AnalysisEngine
 from .calibration import MetricPlaneCalibration, find_pinkplane_homography
 from .crop import BeanCropSelector, CropSettings
-from .detection import BeanDetector, DetectorSettings, temporal_median_background
+from .detection import (
+    BeanDetector,
+    DetectorSettings,
+    RawGreenDetector,
+    temporal_median_background,
+)
 from .inference_transport import DEFAULT_CROP_ENDPOINT
 from .prediction import GateLayout
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
 from .registry_zmq import ZeroMQRegistryClient
 from .replay import CropDispatcher, ReplayRunner, ReplaySettings
-from .source import SourceError, open_replay_source
+from .source import MMapRawVideoSource, SourceError, open_replay_source
 from .tracking import TrackerSettings
 
 
@@ -40,7 +45,7 @@ def parser() -> argparse.ArgumentParser:
         prog="beano-system-test",
         description=(
             "Replay a CamL recording through tracking, BeanRegistry and optional "
-            "crop inference with a bounded decoded-frame buffer."
+            "crop inference with a bounded prepared-frame buffer."
         ),
     )
     result.add_argument("recording", type=Path)
@@ -52,7 +57,16 @@ def parser() -> argparse.ArgumentParser:
         help="3 human-confirmed empty zero-based frame indices",
     )
     result.add_argument("--homography", type=Path)
-    result.add_argument("--prefer-raw", action="store_true")
+    input_mode = result.add_mutually_exclusive_group()
+    input_mode.add_argument("--prefer-raw", action="store_true")
+    input_mode.add_argument(
+        "--optimized-raw",
+        action="store_true",
+        help=(
+            "mmap CamL RG10, detect on its half-resolution green plane, and "
+            "colour-process only inference crops"
+        ),
+    )
     result.add_argument(
         "--target-fps",
         type=float,
@@ -65,7 +79,7 @@ def parser() -> argparse.ArgumentParser:
         "--prebuffer-frames",
         type=int,
         default=60,
-        help="decoded frames held ahead of replay; zero disables buffering",
+        help="prepared frames held ahead of replay; zero disables buffering",
     )
     result.add_argument(
         "--maximum-frames",
@@ -94,10 +108,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     source = None
     registry = None
     try:
-        source = open_replay_source(
-            arguments.recording,
-            prefer_raw=arguments.prefer_raw,
-            cache_frames=3,
+        source = (
+            MMapRawVideoSource(arguments.recording)
+            if arguments.optimized_raw
+            else open_replay_source(
+                arguments.recording,
+                prefer_raw=arguments.prefer_raw,
+                cache_frames=3,
+            )
         )
         invalid = tuple(
             index
@@ -106,9 +124,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         if invalid:
             raise SourceError(f"background frames outside recording: {invalid}")
-        background = temporal_median_background(
-            source.frame(index) for index in arguments.background_frames
-        )
+        if arguments.optimized_raw:
+            background = source.build_background(arguments.background_frames)
+            detector = RawGreenDetector(DetectorSettings())
+            deferred_crop_extractor = source.prepare_crop
+        else:
+            background = temporal_median_background(
+                source.frame(index) for index in arguments.background_frames
+            )
+            detector = BeanDetector(DetectorSettings())
+            deferred_crop_extractor = None
         calibration_path = arguments.homography or find_pinkplane_homography(
             source.path
         )
@@ -121,15 +146,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         registry = ZeroMQRegistryClient(arguments.registry, timeout_ms=2_000)
         registry.ping()
+
+        def position_mapper(point):
+            return calibration.pixel_to_mm(source.undistort_point(point))
+
         engine = AnalysisEngine(
             calibration,
-            BeanDetector(DetectorSettings()),
+            detector,
             background,
             tracker_settings=TrackerSettings(),
             gate_layout=GateLayout(
                 calibration.sorting_line_y(arguments.sorting_offset_mm)
             ),
             registry=registry,
+            position_mapper=position_mapper if arguments.optimized_raw else None,
         )
         selector = None
         dispatcher = None
@@ -138,7 +168,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 CropSettings(
                     size_px=arguments.crop_size,
                     max_crops_per_bean=arguments.crops_per_bean,
-                )
+                ),
+                deferred_extractor=deferred_crop_extractor,
             )
             dispatcher = CropDispatcher(arguments.registry, arguments.crops)
         runner = ReplayRunner(

@@ -18,6 +18,7 @@ class FakeSequentialSource:
     def __init__(self, frame_count=5):
         self.metadata = SourceMetadata(self.path, 8, 6, frame_count, 60.0, True)
         self.calls = []
+        self.released = []
 
     def timestamp_ns(self, index):
         return index * 10
@@ -28,6 +29,9 @@ class FakeSequentialSource:
 
     def close(self):
         pass
+
+    def release_frame(self, frame):
+        self.released.append(int(frame[0, 0, 0]))
 
 
 class FakeEngine:
@@ -103,6 +107,7 @@ class ReplayBufferTests(unittest.TestCase):
         self.assertEqual(summary.frames_processed, 3)
         self.assertEqual(summary.prebuffered_frames, 2)
         self.assertEqual(source.calls, [0, 1, 2])
+        self.assertEqual(source.released, [0, 1, 2])
         self.assertEqual(
             registry.transitions,
             [

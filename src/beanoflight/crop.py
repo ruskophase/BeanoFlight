@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -29,20 +31,44 @@ class CropSettings:
 @dataclass(frozen=True, slots=True)
 class CropPayload:
     job: InferenceJob
-    image_bgr: np.ndarray = field(compare=False, repr=False)
+    image_bgr: np.ndarray | None = field(compare=False, repr=False)
+    materializer: Callable[[], np.ndarray] | None = field(
+        default=None, compare=False, repr=False
+    )
+
+    def materialized(self) -> CropPayload:
+        if self.image_bgr is not None:
+            return self
+        if self.materializer is None:
+            raise ValueError("crop payload has neither an image nor a materializer")
+        image = self.materializer()
+        if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
+            raise ValueError("materialized inference crop must be an 8-bit BGR image")
+        return CropPayload(self.job, image)
 
 
 class BeanCropSelector:
     """Choose the first fully visible confirmed observation for each bean."""
 
-    def __init__(self, settings: CropSettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: CropSettings | None = None,
+        *,
+        extractor: Callable[..., tuple[np.ndarray | None, bool]] | None = None,
+        deferred_extractor: Callable[
+            ..., tuple[Callable[[], np.ndarray], int, int, bool] | None
+        ]
+        | None = None,
+    ) -> None:
         self.settings = settings or CropSettings()
         self.settings.validate()
+        self._extractor = extractor or extract_square_crop
+        self._deferred_extractor = deferred_extractor
         self._counts: dict[BeanRef, int] = {}
 
     def select(
         self,
-        frame_bgr: np.ndarray,
+        frame_bgr: Any,
         analysis: FrameAnalysis,
         revisions: dict[BeanRef, int],
     ) -> tuple[CropPayload, ...]:
@@ -56,14 +82,28 @@ class BeanCropSelector:
             count = self._counts.get(track.bean_ref, 0)
             if count >= self.settings.max_crops_per_bean:
                 continue
-            crop, padded = extract_square_crop(
-                frame_bgr,
-                observation.detection.centroid_px,
-                self.settings.size_px,
-                allow_padding=self.settings.allow_padding,
-            )
-            if crop is None:
-                continue
+            materializer = None
+            if self._deferred_extractor is not None:
+                prepared = self._deferred_extractor(
+                    frame_bgr,
+                    observation.detection.centroid_px,
+                    self.settings.size_px,
+                    allow_padding=self.settings.allow_padding,
+                )
+                if prepared is None:
+                    continue
+                materializer, crop_width, crop_height, padded = prepared
+                crop = None
+            else:
+                crop, padded = self._extractor(
+                    frame_bgr,
+                    observation.detection.centroid_px,
+                    self.settings.size_px,
+                    allow_padding=self.settings.allow_padding,
+                )
+                if crop is None:
+                    continue
+                crop_width, crop_height = crop.shape[1], crop.shape[0]
             revision = revisions.get(track.bean_ref)
             if revision is None:
                 continue
@@ -85,14 +125,14 @@ class BeanCropSelector:
                 frame_index=observation.frame_index,
                 capture_timestamp_ns=observation.timestamp_ns,
                 source_registry_revision=revision,
-                crop_width_px=crop.shape[1],
-                crop_height_px=crop.shape[0],
+                crop_width_px=crop_width,
+                crop_height_px=crop_height,
                 padded=padded,
                 submitted_timestamp_ns=observation.timestamp_ns,
                 updated_timestamp_ns=observation.timestamp_ns,
             )
             self._counts[track.bean_ref] = count + 1
-            selected.append(CropPayload(job, crop))
+            selected.append(CropPayload(job, crop, materializer))
         return tuple(selected)
 
 

@@ -1,0 +1,136 @@
+import csv
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+import cv2
+import numpy as np
+
+from beanoflight.detection import DetectorSettings, RawGreenDetector
+from beanoflight.source import MMapRawVideoSource, SourceError, find_raw_bundle
+
+
+class RawReplayTests(unittest.TestCase):
+    def test_mmaps_green_plane_and_defers_crop_colour_work(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_bundle(root)
+            source = MMapRawVideoSource(root)
+
+            frame = source.frame(1)
+            self.assertEqual(frame.detection_gray.shape, (4, 4))
+            self.assertEqual(frame.detection_gray.dtype, np.uint8)
+            prepared = source.prepare_crop(frame, (4.0, 4.0), 4, allow_padding=False)
+            self.assertIsNotNone(prepared)
+            materialize, width, height, padded = prepared
+            self.assertEqual((width, height, padded), (4, 4, False))
+            source.release_frame(frame)
+            with self.assertRaises(SourceError):
+                _unused = frame.mosaic
+
+            crop = materialize()
+            self.assertEqual(crop.shape, (4, 4, 3))
+            self.assertEqual(crop.dtype, np.uint8)
+            self.assertGreater(float(crop.mean()), 0.0)
+            self.assertEqual(source.undistort_point((3.0, 2.0)), (3.0, 2.0))
+            source.close()
+
+    def test_resolves_bundle_from_calibrated_derivative(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_bundle(root)
+            derivative = root / "postprocess/CamL-calibrated.mkv"
+            derivative.parent.mkdir()
+            derivative.touch()
+            self.assertEqual(find_raw_bundle(derivative), root.resolve())
+
+    def test_green_detector_reports_native_coordinates(self):
+        background = np.zeros((30, 40), dtype=np.uint8)
+        gray = background.copy()
+        cv2.ellipse(gray, (20, 8), (6, 4), 0, 0, 360, 180, -1)
+        frame = SimpleNamespace(
+            detection_gray=gray,
+            native_size_px=(80, 60),
+        )
+        detector = RawGreenDetector(
+            DetectorSettings(
+                processing_scale=0.5,
+                blur_kernel=1,
+                threshold=10,
+                close_kernel=1,
+                open_kernel=1,
+                min_area_px=100,
+                max_area_px=2_000,
+                min_width_px=8,
+                max_width_px=40,
+                min_height_px=8,
+                max_height_px=40,
+            )
+        )
+        result = detector.detect(frame, background)
+        self.assertEqual(len(result.detections), 1)
+        x, y = result.detections[0].centroid_px
+        self.assertAlmostEqual(x, 40.0, delta=1.0)
+        self.assertAlmostEqual(y, 16.0, delta=1.0)
+
+    @staticmethod
+    def _write_bundle(root: Path) -> None:
+        (root / "metadata").mkdir(parents=True)
+        (root / "raw/CamL").mkdir(parents=True)
+        artifacts = root / "calibration/CamL/artifacts/test"
+        artifacts.mkdir(parents=True)
+        np.save(artifacts / "master_dark.npy", np.zeros((8, 8), np.float32))
+        np.save(artifacts / "flat_gain.npy", np.ones((8, 8), np.float32))
+        np.save(artifacts / "defect_map.npy", np.zeros((8, 8), bool))
+        profile = {
+            "capture": {
+                "width": 8,
+                "height": 8,
+                "bytes_per_line": 20,
+                "bit_shift": 4,
+                "cfa": "RGGB",
+                "decoded_white_level": 1023.0,
+            },
+            "processing": {"demosaic": "bilinear"},
+            "artifacts": {
+                name: {"path": f"artifacts/test/{name}.npy"}
+                for name in ("master_dark", "flat_gain", "defect_map")
+            },
+            "calibration": {
+                "dark_level_median": 0.0,
+                "wb_enabled": False,
+                "color_matrix_enabled": False,
+                "camera_matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                "distortion_coefficients": [0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+        }
+        (root / "calibration/CamL/profile.json").write_text(
+            json.dumps(profile), encoding="utf-8"
+        )
+        (root / "recording.json").write_text(
+            json.dumps({"plan": {"frame_rate_hz": 60.0}}), encoding="utf-8"
+        )
+        fields = ("frame_index", "timestamp_ns", "raw_path")
+        with (root / "metadata/CamL.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as stream:
+            output = csv.DictWriter(stream, fieldnames=fields)
+            output.writeheader()
+            for index, value in enumerate((100, 500)):
+                relative = Path(f"raw/CamL/frame-{index}.raw")
+                words = np.zeros((8, 10), dtype="<u2")
+                words[:, :8] = value << 4
+                (root / relative).write_bytes(words.tobytes())
+                output.writerow(
+                    {
+                        "frame_index": index,
+                        "timestamp_ns": 1_000 + index * 10,
+                        "raw_path": relative,
+                    }
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

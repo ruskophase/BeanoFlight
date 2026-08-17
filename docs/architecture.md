@@ -31,6 +31,10 @@ unbounded collection of images.
 
 All tracking and prediction state is in fall-plane millimetres. Pixel values
 remain attached to observations for overlays and future crop extraction.
+Optimized RAW detections retain distorted sensor pixels for bounding boxes and
+crop extraction. Each centroid alone is undistorted with the frozen CamL lens
+model before the undistorted PinkPlane homography converts it to millimetres;
+no full-frame geometric remap is required on the tracking path.
 
 FastCap's CamL kernel timestamp is authoritative. Only differences within that
 timestamp domain are used. Plain videos without `pairs.csv` are supported for
@@ -106,13 +110,13 @@ replaceable notifications. Each notification carries a persistent global
 stream sequence, so a critical consumer uses `events_since(cursor)` to recover
 any gap before proceeding.
 
-Recorded simulation uses a bounded sequential decoder ahead of the analysis
-thread. The default 60 decoded CamL frames use about 272 MiB at 1456 x 1088,
-and the replay clock is anchored only after that initial buffer is ready. The
-producer continues filling released slots while analysis consumes frames. This
-overlaps FFV1 decoding with OpenCV processing without retaining an entire clip;
-both buffer capacity (0-120, where zero disables it) and replay length
-(1-1,000 frames) are bounded and recorded in the run session.
+Recorded simulation uses a bounded sequential producer ahead of the analysis
+thread, and the replay clock is anchored only after that initial buffer is
+ready. In optimized mode it memory-maps CamL RG10 and stores one compact green
+plane per slot instead of expanding every frame to BGR. In fallback mode it
+overlaps FFV1 decoding with analysis. The producer continues filling released
+slots while analysis consumes frames; both capacity (0-120, where zero disables
+it) and replay length (1-1,000 frames) are bounded and recorded in the session.
 
 The original `EventBus` and `BeanStore` remain small same-process adapters for
 simple workers and backwards compatibility. They are not the live

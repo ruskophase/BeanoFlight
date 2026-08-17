@@ -20,6 +20,7 @@ from .source import RecordingVideoSource
 from .tracking import TrackerSettings, TrackManager
 
 ProgressCallback = Callable[[int, int, FrameAnalysis], None]
+PositionMapper = Callable[[tuple[float, float]], tuple[float, float]]
 
 
 class RegistryWriter(Protocol):
@@ -61,6 +62,7 @@ class AnalysisEngine:
         gate_layout: GateLayout | None = None,
         events: EventBus | None = None,
         registry: RegistryWriter | None = None,
+        position_mapper: PositionMapper | None = None,
     ) -> None:
         self.calibration = calibration
         self.detector = detector
@@ -69,6 +71,7 @@ class AnalysisEngine:
         self.gate_layout = gate_layout or GateLayout(calibration.sorting_line_y())
         self.events = events
         self.registry = registry
+        self.position_mapper = position_mapper or calibration.pixel_to_mm
         self.last_registry_revisions: dict[BeanRef, int] = {}
         self.tracker = TrackManager(
             top_y_mm=calibration.top_y_mm,
@@ -93,7 +96,7 @@ class AnalysisEngine:
                 frame_index=frame_index,
                 timestamp_ns=timestamp_ns,
                 detection=detection,
-                position_mm=self.calibration.pixel_to_mm(detection.centroid_px),
+                position_mm=self.position_mapper(detection.centroid_px),
             )
             for detection in detection_result.detections
         )

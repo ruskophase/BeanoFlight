@@ -19,10 +19,13 @@ arrival time.
 
 **Simulation** replays the recording sequentially at a selected rate, including
 60 FPS or unlimited. Preview can be disabled, the display queue is latest-only,
-and full-frame history is never retained. Every eligible bean is cropped to a
-configurable 300 x 300 lossless BGR image and sent over a bounded ZeroMQ path.
-Source-read and detector/tracker latency are reported separately. This is the
-recorded-source stand-in for a future live CamL frame source.
+and full-frame history is never retained. For a complete FastCap bundle, the
+default fast path memory-maps native CamL RG10, detects on a 728 x 544 green
+plane, point-undistorts centroids for metric tracking, and colour-processes only
+selected bean crops. Every eligible bean is sent as a configurable 300 x 300
+BGR8 crop over a bounded ZeroMQ path. Source preparation and detector/tracker
+latency are reported separately. This is the recorded-source stand-in for a
+future live CamL frame source.
 
 ## BeanRegistry
 
@@ -58,7 +61,8 @@ beano-flight /recordings/example
 ```
 
 In BeanoFlight, select 3 empty background frames, choose **Simulation**, set
-the replay rate, decoded-frame prebuffer and crop count, then press **Run**.
+the replay rate, replay prebuffer and crop count, then press **Run**. Leave
+**Use memory-mapped RAW fast path** selected for the supplied complete bundle.
 Live playback defaults off for throughput. The mock inferencer delays each crop
 and adds a deterministic random category/confidence. The sorter applies its
 configurable policy and shows virtual 5 mm gates in black or red while active.
@@ -72,6 +76,7 @@ acceptance runs against already-running services, use:
 ```bash
 beano-system-test /recordings/example \
   --background-frames 43,222,347 \
+  --optimized-raw \
   --prebuffer-frames 60 \
   --maximum-frames 1000 \
   --crops-per-bean 1 \
@@ -126,9 +131,10 @@ Select any of:
 - its `postprocess` directory;
 - `CamL-calibrated.mkv` directly.
 
-Simulation also offers **Open RAW bundle**. It uses BeanoFastCap's calibration
-processor directly and requires the complete bundle. The calibrated MKV is the
-preferred fast review input; RAW replay is the parity/reference path.
+**Open RAW bundle** remains available for slow, fully calibrated Review and
+pipeline comparison. Normal Review should use the calibrated MKV. Simulation's
+separate **memory-mapped RAW fast path** requires the complete bundle, avoids
+full-frame demosaic/colour/remap, and is the preferred performance input.
 
 When `pairs.csv` is beside the video, video frame `n` uses that row's
 `left_timestamp_ns`. If the sidecar is absent or invalid, BeanoFlight clearly
@@ -207,7 +213,8 @@ PYTHONPATH=src python3 -m compileall -q src
 The test suite covers metric fitting, every diagnostic detector stage, guided
 background sampling, edge rejection and suppression, exact timestamps, global
 assignment, ID lifecycle, registry revision/idempotency rules, SQLite recovery,
-byte-exact crop IPC, bounded decoded-frame prefetch, async mock inference,
+byte-exact crop IPC, bounded frame prefetch, mmap RAW lifecycle, deferred crop
+calibration, async mock inference,
 sorting decisions and virtual gate actuation.
 Representative real recordings will be added as regression fixtures after the
 first detector-tuning session.

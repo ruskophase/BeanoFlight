@@ -79,7 +79,7 @@ class DecodedFrameBuffer:
         self.frame_count = max(0, min(frame_count, source.metadata.frame_count))
         self.capacity = max(1, capacity)
         self._target = min(self.frame_count, self.capacity)
-        self._queue: queue.Queue[tuple[int, object]] = queue.Queue(
+        self._queue: queue.Queue[tuple[int, object, float]] = queue.Queue(
             maxsize=self.capacity
         )
         self._stop = threading.Event()
@@ -88,6 +88,7 @@ class DecodedFrameBuffer:
         self._thread: threading.Thread | None = None
         self._error: Exception | None = None
         self._next_index = 0
+        self.last_load_ms = 0.0
 
     def prebuffer(
         self,
@@ -126,7 +127,7 @@ class DecodedFrameBuffer:
             )
         while True:
             try:
-                buffered_index, frame = self._queue.get(timeout=0.05)
+                buffered_index, frame, load_ms = self._queue.get(timeout=0.05)
             except queue.Empty:
                 self._raise_error()
                 if self._finished.is_set():
@@ -137,6 +138,7 @@ class DecodedFrameBuffer:
                     f"decoded frame buffer returned {buffered_index}, expected {index}"
                 )
             self._next_index += 1
+            self.last_load_ms = load_ms
             return frame
 
     def close(self) -> None:
@@ -146,6 +148,12 @@ class DecodedFrameBuffer:
         if thread is not None:
             thread.join(2.0)
         self._thread = None
+        while True:
+            try:
+                _index, frame, _load_ms = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            _release_frame(self.source, frame)
 
     def _decode(self) -> None:
         try:
@@ -156,13 +164,17 @@ class DecodedFrameBuffer:
                     pass
                 if self._stop.is_set():
                     break
+                load_started = time.perf_counter_ns()
                 frame = self.source.frame(index)
+                load_ms = (time.perf_counter_ns() - load_started) / 1_000_000.0
                 while not self._stop.is_set():
                     try:
-                        self._queue.put((index, frame), timeout=0.05)
+                        self._queue.put((index, frame, load_ms), timeout=0.05)
                         break
                     except queue.Full:
                         continue
+                else:
+                    _release_frame(self.source, frame)
                 if self._queue.qsize() >= self._target:
                     self._ready.set()
         except Exception as exc:  # noqa: BLE001 - propagated on the replay thread
@@ -245,7 +257,7 @@ class CropDispatcher:
                 except queue.Empty:
                     continue
                 try:
-                    sender.submit(payload)
+                    sender.submit(payload.materialized())
                     try:
                         registry.update_inference_job(
                             payload.job.bean_ref,
@@ -350,6 +362,7 @@ class ReplayRunner:
                     if self.crop_selector is None
                     else self.crop_selector.settings.max_crops_per_bean
                 ),
+                "source_pipeline": getattr(self.source, "pipeline_metadata", {}),
             },
         )
         session = self.registry.put_session(session, expected_revision=0)
@@ -427,26 +440,40 @@ class ReplayRunner:
                     next_deadline = time.perf_counter()
                     was_paused = False
                 read_started = time.perf_counter_ns()
-                frame = (
-                    self.source.frame(index)
-                    if frame_buffer is None
-                    else frame_buffer.frame(index)
-                )
-                source_read_ms = (time.perf_counter_ns() - read_started) / 1_000_000.0
-                source_read_total += source_read_ms
-                source_read_max = max(source_read_max, source_read_ms)
-                source_timestamp = self.source.timestamp_ns(index)
-                analysis = self.engine.process(frame, index, source_timestamp)
-                frame_count += 1
-                processing_total += analysis.processing_ms
-                processing_max = max(processing_max, analysis.processing_ms)
-                if self.crop_selector is not None and self.crop_dispatcher is not None:
-                    for crop in self.crop_selector.select(
-                        frame, analysis, self.engine.last_registry_revisions
+                frame = None
+                try:
+                    frame = (
+                        self.source.frame(index)
+                        if frame_buffer is None
+                        else frame_buffer.frame(index)
+                    )
+                    source_read_ms = (
+                        (time.perf_counter_ns() - read_started) / 1_000_000.0
+                        if frame_buffer is None
+                        else frame_buffer.last_load_ms
+                    )
+                    source_read_total += source_read_ms
+                    source_read_max = max(source_read_max, source_read_ms)
+                    source_timestamp = self.source.timestamp_ns(index)
+                    analysis = self.engine.process(frame, index, source_timestamp)
+                    frame_count += 1
+                    processing_total += analysis.processing_ms
+                    processing_max = max(processing_max, analysis.processing_ms)
+                    if (
+                        self.crop_selector is not None
+                        and self.crop_dispatcher is not None
                     ):
-                        self.crop_dispatcher.register_and_enqueue(crop, self.registry)
-                if self.settings.preview_enabled and on_preview is not None:
-                    on_preview(frame, analysis)
+                        for crop in self.crop_selector.select(
+                            frame, analysis, self.engine.last_registry_revisions
+                        ):
+                            self.crop_dispatcher.register_and_enqueue(
+                                crop, self.registry
+                            )
+                    if self.settings.preview_enabled and on_preview is not None:
+                        on_preview(_preview_frame(self.source, frame), analysis)
+                finally:
+                    if frame is not None:
+                        _release_frame(self.source, frame)
                 elapsed = max(time.perf_counter() - started, 1e-9)
                 if on_progress is not None:
                     on_progress(
@@ -519,3 +546,14 @@ class ReplayRunner:
             ),
             stopped=cancellation.is_set(),
         )
+
+
+def _release_frame(source: ReplaySource, frame: object) -> None:
+    release = getattr(source, "release_frame", None)
+    if release is not None:
+        release(frame)
+
+
+def _preview_frame(source: ReplaySource, frame: object):
+    convert = getattr(source, "preview_frame", None)
+    return frame if convert is None else convert(frame)
