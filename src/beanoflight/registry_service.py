@@ -260,6 +260,11 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also print high-volume per-frame track.updated activity",
     )
+    result.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress per-event console output while retaining startup and errors",
+    )
     return result
 
 
@@ -288,8 +293,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 registry,
                 command_endpoint=arguments.commands,
                 event_endpoint=arguments.events,
-                event_observer=lambda event: _print_event(
-                    event, include_track_updates=arguments.log_track_updates
+                event_observer=(
+                    None
+                    if arguments.quiet
+                    else lambda event: _print_event(
+                        event, include_track_updates=arguments.log_track_updates
+                    )
                 ),
             )
             print(f"BeanRegistry database: {repository.path}", flush=True)

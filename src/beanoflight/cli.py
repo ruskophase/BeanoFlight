@@ -37,6 +37,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=30.0,
         help="virtual sorting line below the physical FoV bottom (default: 30)",
     )
+    parser.add_argument(
+        "--performance-mode",
+        action="store_true",
+        help=(
+            "start in Simulation mode with RAW mmap, prebuffering, and live "
+            "playback disabled"
+        ),
+    )
     return parser
 
 
@@ -52,6 +60,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         homography_path=args.homography,
         hole_pitch_mm=args.hole_pitch_mm,
         sorting_offset_mm=args.sorting_offset_mm,
+        performance_mode=args.performance_mode,
     )
     app.mainloop()
 

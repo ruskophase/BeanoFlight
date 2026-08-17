@@ -14,7 +14,13 @@ from .sorter import SorterActivity, SorterService, SorterSettings
 
 
 class SorterApp(tk.Tk):
-    def __init__(self, registry_endpoint: str) -> None:
+    def __init__(
+        self,
+        registry_endpoint: str,
+        *,
+        animate_gates: bool = True,
+        show_activity: bool = True,
+    ) -> None:
         super().__init__(className="Beano Sorter")
         self.title("BeanoSorter — Virtual Gates")
         self.iconname("BeanoSorter")
@@ -27,7 +33,6 @@ class SorterApp(tk.Tk):
         self._gate_items: dict[int, int] = {}
         self._displayed_gate_states: dict[int, bool] = {}
         self._activity_display_enabled = threading.Event()
-        self._activity_display_enabled.set()
 
         defaults = SorterSettings()
         self.categories_var = tk.StringVar(value=",".join(defaults.reject_categories))
@@ -40,9 +45,10 @@ class SorterApp(tk.Tk):
         self.notice_var = tk.StringVar(value=str(defaults.minimum_notice_ms))
         self.status_var = tk.StringVar(value="Stopped")
         self.counts_var = tk.StringVar(value="decisions 0 · actuations 0 · errors 0")
-        self.animate_gates_var = tk.BooleanVar(value=True)
-        self.show_activity_var = tk.BooleanVar(value=True)
+        self.animate_gates_var = tk.BooleanVar(value=animate_gates)
+        self.show_activity_var = tk.BooleanVar(value=show_activity)
         self._build()
+        self._display_options_changed()
         self.after(50, self._poll)
         self.after(100, self.start_service)
 
@@ -244,12 +250,26 @@ class SorterApp(tk.Tk):
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="BeanoFlight sorting simulation GUI")
     result.add_argument("--registry", default=DEFAULT_COMMAND_ENDPOINT)
+    result.add_argument(
+        "--no-gate-animation",
+        action="store_true",
+        help="start with virtual gate animation disabled",
+    )
+    result.add_argument(
+        "--no-activity-log",
+        action="store_true",
+        help="start with sorter activity rendering disabled",
+    )
     return result
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     arguments = parser().parse_args(argv)
-    SorterApp(arguments.registry).mainloop()
+    SorterApp(
+        arguments.registry,
+        animate_gates=not arguments.no_gate_animation,
+        show_activity=not arguments.no_activity_log,
+    ).mainloop()
 
 
 if __name__ == "__main__":

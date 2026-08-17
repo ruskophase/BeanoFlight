@@ -24,6 +24,21 @@ REGISTRY_CONFLICT = "conflict"
 REGISTRY_HEALTHY = "healthy"
 REGISTRY_UNRESPONSIVE = "unresponsive"
 
+PERFORMANCE_MODE_ARGUMENTS = {
+    "registry": ("--quiet",),
+    "monitor": ("--no-live-updates",),
+    "inferencer": ("--no-crop-preview", "--no-activity-log"),
+    "sorter": ("--no-gate-animation", "--no-activity-log"),
+    "flight": ("--performance-mode",),
+}
+
+
+def performance_mode_arguments(component: str, enabled: bool) -> tuple[str, ...]:
+    """Return the startup flags for one launcher component."""
+
+    arguments = PERFORMANCE_MODE_ARGUMENTS[component]
+    return arguments if enabled else ()
+
 
 def registry_endpoint_state(
     endpoint: str = DEFAULT_COMMAND_ENDPOINT,
@@ -63,13 +78,14 @@ class SimulationLauncherApp(tk.Tk):
         super().__init__(className="BeanoFlight Simulation")
         self.title("BeanoFlight Simulation Launcher")
         self.iconname("BeanoFlight Simulation")
-        self.geometry("800x500")
-        self.minsize(700, 430)
+        self.geometry("800x560")
+        self.minsize(700, 500)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.recording_var = tk.StringVar(
             value="" if initial_recording is None else str(initial_recording)
         )
         self.database_var = tk.StringVar(value="beanoflight-simulation.db")
+        self.performance_mode_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="All components stopped")
         self._processes: dict[str, subprocess.Popen] = {}
         self._external_registry = False
@@ -95,6 +111,20 @@ class SimulationLauncherApp(tk.Tk):
         ttk.Entry(form, textvariable=self.database_var).grid(
             row=3, column=0, sticky=tk.EW, padx=(0, 8)
         )
+        ttk.Checkbutton(
+            form,
+            text="Performance mode (recommended for 60 FPS)",
+            variable=self.performance_mode_var,
+        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(12, 0))
+        ttk.Label(
+            form,
+            text=(
+                "Newly started components use quiet registry logging, paused monitor "
+                "updates, hidden crop/activity views and static gates. Each GUI can "
+                "still re-enable its own diagnostics."
+            ),
+            wraplength=720,
+        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(3, 0))
         form.columnconfigure(0, weight=1)
 
         buttons = ttk.LabelFrame(self, text="Independent processes", padding=12)
@@ -143,7 +173,7 @@ class SimulationLauncherApp(tk.Tk):
         )
         return True
 
-    def _start_registry(self) -> bool:
+    def _start_registry(self, *, performance_mode: bool | None = None) -> bool:
         existing = self._processes.get("registry")
         if existing is not None and existing.poll() is None:
             return True
@@ -176,6 +206,11 @@ class SimulationLauncherApp(tk.Tk):
         self._external_registry = False
         self._registry_blocked = ""
         self.status_var.set("Starting BeanRegistry…")
+        performance_mode = (
+            self.performance_mode_var.get()
+            if performance_mode is None
+            else performance_mode
+        )
         return self._launch(
             "registry",
             "beanoflight.registry_service",
@@ -185,17 +220,29 @@ class SimulationLauncherApp(tk.Tk):
             DEFAULT_COMMAND_ENDPOINT,
             "--events",
             DEFAULT_EVENT_ENDPOINT,
+            *performance_mode_arguments("registry", performance_mode),
         )
 
-    def _start_monitor(self) -> None:
+    def _start_monitor(self, *, performance_mode: bool | None = None) -> None:
+        performance_mode = (
+            self.performance_mode_var.get()
+            if performance_mode is None
+            else performance_mode
+        )
         self._launch(
             "monitor",
             "beanoflight.registry_monitor_app",
             "--registry",
             DEFAULT_COMMAND_ENDPOINT,
+            *performance_mode_arguments("monitor", performance_mode),
         )
 
-    def _start_inferencer(self) -> None:
+    def _start_inferencer(self, *, performance_mode: bool | None = None) -> None:
+        performance_mode = (
+            self.performance_mode_var.get()
+            if performance_mode is None
+            else performance_mode
+        )
         self._launch(
             "inferencer",
             "beanoflight.mock_inferencer_app",
@@ -203,29 +250,45 @@ class SimulationLauncherApp(tk.Tk):
             DEFAULT_COMMAND_ENDPOINT,
             "--crops",
             DEFAULT_CROP_ENDPOINT,
+            *performance_mode_arguments("inferencer", performance_mode),
         )
 
-    def _start_sorter(self) -> None:
+    def _start_sorter(self, *, performance_mode: bool | None = None) -> None:
+        performance_mode = (
+            self.performance_mode_var.get()
+            if performance_mode is None
+            else performance_mode
+        )
         self._launch(
             "sorter",
             "beanoflight.sorter_app",
             "--registry",
             DEFAULT_COMMAND_ENDPOINT,
+            *performance_mode_arguments("sorter", performance_mode),
         )
 
-    def _start_flight(self) -> None:
+    def _start_flight(self, *, performance_mode: bool | None = None) -> None:
+        performance_mode = (
+            self.performance_mode_var.get()
+            if performance_mode is None
+            else performance_mode
+        )
         arguments = []
         if self.recording_var.get().strip():
             arguments.append(self.recording_var.get().strip())
+        arguments.extend(performance_mode_arguments("flight", performance_mode))
         self._launch("flight", "beanoflight.cli", *arguments)
 
     def start_all(self) -> None:
-        if not self._start_registry():
+        performance_mode = self.performance_mode_var.get()
+        if not self._start_registry(performance_mode=performance_mode):
             return
-        self.after(350, self._start_monitor)
-        self.after(500, self._start_inferencer)
-        self.after(650, self._start_sorter)
-        self.after(800, self._start_flight)
+        self.after(350, lambda: self._start_monitor(performance_mode=performance_mode))
+        self.after(
+            500, lambda: self._start_inferencer(performance_mode=performance_mode)
+        )
+        self.after(650, lambda: self._start_sorter(performance_mode=performance_mode))
+        self.after(800, lambda: self._start_flight(performance_mode=performance_mode))
 
     def stop_all(self) -> None:
         processes = tuple(self._processes.values())

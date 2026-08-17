@@ -81,8 +81,13 @@ healthy registry that is already serving the selected database. It blocks
 startup when a different database is using the endpoint, or when an old
 registry owns the database or endpoint but is not answering. This remains safe
 after closing and reopening the launcher, even though its components
-deliberately survive closing the launcher window. For repeatable headless
-acceptance runs against already-running services, use:
+deliberately survive closing the launcher window. Its default **Performance
+mode** suppresses registry event printing and starts with monitor polling, crop
+and activity views, and gate animation disabled. BeanoFlight opens directly in
+Simulation mode with mmap RAW, prebuffering and no live playback. Clear the
+launcher checkbox for the fully visual profile, or re-enable an individual
+display in its own GUI after startup. For repeatable headless acceptance runs
+against already-running services, use:
 
 ```bash
 beano-system-test /recordings/example \

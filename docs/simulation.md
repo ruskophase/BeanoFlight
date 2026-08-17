@@ -38,7 +38,12 @@ CamL mmap RG10 (fast) or calibrated MKV (fallback)
   replay limit, crops per bean, crop size and sockets.
 - `beano-simulation` starts any or all of the above as separate child
   processes. Closing the launcher leaves them running; **Stop all** terminates
-  only processes that launcher started.
+  only processes that launcher started. Its selected-by-default **Performance
+  mode** suppresses registry event printing, pauses Registry Monitor polling,
+  disables crop/activity rendering and gate animation, and opens BeanoFlight
+  in Simulation mode with the existing fast replay defaults. These are initial
+  GUI states, so a diagnostic display can be re-enabled when needed without
+  restarting its worker service.
 - `beano-system-test` is the non-GUI replay driver for repeatable acceptance
   tests against already-running registry, inferencer and sorter processes.
 
@@ -71,6 +76,12 @@ Use **Unlimited** to measure the sustainable rate without deliberate sleeps.
 A 60 FPS target preserves source time at real-time scale but cannot compensate
 for a decoder or analysis path taking longer than 16.67 ms; missed deadlines
 and achieved FPS make that visible.
+
+For the normal 60 FPS test, start through `beano-simulation`, leave
+**Performance mode** selected, and press **Start all**. Clear it only when the
+visual diagnostics are more important than a representative throughput
+measurement. If the launcher adopts an already-running registry, that external
+process retains the console logging mode with which it was originally started.
 
 On the optimized path, each slot owns a read-only 3.06 MiB RAW mapping and a
 0.38 MiB 728 x 544 green image. A 60-frame buffer therefore allocates about

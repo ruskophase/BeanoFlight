@@ -32,7 +32,14 @@ def crop_preview_image(image_bgr) -> Image.Image:
 
 
 class MockInferencerApp(tk.Tk):
-    def __init__(self, registry_endpoint: str, crop_endpoint: str) -> None:
+    def __init__(
+        self,
+        registry_endpoint: str,
+        crop_endpoint: str,
+        *,
+        show_crop: bool = True,
+        show_activity: bool = True,
+    ) -> None:
         super().__init__(className="Mock Inferencer")
         self.title("Mock Inferencer")
         self.iconname("Mock Inferencer")
@@ -45,9 +52,7 @@ class MockInferencerApp(tk.Tk):
         self._activities: queue.Queue[MockInferenceActivity] = queue.Queue(maxsize=128)
         self._photo = None
         self._crop_display_enabled = threading.Event()
-        self._crop_display_enabled.set()
         self._activity_display_enabled = threading.Event()
-        self._activity_display_enabled.set()
 
         defaults = MockInferenceSettings()
         self.latency_var = tk.StringVar(value=str(defaults.latency_ms))
@@ -60,9 +65,10 @@ class MockInferencerApp(tk.Tk):
         )
         self.status_var = tk.StringVar(value="Stopped")
         self.counts_var = tk.StringVar(value="received 0 · completed 0 · dropped 0")
-        self.show_crop_var = tk.BooleanVar(value=True)
-        self.show_activity_var = tk.BooleanVar(value=True)
+        self.show_crop_var = tk.BooleanVar(value=show_crop)
+        self.show_activity_var = tk.BooleanVar(value=show_activity)
         self._build()
+        self._display_options_changed()
         self.after(50, self._poll)
         self.after(100, self.start_service)
 
@@ -236,12 +242,27 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="BeanoFlight mock inference GUI")
     result.add_argument("--registry", default=DEFAULT_COMMAND_ENDPOINT)
     result.add_argument("--crops", default=DEFAULT_CROP_ENDPOINT)
+    result.add_argument(
+        "--no-crop-preview",
+        action="store_true",
+        help="start with crop conversion and display disabled",
+    )
+    result.add_argument(
+        "--no-activity-log",
+        action="store_true",
+        help="start with inference activity rendering disabled",
+    )
     return result
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     arguments = parser().parse_args(argv)
-    MockInferencerApp(arguments.registry, arguments.crops).mainloop()
+    MockInferencerApp(
+        arguments.registry,
+        arguments.crops,
+        show_crop=not arguments.no_crop_preview,
+        show_activity=not arguments.no_activity_log,
+    ).mainloop()
 
 
 if __name__ == "__main__":

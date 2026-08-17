@@ -84,6 +84,13 @@ endpoint or selected database is owned but unresponsive, **Start all** stops
 immediately with a recovery message instead of creating a second database
 writer.
 
+When using `beano-simulation`, leave **Performance mode** selected for a
+repeatable throughput run. It starts newly launched components with registry
+event printing, Registry Monitor polling, crop and activity rendering, and
+virtual-gate animation disabled. The processing services continue to run; only
+their optional displays are paused. An already-running registry adopted by the
+launcher keeps its original logging setting.
+
 Disable preview for throughput checks. BeanoFlight reports source-read and
 analysis time separately. For a complete recording bundle, keep the
 memory-mapped RAW fast path enabled: it detects on the native green plane and

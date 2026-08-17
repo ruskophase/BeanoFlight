@@ -263,6 +263,7 @@ class BeanoFlightApp(tk.Tk):
         homography_path: Path | None = None,
         hole_pitch_mm: float = 9.16,
         sorting_offset_mm: float = 30.0,
+        performance_mode: bool = False,
     ) -> None:
         super().__init__(className="BeanoFlight")
         self.title("BeanoFlight")
@@ -274,6 +275,7 @@ class BeanoFlightApp(tk.Tk):
         self.hole_pitch_mm = hole_pitch_mm
         self.sorting_offset_mm = sorting_offset_mm
         self.explicit_homography = homography_path
+        self.performance_mode = bool(performance_mode)
 
         self.source: ReplaySource | None = None
         self.source_prefer_raw = False
@@ -300,7 +302,9 @@ class BeanoFlightApp(tk.Tk):
         self.status_var = tk.StringVar(value="Open a CamL recording to begin.")
         self.source_var = tk.StringVar(value="No recording loaded")
         self.calibration_var = tk.StringVar(value="No metric calibration")
-        self.mode_var = tk.StringVar(value="Review")
+        self.mode_var = tk.StringVar(
+            value="Simulation" if self.performance_mode else "Review"
+        )
         self.inspector_var = tk.BooleanVar(value=False)
         self.stage_var = tk.StringVar(value="Pipeline inspector disabled")
         self.stage_explanation_var = tk.StringVar(value="")
@@ -374,7 +378,11 @@ class BeanoFlightApp(tk.Tk):
         ttk.Button(toolbar, text="Analyse clip", command=self.analyse_clip).pack(
             side=tk.LEFT
         )
-        self.run_button = ttk.Button(toolbar, text="Play", command=self.toggle_run)
+        self.run_button = ttk.Button(
+            toolbar,
+            text="Run" if self.performance_mode else "Play",
+            command=self.toggle_run,
+        )
         self.run_button.pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(toolbar, text="Stop", command=self.stop_work).pack(
             side=tk.LEFT, padx=(6, 0)
@@ -739,6 +747,16 @@ class BeanoFlightApp(tk.Tk):
         ttk.Label(
             parent, text="Asynchronous system replay", style="Heading.TLabel"
         ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
+        if self.performance_mode:
+            ttk.Label(
+                parent,
+                text=(
+                    "Launcher performance profile active: mmap RAW and prebuffering "
+                    "on; live playback off."
+                ),
+                wraplength=370,
+                style="Muted.TLabel",
+            ).grid(row=13, column=0, columnspan=2, sticky=tk.W, pady=(12, 0))
         ttk.Label(parent, text="Target processing FPS").grid(
             row=1, column=0, sticky=tk.W, pady=3
         )

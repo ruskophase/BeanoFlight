@@ -32,7 +32,7 @@ def actuation_display(record: BeanRecord) -> str:
 
 
 class RegistryMonitorApp(tk.Tk):
-    def __init__(self, registry_endpoint: str) -> None:
+    def __init__(self, registry_endpoint: str, *, live_updates: bool = True) -> None:
         super().__init__(className="BeanRegistry Monitor")
         self.title("BeanRegistry Monitor")
         self.iconname("BeanRegistry Monitor")
@@ -44,12 +44,17 @@ class RegistryMonitorApp(tk.Tk):
         self.status_var = tk.StringVar(value="Connecting…")
         self.session_var = tk.StringVar(value="No run session")
         self.cursor_var = tk.StringVar(value="event cursor 0")
-        self.live_updates_var = tk.BooleanVar(value=True)
+        self.live_updates_var = tk.BooleanVar(value=live_updates)
         self._build()
         self.worker = RegistryMonitorWorker(
             self._post_snapshot, registry_endpoint=registry_endpoint
         )
+        self.worker.set_enabled(live_updates)
         self.worker.start()
+        if not live_updates:
+            self.status_var.set(
+                "Paused · registry polling and display updates disabled"
+            )
         self.after(100, self._poll)
 
     def _build(self) -> None:
@@ -215,12 +220,19 @@ class RegistryMonitorApp(tk.Tk):
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="BeanRegistry read-only monitor GUI")
     result.add_argument("--registry", default=DEFAULT_COMMAND_ENDPOINT)
+    result.add_argument(
+        "--no-live-updates",
+        action="store_true",
+        help="start with registry polling and display updates paused",
+    )
     return result
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     arguments = parser().parse_args(argv)
-    RegistryMonitorApp(arguments.registry).mainloop()
+    RegistryMonitorApp(
+        arguments.registry, live_updates=not arguments.no_live_updates
+    ).mainloop()
 
 
 if __name__ == "__main__":
