@@ -106,6 +106,14 @@ replaceable notifications. Each notification carries a persistent global
 stream sequence, so a critical consumer uses `events_since(cursor)` to recover
 any gap before proceeding.
 
+Recorded simulation uses a bounded sequential decoder ahead of the analysis
+thread. The default 60 decoded CamL frames use about 272 MiB at 1456 x 1088,
+and the replay clock is anchored only after that initial buffer is ready. The
+producer continues filling released slots while analysis consumes frames. This
+overlaps FFV1 decoding with OpenCV processing without retaining an entire clip;
+both buffer capacity (0-120, where zero disables it) and replay length
+(1-1,000 frames) are bounded and recorded in the run session.
+
 The original `EventBus` and `BeanStore` remain small same-process adapters for
 simple workers and backwards compatibility. They are not the live
 multi-process source of truth. See `bean-registry.md` for the process contract.

@@ -82,9 +82,17 @@ BeanoFlight refuses to begin Simulation if its ping is not acknowledged.
 Disable preview for throughput checks. BeanoFlight reports source-read and
 analysis time separately: on an FFV1 recording, software decoding may be the
 limiting stage even when the future live-camera detector path is within its
-16.67 ms budget. Inspect the registry monitor for a complete chain of
+16.67 ms budget. The default 60-frame decoded prebuffer starts before the replay
+clock and then overlaps decoding with analysis. Set the maximum replay length
+between 1 and 1,000 frames. Inspect the registry monitor for a complete chain of
 `inference.submitted`, `inference.accepted`, `inference.completed`,
 `sorting.decision`, and, where policy selects a gate, `sorting.actuated`.
+
+The Actuation column reads `Awaiting`, `Not required`, `Scheduled`, `OK` or
+`FAIL`; a blank result is no longer used for the normal no-gate case. Turn off
+live playback, mock crop display, activity logs, registry live updates and
+virtual-gate animation when measuring throughput. These controls affect GUI
+work only and do not stop the corresponding service.
 
 The headless `beano-system-test` requires exactly 3 explicit, visually
 confirmed empty-frame indices and prints a JSON performance summary on

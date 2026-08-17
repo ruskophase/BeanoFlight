@@ -58,10 +58,12 @@ beano-flight /recordings/example
 ```
 
 In BeanoFlight, select 3 empty background frames, choose **Simulation**, set
-the replay rate and preview option, then press **Run**. The mock inferencer
-delays each crop and adds a deterministic random category/confidence. The
-sorter applies its configurable policy and shows virtual 5 mm gates in black
-or red while active.
+the replay rate, decoded-frame prebuffer and crop count, then press **Run**.
+Live playback defaults off for throughput. The mock inferencer delays each crop
+and adds a deterministic random category/confidence. The sorter applies its
+configurable policy and shows virtual 5 mm gates in black or red while active.
+Crop previews, activity logs, monitor polling and gate animation can be turned
+off independently without stopping their worker services.
 
 `beano-simulation /recordings/example` is a convenience launcher; each button
 still creates an independent operating-system process. For repeatable headless
@@ -70,6 +72,9 @@ acceptance runs against already-running services, use:
 ```bash
 beano-system-test /recordings/example \
   --background-frames 43,222,347 \
+  --prebuffer-frames 60 \
+  --maximum-frames 1000 \
+  --crops-per-bean 1 \
   --target-fps 60
 ```
 
@@ -202,7 +207,7 @@ PYTHONPATH=src python3 -m compileall -q src
 The test suite covers metric fitting, every diagnostic detector stage, guided
 background sampling, edge rejection and suppression, exact timestamps, global
 assignment, ID lifecycle, registry revision/idempotency rules, SQLite recovery,
-byte-exact crop IPC, async mock inference, sorting decisions and virtual gate
-actuation.
+byte-exact crop IPC, bounded decoded-frame prefetch, async mock inference,
+sorting decisions and virtual gate actuation.
 Representative real recordings will be added as regression fixtures after the
 first detector-tuning session.
