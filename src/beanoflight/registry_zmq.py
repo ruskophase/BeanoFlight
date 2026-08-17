@@ -178,7 +178,9 @@ class ZeroMQRegistryServer:
             ]
         if operation == "get":
             record = self.registry.get(bean_ref_from_dict(_object(payload["bean_ref"])))
-            return record_to_dict(record)
+            return record_to_dict(
+                record, include_history=bool(payload.get("include_history", True))
+            )
         if operation in {"list", "list_active"}:
             run_id_value = payload.get("run_id")
             run_id = None if run_id_value is None else str(run_id_value)
@@ -203,6 +205,8 @@ class ZeroMQRegistryServer:
                     limit=int(payload.get("limit", 1_000)),
                 )
             ]
+        if operation == "event_cursor":
+            return self.registry.event_cursor()
         if operation == "update_track":
             track = track_from_dict(_object(payload["track"]))
             prediction_value = payload.get("prediction")
@@ -351,9 +355,17 @@ class ZeroMQRegistryClient:
             for item in _array(self._request("list_sessions", {}))
         )
 
-    def get(self, bean_ref: BeanRef) -> BeanRecord:
+    def get(self, bean_ref: BeanRef, *, include_history: bool = True) -> BeanRecord:
         return record_from_dict(
-            _object(self._request("get", {"bean_ref": bean_ref_to_dict(bean_ref)}))
+            _object(
+                self._request(
+                    "get",
+                    {
+                        "bean_ref": bean_ref_to_dict(bean_ref),
+                        "include_history": include_history,
+                    },
+                )
+            )
         )
 
     def list_records(
@@ -388,6 +400,9 @@ class ZeroMQRegistryClient:
                 )
             )
         )
+
+    def event_cursor(self) -> int:
+        return int(self._request("event_cursor", {}))
 
     def update_track(
         self,

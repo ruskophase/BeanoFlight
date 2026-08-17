@@ -239,6 +239,8 @@ class BeanRegistryTests(unittest.TestCase):
         self.assertEqual(acknowledged.decision.acknowledged_timestamp_ns, 181_000_000)
         journal = registry.events_since(0)
         self.assertEqual([event.stream_sequence for event in journal], [1, 2, 3, 4, 5])
+        self.assertEqual(registry.event_cursor(), 5)
+        self.assertEqual(registry.events_since(registry.event_cursor()), ())
         self.assertEqual(registry.events_since(3), journal[3:])
         with self.assertRaises(RegistryConflictError):
             registry.set_sorting_decision(
@@ -433,8 +435,10 @@ class SQLiteRegistryTests(unittest.TestCase):
             repository.close()
 
             with SQLiteBeanRepository(path) as reopened:
-                restored = BeanRegistry(reopened).get(bean_ref)
+                restored_registry = BeanRegistry(reopened)
+                restored = restored_registry.get(bean_ref)
                 self.assertEqual(restored, expected)
+                self.assertEqual(restored_registry.event_cursor(), 5)
                 self.assertEqual(
                     [event.kind for event in reopened.event_history(bean_ref)],
                     [

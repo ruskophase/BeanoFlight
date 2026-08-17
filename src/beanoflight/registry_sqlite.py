@@ -526,6 +526,15 @@ class SQLiteBeanRepository:
                 )
             )
 
+    def event_cursor(self) -> int:
+        """Return the newest persistent registry event sequence."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COALESCE(MAX(event_sequence), 0) FROM registry_events"
+            ).fetchone()
+            return int(row[0])
+
     def save_session(self, session: RunSession) -> None:
         value = run_session_to_dict(session)
         with self._lock, self._connection:

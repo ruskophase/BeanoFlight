@@ -6,7 +6,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from .models import BeanEvent
+from .models import BeanEvent, BeanRef
 from .registry_models import BeanRecord, RunSession
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
 from .registry_zmq import ZeroMQRegistryClient
@@ -28,16 +28,20 @@ class RegistryMonitorWorker:
         callback: Callable[[RegistryMonitorSnapshot], None],
         *,
         registry_endpoint: str = DEFAULT_COMMAND_ENDPOINT,
-        refresh_seconds: float = 0.2,
+        refresh_seconds: float = 0.5,
     ) -> None:
         self.callback = callback
         self.registry_endpoint = registry_endpoint
-        self.refresh_seconds = max(0.02, float(refresh_seconds))
+        self.refresh_seconds = max(0.05, float(refresh_seconds))
         self._stop = threading.Event()
         self._enabled = threading.Event()
         self._enabled.set()
+        self._reset = threading.Event()
+        self._reset.set()
         self._thread: threading.Thread | None = None
-        self._cursor = 0
+        self._cursor: int | None = None
+        self._run_id = ""
+        self._records: dict[BeanRef, BeanRecord] = {}
 
     def start(self) -> None:
         if self._thread is not None:
@@ -55,6 +59,7 @@ class RegistryMonitorWorker:
 
     def set_enabled(self, enabled: bool) -> None:
         if enabled:
+            self._reset.set()
             self._enabled.set()
         else:
             self._enabled.clear()
@@ -68,30 +73,79 @@ class RegistryMonitorWorker:
                     continue
                 try:
                     client.ping()
+                    if self._reset.is_set():
+                        self._cursor = client.event_cursor()
+                        self._run_id = ""
+                        self._records.clear()
+                        self._reset.clear()
                     sessions = client.list_sessions()
-                    records = client.list_records()
-                    events = client.events_since(self._cursor, limit=1_000)
+                    current = _latest_session(sessions)
+                    current_run_id = "" if current is None else current.run_id
+                    if current_run_id != self._run_id:
+                        self._run_id = current_run_id
+                        self._records = (
+                            {}
+                            if not current_run_id
+                            else {
+                                record.bean_ref: record
+                                for record in client.list_records(run_id=current_run_id)
+                            }
+                        )
+                    cursor = 0 if self._cursor is None else self._cursor
+                    events = client.events_since(cursor, limit=1_000)
                     if events:
                         self._cursor = events[-1].stream_sequence
+                    changed_refs = dict.fromkeys(
+                        event.bean_ref
+                        for event in events
+                        if event.bean_ref.run_id == current_run_id
+                    )
+                    for bean_ref in changed_refs:
+                        self._records[bean_ref] = client.get(
+                            bean_ref, include_history=False
+                        )
                     significant = tuple(
-                        event for event in events if event.kind != "track.updated"
+                        event
+                        for event in events
+                        if event.bean_ref.run_id == current_run_id
+                        and event.kind != "track.updated"
                     )
                     self.callback(
                         RegistryMonitorSnapshot(
                             True,
                             sessions,
-                            records,
+                            tuple(
+                                sorted(
+                                    self._records.values(),
+                                    key=lambda record: record.bean_ref,
+                                )
+                            ),
                             significant,
-                            self._cursor,
+                            0 if self._cursor is None else self._cursor,
                         )
                     )
                 except Exception as exc:  # noqa: BLE001 - monitor reconnect loop
                     client.close()
                     self.callback(
                         RegistryMonitorSnapshot(
-                            False, cursor=self._cursor, error=str(exc)
+                            False,
+                            cursor=0 if self._cursor is None else self._cursor,
+                            error=str(exc),
                         )
                     )
                 self._stop.wait(self.refresh_seconds)
         finally:
             client.close()
+
+
+def _latest_session(sessions: tuple[RunSession, ...]) -> RunSession | None:
+    if not sessions:
+        return None
+    return max(
+        sessions,
+        key=lambda session: (
+            session.updated_timestamp_ns,
+            session.created_timestamp_ns,
+            session.run_id,
+        ),
+    )

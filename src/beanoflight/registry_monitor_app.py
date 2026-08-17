@@ -125,7 +125,14 @@ class RegistryMonitorApp(tk.Tk):
         self.status_var.set(f"Connected · {self.registry_endpoint}")
         self.cursor_var.set(f"event cursor {snapshot.cursor}")
         if snapshot.sessions:
-            session = snapshot.sessions[-1]
+            session = max(
+                snapshot.sessions,
+                key=lambda item: (
+                    item.updated_timestamp_ns,
+                    item.created_timestamp_ns,
+                    item.run_id,
+                ),
+            )
             self.session_var.set(
                 f"run {session.run_id[:12]} · {session.state.value} · "
                 f"{session.target_fps:g} fps"

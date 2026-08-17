@@ -21,14 +21,18 @@ CamL mmap RG10 (fast) or calibrated MKV (fallback)
 
 - `beano-registry` is the only database writer. Its console output suppresses
   high-volume `track.updated` messages unless `--log-track-updates` is used.
-- `beano-registry-monitor` is read-only. It displays current runs and beans,
-  makes no-gate and scheduled actuation states explicit, and can pause polling.
+- `beano-registry-monitor` is read-only. It displays the latest run and keeps
+  that snapshot current from coalesced events instead of repeatedly loading all
+  historical beans. It makes no-gate and scheduled actuation states explicit,
+  and can pause polling.
 - `beano-mock-inferencer` receives lossless BGR crops, optionally shows the
   latest crop and activity log, waits a configurable ResNet-like delay and
   writes a seeded category and confidence to the registry.
 - `beano-sorter` is a durable event-journal consumer. It owns classification
-  policy and timing. Its actuator loop turns virtual 5 mm gate dots red while
-  open and records actual open/close timestamps.
+  policy and timing. Recovery starts from the current cursor plus live/latest
+  run snapshots; it never replays unrelated historical runs. Its actuator loop
+  turns virtual 5 mm gate dots red while open and records actual open/close
+  timestamps.
 - `beano-flight` owns detection, identity, tracking, prediction and crop
   selection. Its Simulation tab controls input path, rate, preview, prebuffer,
   replay limit, crops per bean, crop size and sockets.
@@ -76,14 +80,25 @@ still needs about 272 MiB for 60 decoded BGR frames. BeanoFlight limits either
 buffer to 120 frames and replay to 1,000 frames. Prebuffer time is reported
 separately and excluded from achieved playback FPS.
 
-On 2026-08-17, the optimized path replayed all 601 frames of
-`20260816T134132.801241Z-beans` on the development Jetson at 59.79 FPS against a
-60 FPS clock. That run included SQLite/ZeroMQ registry updates, 25 ms mock
-inference, 141 calibrated 300 x 300 crops, and zero crop drops. Mean RAW frame
-preparation was 7.49 ms and mean analysis was 12.41 ms. With crops disabled and
-an unlimited clock, the same path sustained 95.2 FPS. Individual timing spikes
-still exceed 16.67 ms, so the deadline counter remains useful even when later
-frames catch up and aggregate throughput reaches 60 FPS.
+On 2026-08-17, after adding history-bounded registry consumers, the optimized
+path replayed all 601 frames of `20260816T134132.801241Z-beans` on the
+development Jetson at 60.00 FPS against a 60 FPS clock. Registry Monitor, Mock
+Inferencer and BeanoSorter ran concurrently in separate processes. The run
+included SQLite/ZeroMQ registry updates, 25 ms mock inference, 141 calibrated
+300 x 300 crops, and zero crop drops. Mean RAW frame preparation was 6.74 ms and
+mean analysis was 12.23 ms. With crops disabled and an unlimited clock, an
+earlier run of the same path sustained 95.2 FPS. Individual timing spikes still
+exceed 16.67 ms, so the deadline counter remains useful even when later frames
+catch up and aggregate throughput reaches 60 FPS.
+
+A separate startup check used an 81.7 MiB registry copy containing 1,143 beans
+and 14,208 events. The current-run snapshot took 53 ms once; subsequent idle
+journal polls averaged 0.20 ms and did not scan SQLite history.
+
+The final replay summary is also persisted under the run session's
+`settings.performance` field. This includes achieved FPS, source and analysis
+timings, prebuffer timing, deadline misses and crop counters, allowing a slow
+run to be diagnosed after its GUI has closed.
 
 For the supplied exploratory recording, one useful confirmed-empty candidate
 set is:

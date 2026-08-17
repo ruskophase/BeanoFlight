@@ -117,6 +117,14 @@ The consumer stores its cursor only after its own effect is safely committed.
 This makes the SQLite journal the recovery path while keeping routine latency
 on local IPC.
 
+A snapshot-based consumer must not replay the complete journal on every
+process start. It first reads `event_cursor()`, then takes the relevant current
+state snapshot, and finally consumes events after that cursor. An update racing
+with the snapshot can be seen twice, so effects remain idempotent, but no update
+is missed. BeanoSorter applies this pattern to live sessions and the most
+recent session, and coalesces each event page to one current-state lookup per
+bean.
+
 ## Memory and image copying
 
 Only the latest observation crosses ZeroMQ on a track update. The registry

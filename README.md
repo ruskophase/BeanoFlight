@@ -50,6 +50,8 @@ silently replacing a Unix socket while sharing the WAL database.
 
 The simulation adds persistent run sessions, crop-job status, classification,
 sorting decisions and virtual actuation results. It still stores no images.
+Registry consumers bootstrap from the current journal cursor and current-run
+snapshot, so startup work no longer grows with every previous simulation.
 
 ## Asynchronous simulation
 

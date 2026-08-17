@@ -105,6 +105,17 @@ The headless `beano-system-test` requires exactly 3 explicit, visually
 confirmed empty-frame indices and prints a JSON performance summary on
 completion. Add `--optimized-raw` to use the same fast path as the GUI.
 
+Every completed session stores its achieved FPS, source-read and analysis
+means/maxima, prebuffer time, missed deadlines and crop counts in the session
+`settings.performance` object. These values remain available after the
+BeanoFlight window closes.
+
+After upgrading code that changes the registry command contract, stop all
+components and restart BeanRegistry before restarting its clients. For the
+current performance reference, confirm that the selected source is
+`20260816T134132.801241Z-beans`; the launcher remembers only the path supplied
+when it was started or subsequently chosen in BeanoFlight.
+
 ## Registry ownership recovery
 
 BeanRegistry holds advisory locks beside the database and IPC socket paths for

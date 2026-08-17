@@ -270,7 +270,9 @@ class CropDispatcher:
                         # A zero-latency worker can complete the job between the
                         # crop ACK and this bookkeeping call. Completion is a
                         # successful terminal state, not a dispatch failure.
-                        record = registry.get(payload.job.bean_ref)
+                        record = registry.get(
+                            payload.job.bean_ref, include_history=False
+                        )
                         current = next(
                             item
                             for item in record.inference_jobs
@@ -370,6 +372,7 @@ class ReplayRunner:
         prebuffered_frames = 0
         prebuffer_seconds = 0.0
         started = 0.0
+        playback_elapsed = 0.0
         next_deadline = 0.0
         frame_count = 0
         processing_total = 0.0
@@ -500,8 +503,11 @@ class ReplayRunner:
                         cancellation.wait(remaining)
                     else:
                         missed += 1
+            playback_elapsed = max(time.perf_counter() - started, 1e-9)
         except Exception as exc:
             failure = exc
+            if started > 0:
+                playback_elapsed = max(time.perf_counter() - started, 1e-9)
             raise
         finally:
             if frame_buffer is not None:
@@ -509,6 +515,17 @@ class ReplayRunner:
             if self.crop_dispatcher is not None:
                 self.crop_dispatcher.close(drain=True)
             final_state = RunState.FAILED if failure is not None else RunState.COMPLETED
+            achieved_fps = (
+                frame_count / playback_elapsed if playback_elapsed > 0 else 0.0
+            )
+            source_mean_ms = source_read_total / frame_count if frame_count else 0.0
+            processing_mean_ms = processing_total / frame_count if frame_count else 0.0
+            crops_submitted = (
+                0 if self.crop_dispatcher is None else self.crop_dispatcher.submitted
+            )
+            crops_dropped = (
+                0 if self.crop_dispatcher is None else self.crop_dispatcher.dropped
+            )
             session = self.registry.put_session(
                 replace(
                     session,
@@ -519,31 +536,37 @@ class ReplayRunner:
                         "frames_processed": frame_count,
                         "stopped": cancellation.is_set(),
                         "failure": "" if failure is None else str(failure),
+                        "performance": {
+                            "elapsed_seconds": playback_elapsed,
+                            "achieved_fps": achieved_fps,
+                            "mean_source_read_ms": source_mean_ms,
+                            "max_source_read_ms": source_read_max,
+                            "mean_processing_ms": processing_mean_ms,
+                            "max_processing_ms": processing_max,
+                            "prebuffered_frames": prebuffered_frames,
+                            "prebuffer_seconds": prebuffer_seconds,
+                            "missed_deadlines": missed,
+                            "crops_submitted": crops_submitted,
+                            "crops_dropped": crops_dropped,
+                        },
                     },
                 ),
                 expected_revision=session.revision,
             )
-        elapsed = max(time.perf_counter() - started, 1e-9)
         return ReplaySummary(
             run_id=run_id,
             frames_processed=frame_count,
-            elapsed_seconds=elapsed,
-            achieved_fps=frame_count / elapsed,
-            mean_source_read_ms=(
-                source_read_total / frame_count if frame_count else 0.0
-            ),
+            elapsed_seconds=playback_elapsed,
+            achieved_fps=achieved_fps,
+            mean_source_read_ms=source_mean_ms,
             max_source_read_ms=source_read_max,
-            mean_processing_ms=(processing_total / frame_count if frame_count else 0.0),
+            mean_processing_ms=processing_mean_ms,
             max_processing_ms=processing_max,
             prebuffered_frames=prebuffered_frames,
             prebuffer_seconds=prebuffer_seconds,
             missed_deadlines=missed,
-            crops_submitted=(
-                0 if self.crop_dispatcher is None else self.crop_dispatcher.submitted
-            ),
-            crops_dropped=(
-                0 if self.crop_dispatcher is None else self.crop_dispatcher.dropped
-            ),
+            crops_submitted=crops_submitted,
+            crops_dropped=crops_dropped,
             stopped=cancellation.is_set(),
         )
 

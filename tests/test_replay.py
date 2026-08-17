@@ -47,10 +47,13 @@ class FakeRegistry:
     def __init__(self, source):
         self.source = source
         self.transitions = []
+        self.sessions = []
 
     def put_session(self, session, *, expected_revision):
         self.transitions.append((session.state, len(self.source.calls)))
-        return replace(session, revision=expected_revision + 1)
+        stored = replace(session, revision=expected_revision + 1)
+        self.sessions.append(stored)
+        return stored
 
 
 class ReplayBufferTests(unittest.TestCase):
@@ -116,6 +119,11 @@ class ReplayBufferTests(unittest.TestCase):
                 (RunState.COMPLETED, 3),
             ],
         )
+        performance = registry.sessions[-1].settings["performance"]
+        self.assertEqual(performance["prebuffered_frames"], 2)
+        self.assertEqual(performance["crops_submitted"], 0)
+        self.assertEqual(performance["crops_dropped"], 0)
+        self.assertGreater(performance["achieved_fps"], 0)
 
 
 if __name__ == "__main__":

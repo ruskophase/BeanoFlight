@@ -73,6 +73,8 @@ class RegistryRepository(Protocol):
         self, after_sequence: int, *, limit: int = 1_000
     ) -> tuple[BeanEvent, ...]: ...
 
+    def event_cursor(self) -> int: ...
+
     def batch(self) -> AbstractContextManager[None]: ...
 
     def save_session(self, session: RunSession) -> None: ...
@@ -103,7 +105,7 @@ class BeanRegistry:
         self._journal: deque[BeanEvent] = deque(
             maxlen=max(128, int(event_history_capacity))
         )
-        self._stream_sequence = 0
+        self._stream_sequence = 0 if repository is None else repository.event_cursor()
 
     def subscribe(self, *, capacity: int = 1_024):
         return self.events.subscribe(capacity=capacity)
@@ -716,6 +718,8 @@ class BeanRegistry:
         if limit <= 0 or limit > 10_000:
             raise ValueError("event query limit must be between 1 and 10000")
         with self._lock:
+            if after_sequence >= self._stream_sequence:
+                return ()
             if self.repository is not None:
                 return self.repository.events_since(after_sequence, limit=limit)
             if self._journal and after_sequence < self._journal[0].stream_sequence - 1:
@@ -727,6 +731,12 @@ class BeanRegistry:
                 for event in self._journal
                 if event.stream_sequence > after_sequence
             )[:limit]
+
+    def event_cursor(self) -> int:
+        """Return the newest durable journal sequence without replaying history."""
+
+        with self._lock:
+            return self._stream_sequence
 
     def evict_completed(self, *, before_timestamp_ns: int) -> int:
         terminal = {TrackStatus.EXITED, TrackStatus.CANCELLED}

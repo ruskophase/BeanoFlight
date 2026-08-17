@@ -116,6 +116,9 @@ class ZeroMQRegistryTests(unittest.TestCase):
             self.assertEqual(
                 [event.stream_sequence for event in journal], [1, 2, 3, 4, 5]
             )
+            self.assertEqual(client.event_cursor(), 5)
+            without_history = client.get(bean_ref, include_history=False)
+            self.assertEqual(without_history.track.history, ())
             with self.assertRaises(RegistryRemoteError):
                 client.get(BeanRef("zmq-run", 404))
 

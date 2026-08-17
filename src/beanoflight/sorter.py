@@ -8,9 +8,11 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .models import BeanEvent
 from .registry_models import (
     ActuationResult,
     BeanRecord,
+    RunSession,
     RunState,
     SortingDecision,
 )
@@ -108,16 +110,13 @@ class SorterService:
             while not self._stop.is_set():
                 try:
                     if first:
-                        for record in registry.list_records():
-                            self._consider(record, registry)
+                        self._recover_current_state(registry)
                         first = False
                     events = registry.events_since(self._cursor, limit=500)
                     if not events:
                         self._stop.wait(0.025)
                         continue
-                    for event in events:
-                        self._cursor = event.stream_sequence
-                        self._consider(registry.get(event.bean_ref), registry)
+                    self._process_events(events, registry)
                 except Exception as exc:  # noqa: BLE001 - reconnect loop is intentional
                     self.errors += 1
                     self._emit("error", detail=str(exc))
@@ -125,6 +124,28 @@ class SorterService:
                     self._stop.wait(0.25)
         finally:
             registry.close()
+
+    def _recover_current_state(self, registry: ZeroMQRegistryClient) -> None:
+        # Take the cursor before the snapshot. Events racing with the snapshot are
+        # replayed once afterwards; immutable decisions make that harmless.
+        self._cursor = registry.event_cursor()
+        sessions = registry.list_sessions()
+        for run_id in _recovery_run_ids(sessions):
+            for record in registry.list_records(run_id=run_id):
+                self._consider(record, registry)
+
+    def _process_events(
+        self,
+        events: tuple[BeanEvent, ...],
+        registry: ZeroMQRegistryClient,
+    ) -> None:
+        # Many track updates for one bean can arrive between polls. The registry
+        # snapshot already contains the newest state, so one lookup per bean is
+        # sufficient and avoids replay work growing with the frame rate.
+        bean_refs = dict.fromkeys(event.bean_ref for event in events)
+        for bean_ref in bean_refs:
+            self._consider(registry.get(bean_ref, include_history=False), registry)
+        self._cursor = events[-1].stream_sequence
 
     def _consider(self, record: BeanRecord, registry: ZeroMQRegistryClient) -> None:
         if record.decision is not None:
@@ -309,3 +330,31 @@ class SorterService:
                 detail=detail,
             )
         )
+
+
+def _recovery_run_ids(sessions: tuple[RunSession, ...]) -> tuple[str, ...]:
+    if not sessions:
+        return ()
+    latest = max(
+        sessions,
+        key=lambda session: (
+            session.updated_timestamp_ns,
+            session.created_timestamp_ns,
+            session.run_id,
+        ),
+    )
+    live_states = {RunState.CREATED, RunState.RUNNING, RunState.PAUSED}
+    selected = {session.run_id for session in sessions if session.state in live_states}
+    selected.add(latest.run_id)
+    return tuple(
+        session.run_id
+        for session in sorted(
+            sessions,
+            key=lambda session: (
+                session.updated_timestamp_ns,
+                session.created_timestamp_ns,
+                session.run_id,
+            ),
+        )
+        if session.run_id in selected
+    )
