@@ -44,6 +44,10 @@ event has a persistent stream sequence; critical consumers recover through the
 `events_since` query rather than assuming publish/subscribe delivery. Frame
 images are never written to the registry or its database.
 
+BeanRegistry holds exclusive OS locks for its SQLite database and both IPC
+endpoints. A second instance exits with a clear ownership error instead of
+silently replacing a Unix socket while sharing the WAL database.
+
 The simulation adds persistent run sessions, crop-job status, classification,
 sorting decisions and virtual actuation results. It still stores no images.
 
@@ -70,7 +74,12 @@ Crop previews, activity logs, monitor polling and gate animation can be turned
 off independently without stopping their worker services.
 
 `beano-simulation /recordings/example` is a convenience launcher; each button
-still creates an independent operating-system process. For repeatable headless
+still creates an independent operating-system process. The launcher adopts a
+healthy registry that is already serving the selected database. It blocks
+startup when a different database is using the endpoint, or when an old
+registry owns the database or endpoint but is not answering. This remains safe
+after closing and reopening the launcher, even though its components
+deliberately survive closing the launcher window. For repeatable headless
 acceptance runs against already-running services, use:
 
 ```bash

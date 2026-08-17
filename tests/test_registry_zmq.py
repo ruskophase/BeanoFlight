@@ -50,7 +50,9 @@ class ZeroMQRegistryTests(unittest.TestCase):
             self.assertTrue(ready.wait(2.0))
             client = ZeroMQRegistryClient(command_endpoint, timeout_ms=2_000)
             subscriber = ZeroMQRegistrySubscriber(event_endpoint)
-            self.assertEqual(client.ping()["service"], "BeanRegistry")
+            ping = client.ping()
+            self.assertEqual(ping["service"], "BeanRegistry")
+            self.assertEqual(ping["database"], str(repository.path.resolve()))
             # PUB/SUB subscriptions are asynchronous; allow the local handshake.
             time.sleep(0.1)
             bean_ref = BeanRef("zmq-run", 9)
@@ -99,9 +101,7 @@ class ZeroMQRegistryTests(unittest.TestCase):
             )
             self.assertEqual(decided.revision, 4)
             self.assertEqual(acknowledged.revision, 5)
-            self.assertEqual(
-                client.list_active(run_id="zmq-run"), (acknowledged,)
-            )
+            self.assertEqual(client.list_active(run_id="zmq-run"), (acknowledged,))
             journal = client.events_since(0)
             self.assertEqual(
                 [event.kind for event in journal],

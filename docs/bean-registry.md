@@ -4,6 +4,11 @@
 the live sorter. Other processes send commands or queries; they do not mutate
 Python objects or write SQLite tables directly.
 
+At startup the service takes exclusive advisory locks for the resolved
+database and both IPC endpoints. It also refuses to bind over a listener left
+by an older unlocked release. The launcher probes for a healthy existing
+service and adopts it rather than spawning another writer.
+
 ```text
 Capture/shared frames -> Detector/Tracker -> BeanRegistry <- inference result
        |                                       |

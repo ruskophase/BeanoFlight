@@ -39,6 +39,9 @@ no full-frame geometric remap is required on the tracking path.
 FastCap's CamL kernel timestamp is authoritative. Only differences within that
 timestamp domain are used. Plain videos without `pairs.csv` are supported for
 diagnostics but are marked as using nominal FPS time.
+Run creation/update fields remain in Unix wall-clock nanoseconds. Persisting a
+source-domain observation never rewrites those session fields; source and wall
+clocks meet only through the explicit run clock anchor.
 
 ## Assignment and lifecycle
 

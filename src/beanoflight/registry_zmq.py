@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import uuid
 from collections.abc import Callable, Mapping
+from pathlib import Path
 
 import zmq
 
@@ -149,7 +151,13 @@ class ZeroMQRegistryServer:
         self, operation: str, payload: Mapping[str, object], request_id: str
     ) -> object:
         if operation == "ping":
-            return {"service": "BeanRegistry", "schema": REGISTRY_SCHEMA}
+            database = getattr(self.registry.repository, "path", None)
+            return {
+                "service": "BeanRegistry",
+                "schema": REGISTRY_SCHEMA,
+                "pid": os.getpid(),
+                "database": ("" if database is None else str(Path(database).resolve())),
+            }
         if operation == "put_session":
             expected_value = payload.get("expected_revision")
             session = self.registry.put_session(

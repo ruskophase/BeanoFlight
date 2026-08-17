@@ -78,6 +78,11 @@ Start `beano-simulation` for a convenience control panel, or run the registry,
 monitor, mock inferencer, sorter and BeanoFlight in separate terminals. Select
 the same command and crop endpoints in each GUI. Start the registry first;
 BeanoFlight refuses to begin Simulation if its ping is not acknowledged.
+The launcher reuses a healthy existing registry only when it reports the
+selected database. If the endpoint is serving a different database, or if the
+endpoint or selected database is owned but unresponsive, **Start all** stops
+immediately with a recovery message instead of creating a second database
+writer.
 
 Disable preview for throughput checks. BeanoFlight reports source-read and
 analysis time separately. For a complete recording bundle, keep the
@@ -86,8 +91,8 @@ colour-processes only asynchronous inference crops. The FFV1 route remains a
 useful fallback and review reference, but software decoding can be its limiting
 stage. The default 60-frame prebuffer starts before the replay clock and then
 overlaps RAW preparation or video decoding with analysis. Set the maximum replay
-length between 1 and 1,000 frames. Inspect the registry monitor for a complete chain of
-`inference.submitted`, `inference.accepted`, `inference.completed`,
+length between 1 and 1,000 frames. Inspect the registry monitor for a complete
+chain of `inference.submitted`, `inference.accepted`, `inference.completed`,
 `sorting.decision`, and, where policy selects a gate, `sorting.actuated`.
 
 The Actuation column reads `Awaiting`, `Not required`, `Scheduled`, `OK` or
@@ -99,3 +104,18 @@ work only and do not stop the corresponding service.
 The headless `beano-system-test` requires exactly 3 explicit, visually
 confirmed empty-frame indices and prints a JSON performance summary on
 completion. Add `--optimized-raw` to use the same fast path as the GUI.
+
+## Registry ownership recovery
+
+BeanRegistry holds advisory locks beside the database and IPC socket paths for
+its entire lifetime. Lock files persist harmlessly after exit; ownership is the
+live OS lock, not the presence of the file. A second service exits with status
+2 and reports the owning PID metadata.
+
+When upgrading from a version without these locks, BeanoFlight also identifies
+local registry processes whose command line selects the database and which
+actually hold that SQLite file open. If the launcher says the registry is
+occupied but unresponsive, close the dependent component GUIs, terminate every
+old `beanoflight.registry_service` process gracefully, verify that none remain,
+and then start the registry once. Do not delete the SQLite, WAL or SHM files as
+a way of resolving process ownership.

@@ -110,8 +110,7 @@ class SQLiteBeanRepository:
             """
             INSERT INTO sessions(run_id, created_timestamp_ns)
             VALUES (?, ?)
-            ON CONFLICT(run_id) DO UPDATE SET
-                created_timestamp_ns = MIN(created_timestamp_ns, excluded.created_timestamp_ns)
+            ON CONFLICT(run_id) DO NOTHING
             """,
             (ref.run_id, record.created_timestamp_ns),
         )

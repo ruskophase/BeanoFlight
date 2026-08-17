@@ -274,6 +274,37 @@ class BeanRegistryTests(unittest.TestCase):
 
 
 class SQLiteRegistryTests(unittest.TestCase):
+    def test_track_persistence_does_not_replace_session_wall_clock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "beanoflight.db"
+            wall_clock_ns = 1_786_960_000_000_000_000
+            source_clock_ns = 235_228_702_332_000
+            session = RunSession(
+                "clock-domain-run",
+                0,
+                RunState.RUNNING,
+                "/recording",
+                "raw-mmap-green",
+                601,
+                60.0,
+                60.0,
+                source_clock_ns,
+                source_clock_ns,
+                1_000,
+                False,
+                wall_clock_ns,
+                wall_clock_ns,
+                {},
+            )
+            with SQLiteBeanRepository(path) as repository:
+                registry = BeanRegistry(repository)
+                registry.put_session(session)
+                registry.update_track(
+                    track(BeanRef(session.run_id, 1), 0, source_clock_ns, -25.0)
+                )
+                restored = repository.load_session(session.run_id)
+                self.assertEqual(restored.created_timestamp_ns, wall_clock_ns)
+
     def test_schema_one_session_is_migrated_in_place(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "version-one.db"

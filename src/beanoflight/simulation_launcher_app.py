@@ -11,7 +11,51 @@ from pathlib import Path
 from tkinter import filedialog, ttk
 
 from .inference_transport import DEFAULT_CROP_ENDPOINT
-from .registry_service import DEFAULT_COMMAND_ENDPOINT, DEFAULT_EVENT_ENDPOINT
+from .registry_service import (
+    DEFAULT_COMMAND_ENDPOINT,
+    DEFAULT_EVENT_ENDPOINT,
+    ipc_endpoint_has_listener,
+    registry_processes_for_database,
+)
+from .registry_zmq import ZeroMQRegistryClient
+
+REGISTRY_ABSENT = "absent"
+REGISTRY_CONFLICT = "conflict"
+REGISTRY_HEALTHY = "healthy"
+REGISTRY_UNRESPONSIVE = "unresponsive"
+
+
+def registry_endpoint_state(
+    endpoint: str = DEFAULT_COMMAND_ENDPOINT,
+    *,
+    database: Path | None = None,
+    timeout_ms: int = 250,
+) -> str:
+    """Classify the endpoint without allowing a second service to replace it."""
+
+    client = ZeroMQRegistryClient(endpoint, timeout_ms=max(1, int(timeout_ms)))
+    try:
+        response = client.ping()
+        if response.get("service") == "BeanRegistry":
+            active_database = str(response.get("database", "")).strip()
+            if (
+                database is not None
+                and active_database
+                and Path(active_database).resolve() != database.expanduser().resolve()
+            ):
+                return REGISTRY_CONFLICT
+            return REGISTRY_HEALTHY
+    except Exception:  # noqa: BLE001 - transport failure becomes state
+        occupied = ipc_endpoint_has_listener(endpoint) or (
+            database is not None and bool(registry_processes_for_database(database))
+        )
+        return REGISTRY_UNRESPONSIVE if occupied else REGISTRY_ABSENT
+    finally:
+        client.close()
+    occupied = ipc_endpoint_has_listener(endpoint) or (
+        database is not None and bool(registry_processes_for_database(database))
+    )
+    return REGISTRY_UNRESPONSIVE if occupied else REGISTRY_ABSENT
 
 
 class SimulationLauncherApp(tk.Tk):
@@ -28,6 +72,8 @@ class SimulationLauncherApp(tk.Tk):
         self.database_var = tk.StringVar(value="beanoflight-simulation.db")
         self.status_var = tk.StringVar(value="All components stopped")
         self._processes: dict[str, subprocess.Popen] = {}
+        self._external_registry = False
+        self._registry_blocked = ""
         self._build()
         self.after(500, self._poll)
 
@@ -87,17 +133,50 @@ class SimulationLauncherApp(tk.Tk):
         if selected:
             self.recording_var.set(selected)
 
-    def _launch(self, key: str, module: str, *arguments: str) -> None:
+    def _launch(self, key: str, module: str, *arguments: str) -> bool:
         existing = self._processes.get(key)
         if existing is not None and existing.poll() is None:
-            return
+            return True
         self._processes[key] = subprocess.Popen(
             [sys.executable, "-m", module, *arguments],
             start_new_session=True,
         )
+        return True
 
-    def _start_registry(self) -> None:
-        self._launch(
+    def _start_registry(self) -> bool:
+        existing = self._processes.get("registry")
+        if existing is not None and existing.poll() is None:
+            return True
+        state = registry_endpoint_state(
+            database=Path(
+                self.database_var.get().strip() or "beanoflight-simulation.db"
+            )
+        )
+        if state == REGISTRY_HEALTHY:
+            self._external_registry = True
+            self._registry_blocked = ""
+            self.status_var.set("Using the existing healthy BeanRegistry service")
+            return True
+        if state == REGISTRY_CONFLICT:
+            self._external_registry = False
+            self._registry_blocked = (
+                "Registry endpoint is serving a different database. Stop that "
+                "registry or select its database before starting this simulation."
+            )
+            self.status_var.set(self._registry_blocked)
+            return False
+        if state == REGISTRY_UNRESPONSIVE:
+            self._external_registry = False
+            self._registry_blocked = (
+                "Registry endpoint is occupied but not answering. Stop the old "
+                "registry process before starting another."
+            )
+            self.status_var.set(self._registry_blocked)
+            return False
+        self._external_registry = False
+        self._registry_blocked = ""
+        self.status_var.set("Starting BeanRegistry…")
+        return self._launch(
             "registry",
             "beanoflight.registry_service",
             "--database",
@@ -141,7 +220,8 @@ class SimulationLauncherApp(tk.Tk):
         self._launch("flight", "beanoflight.cli", *arguments)
 
     def start_all(self) -> None:
-        self._start_registry()
+        if not self._start_registry():
+            return
         self.after(350, self._start_monitor)
         self.after(500, self._start_inferencer)
         self.after(650, self._start_sorter)
@@ -159,15 +239,33 @@ class SimulationLauncherApp(tk.Tk):
                 process.kill()
                 process.wait(timeout=2.0)
         self._processes.clear()
-        self.status_var.set("All launcher-owned components stopped")
+        self.status_var.set(
+            "All launcher-owned components stopped; existing registry left running"
+            if self._external_registry
+            else "All launcher-owned components stopped"
+        )
 
     def _poll(self) -> None:
         running = tuple(
             key for key, process in self._processes.items() if process.poll() is None
         )
-        self.status_var.set(
-            "Running: " + ", ".join(running) if running else "All components stopped"
+        exited = tuple(
+            f"{key} (exit {process.returncode})"
+            for key, process in self._processes.items()
+            if process.poll() is not None and process.returncode
         )
+        visible = [*running]
+        if self._external_registry:
+            visible.insert(0, "registry (existing)")
+        if self._registry_blocked:
+            self.status_var.set(self._registry_blocked)
+        elif visible:
+            suffix = f"; failed: {', '.join(exited)}" if exited else ""
+            self.status_var.set("Running: " + ", ".join(visible) + suffix)
+        elif exited:
+            self.status_var.set("Failed: " + ", ".join(exited))
+        else:
+            self.status_var.set("All components stopped")
         self.after(500, self._poll)
 
     def _close(self) -> None:
