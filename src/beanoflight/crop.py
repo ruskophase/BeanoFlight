@@ -22,8 +22,8 @@ class CropSettings:
             raise ValueError("crop size must be positive")
         if not self.camera_id.strip():
             raise ValueError("crop camera ID is required")
-        if self.max_crops_per_bean <= 0:
-            raise ValueError("crops per bean must be positive")
+        if not 1 <= self.max_crops_per_bean <= 5:
+            raise ValueError("crops per bean must be between 1 and 5")
 
 
 @dataclass(frozen=True, slots=True)

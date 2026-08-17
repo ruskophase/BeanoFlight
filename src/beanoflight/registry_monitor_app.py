@@ -8,8 +8,27 @@ import tkinter as tk
 from collections.abc import Sequence
 from tkinter import ttk
 
+from .registry_models import BeanRecord
 from .registry_monitor import RegistryMonitorSnapshot, RegistryMonitorWorker
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
+
+
+def _gate_labels(indices: tuple[int, ...]) -> str:
+    return ",".join("G0" if value == 0 else f"G{value:+d}" for value in indices)
+
+
+def actuation_display(record: BeanRecord) -> str:
+    decision = record.decision
+    result = record.actuation
+    if result is not None:
+        label = "OK" if result.success else "FAIL"
+        gates = () if decision is None else decision.gate_indices
+        return f"{label} {_gate_labels(gates)}".strip()
+    if decision is None:
+        return "Awaiting"
+    if not decision.gate_indices:
+        return "Not required"
+    return f"Scheduled {_gate_labels(decision.gate_indices)}"
 
 
 class RegistryMonitorApp(tk.Tk):
@@ -25,6 +44,7 @@ class RegistryMonitorApp(tk.Tk):
         self.status_var = tk.StringVar(value="Connecting…")
         self.session_var = tk.StringVar(value="No run session")
         self.cursor_var = tk.StringVar(value="event cursor 0")
+        self.live_updates_var = tk.BooleanVar(value=True)
         self._build()
         self.worker = RegistryMonitorWorker(
             self._post_snapshot, registry_endpoint=registry_endpoint
@@ -38,6 +58,12 @@ class RegistryMonitorApp(tk.Tk):
         ttk.Label(header, textvariable=self.status_var).pack(side=tk.LEFT)
         ttk.Label(header, textvariable=self.session_var).pack(side=tk.LEFT, padx=20)
         ttk.Label(header, textvariable=self.cursor_var).pack(side=tk.RIGHT)
+        ttk.Checkbutton(
+            header,
+            text="Live updates (uses extra CPU)",
+            variable=self.live_updates_var,
+            command=self._toggle_live_updates,
+        ).pack(side=tk.RIGHT, padx=20)
 
         body = ttk.Panedwindow(self, orient=tk.VERTICAL)
         body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -60,7 +86,7 @@ class RegistryMonitorApp(tk.Tk):
         self.records = ttk.Treeview(
             records_frame, columns=columns, show="headings", height=14
         )
-        widths = (150, 90, 70, 140, 170, 110, 190, 170, 110)
+        widths = (150, 90, 70, 140, 170, 110, 190, 170, 160)
         for name, width in zip(columns, widths):
             self.records.heading(name, text=name.replace("_", " ").title())
             self.records.column(name, width=width, anchor=tk.W)
@@ -146,9 +172,7 @@ class RegistryMonitorApp(tk.Tk):
                 ""
                 if decision is None
                 else f"{decision.gate_indices} · {decision.reason}",
-                ""
-                if record.actuation is None
-                else ("OK" if record.actuation.success else "FAIL"),
+                actuation_display(record),
             )
             if key in existing:
                 self.records.item(key, values=values)
@@ -167,6 +191,14 @@ class RegistryMonitorApp(tk.Tk):
             if int(self.events.index("end-1c").split(".")[0]) > 500:
                 self.events.delete("500.0", tk.END)
             self.events.configure(state=tk.DISABLED)
+
+    def _toggle_live_updates(self) -> None:
+        enabled = self.live_updates_var.get()
+        self.worker.set_enabled(enabled)
+        if not enabled:
+            self.status_var.set(
+                "Paused · registry polling and display updates disabled"
+            )
 
     def _close(self) -> None:
         self.worker.close()

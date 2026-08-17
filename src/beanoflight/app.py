@@ -306,8 +306,12 @@ class BeanoFlightApp(tk.Tk):
             value=str(self.tracker_settings.right_birth_margin_px)
         )
         self.target_fps_var = tk.StringVar(value="60")
-        self.preview_enabled_var = tk.BooleanVar(value=True)
+        self.preview_enabled_var = tk.BooleanVar(value=False)
+        self.prebuffer_enabled_var = tk.BooleanVar(value=True)
+        self.prebuffer_frames_var = tk.StringVar(value="60")
+        self.maximum_frames_var = tk.StringVar(value="1000")
         self.crop_size_var = tk.StringVar(value="300")
+        self.crops_per_bean_var = tk.StringVar(value="1")
         self.registry_endpoint_var = tk.StringVar(value=DEFAULT_COMMAND_ENDPOINT)
         self.inference_endpoint_var = tk.StringVar(value=DEFAULT_CROP_ENDPOINT)
 
@@ -738,11 +742,36 @@ class BeanoFlightApp(tk.Tk):
         ).grid(row=1, column=1, sticky=tk.EW, pady=3)
         ttk.Checkbutton(
             parent,
-            text="Render preview (disable for throughput tests)",
+            text="Show live playback (uses extra CPU)",
             variable=self.preview_enabled_var,
         ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=5)
+        ttk.Checkbutton(
+            parent,
+            text="Prebuffer decoded frames before playback",
+            variable=self.prebuffer_enabled_var,
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=5)
+        ttk.Label(parent, text="Decoded prebuffer (frames)").grid(
+            row=4, column=0, sticky=tk.W, pady=3
+        )
+        ttk.Spinbox(
+            parent,
+            textvariable=self.prebuffer_frames_var,
+            from_=10,
+            to=120,
+            width=18,
+        ).grid(row=4, column=1, sticky=tk.EW, pady=3)
+        ttk.Label(parent, text="Maximum replay frames").grid(
+            row=5, column=0, sticky=tk.W, pady=3
+        )
+        ttk.Spinbox(
+            parent,
+            textvariable=self.maximum_frames_var,
+            from_=1,
+            to=1000,
+            width=18,
+        ).grid(row=5, column=1, sticky=tk.EW, pady=3)
         ttk.Label(parent, text="Square crop size (px)").grid(
-            row=3, column=0, sticky=tk.W, pady=3
+            row=6, column=0, sticky=tk.W, pady=3
         )
         ttk.Spinbox(
             parent,
@@ -751,31 +780,43 @@ class BeanoFlightApp(tk.Tk):
             to=1024,
             increment=2,
             width=18,
-        ).grid(row=3, column=1, sticky=tk.EW, pady=3)
+        ).grid(row=6, column=1, sticky=tk.EW, pady=3)
+        ttk.Label(parent, text="Crops per bean").grid(
+            row=7, column=0, sticky=tk.W, pady=3
+        )
+        ttk.Spinbox(
+            parent,
+            textvariable=self.crops_per_bean_var,
+            from_=1,
+            to=5,
+            width=18,
+        ).grid(row=7, column=1, sticky=tk.EW, pady=3)
         ttk.Label(parent, text="Registry command endpoint").grid(
-            row=4, column=0, sticky=tk.W, pady=3
+            row=8, column=0, sticky=tk.W, pady=3
         )
         ttk.Entry(parent, textvariable=self.registry_endpoint_var).grid(
-            row=4, column=1, sticky=tk.EW, pady=3
+            row=8, column=1, sticky=tk.EW, pady=3
         )
         ttk.Label(parent, text="Inference crop endpoint").grid(
-            row=5, column=0, sticky=tk.W, pady=3
+            row=9, column=0, sticky=tk.W, pady=3
         )
         ttk.Entry(parent, textvariable=self.inference_endpoint_var).grid(
-            row=5, column=1, sticky=tk.EW, pady=3
+            row=9, column=1, sticky=tk.EW, pady=3
         )
-        ttk.Separator(parent).grid(row=6, column=0, columnspan=2, sticky=tk.EW, pady=12)
+        ttk.Separator(parent).grid(
+            row=10, column=0, columnspan=2, sticky=tk.EW, pady=12
+        )
         ttk.Label(
             parent,
             text=(
-                "Simulation streams frame results without retaining the clip, sends one "
-                "fully visible 300×300 crop per confirmed bean, and uses the external "
-                "BeanRegistry and mock inferencer processes. Unlimited uses a logical "
-                "rather than wall-clock valve schedule."
+                "Simulation streams frame results without retaining the clip. A bounded "
+                "decoded-frame buffer overlaps input work with analysis, while crops are "
+                "sent to the external inferencer. Unlimited uses a logical rather than "
+                "wall-clock valve schedule."
             ),
             wraplength=390,
             style="Muted.TLabel",
-        ).grid(row=7, column=0, columnspan=2, sticky=tk.W)
+        ).grid(row=11, column=0, columnspan=2, sticky=tk.W)
         parent.columnconfigure(1, weight=1)
 
     def open_video(self) -> None:
@@ -1084,11 +1125,20 @@ class BeanoFlightApp(tk.Tk):
         try:
             fps_text = self.target_fps_var.get().strip().lower()
             target_fps = 0.0 if fps_text == "unlimited" else float(fps_text)
-            crop_settings = CropSettings(size_px=int(self.crop_size_var.get()))
+            crop_settings = CropSettings(
+                size_px=int(self.crop_size_var.get()),
+                max_crops_per_bean=int(self.crops_per_bean_var.get()),
+            )
             crop_settings.validate()
             replay_settings = ReplaySettings(
                 target_fps=target_fps,
                 preview_enabled=self.preview_enabled_var.get(),
+                prebuffer_frames=(
+                    int(self.prebuffer_frames_var.get())
+                    if self.prebuffer_enabled_var.get()
+                    else 0
+                ),
+                maximum_frames=int(self.maximum_frames_var.get()),
             )
             replay_settings.validate()
         except ValueError as exc:
@@ -1159,11 +1209,17 @@ class BeanoFlightApp(tk.Tk):
                     if value.frame_index == 0 or value.frame_index % 10 == 0:
                         self._control_queue.put(("replay_progress", generation, value))
 
+                def prebuffer_progress(buffered: int, target: int) -> None:
+                    self._control_queue.put(
+                        ("prebuffer_progress", generation, buffered, target)
+                    )
+
                 summary = runner.run(
                     stop=self._stop,
                     paused=self._pause,
                     on_preview=preview,
                     on_progress=progress,
+                    on_prebuffer=prebuffer_progress,
                 )
                 self._control_queue.put(("replay_done", generation, summary))
             except Exception as exc:  # noqa: BLE001 - worker reports GUI-safe errors
@@ -1181,8 +1237,13 @@ class BeanoFlightApp(tk.Tk):
         self._playing = True
         self.run_button.configure(text="Pause")
         rate = "unlimited" if replay_settings.target_fps <= 0 else f"{target_fps:g} FPS"
+        buffer_status = (
+            f"prebuffering {replay_settings.prebuffer_frames} frames"
+            if replay_settings.prebuffer_frames
+            else "streaming decode"
+        )
         self.status_var.set(
-            f"Simulation starting at {rate}; preview "
+            f"Simulation starting at {rate}; {buffer_status}; live playback "
             f"{'enabled' if replay_settings.preview_enabled else 'disabled'}…"
         )
 
@@ -1318,6 +1379,11 @@ class BeanoFlightApp(tk.Tk):
                         f"{value.processing_ms:.2f} ms · crops {value.crops_submitted} "
                         f"({value.crops_dropped} dropped)"
                     )
+                elif kind == "prebuffer_progress":
+                    _kind, _generation, buffered, target = message
+                    self.status_var.set(
+                        f"Prebuffering decoded frames {buffered:,} / {target:,}…"
+                    )
                 elif kind == "replay_done":
                     summary = message[2]
                     self._worker = None
@@ -1329,6 +1395,8 @@ class BeanoFlightApp(tk.Tk):
                         f"{summary.mean_source_read_ms:.2f} ms; analysis mean "
                         f"{summary.mean_processing_ms:.2f} ms; analysis max "
                         f"{summary.max_processing_ms:.2f} ms; "
+                        f"prebuffer {summary.prebuffered_frames} frames in "
+                        f"{summary.prebuffer_seconds:.2f} s; "
                         f"{summary.missed_deadlines} missed deadlines"
                     )
                     self.status_var.set(

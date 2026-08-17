@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import queue
+import threading
 import tkinter as tk
 from collections.abc import Sequence
 from tkinter import messagebox, ttk
@@ -24,6 +25,9 @@ class SorterApp(tk.Tk):
         self.service: SorterService | None = None
         self._activities: queue.Queue[SorterActivity] = queue.Queue(maxsize=256)
         self._gate_items: dict[int, int] = {}
+        self._displayed_gate_states: dict[int, bool] = {}
+        self._activity_display_enabled = threading.Event()
+        self._activity_display_enabled.set()
 
         defaults = SorterSettings()
         self.categories_var = tk.StringVar(value=",".join(defaults.reject_categories))
@@ -36,8 +40,10 @@ class SorterApp(tk.Tk):
         self.notice_var = tk.StringVar(value=str(defaults.minimum_notice_ms))
         self.status_var = tk.StringVar(value="Stopped")
         self.counts_var = tk.StringVar(value="decisions 0 · actuations 0 · errors 0")
+        self.animate_gates_var = tk.BooleanVar(value=True)
+        self.show_activity_var = tk.BooleanVar(value=True)
         self._build()
-        self.after(25, self._poll)
+        self.after(50, self._poll)
         self.after(100, self.start_service)
 
     def _build(self) -> None:
@@ -62,6 +68,18 @@ class SorterApp(tk.Tk):
         ttk.Button(controls, text="Stop", command=self.stop_service).grid(
             row=1, column=len(fields) + 1
         )
+        ttk.Checkbutton(
+            controls,
+            text="Animate virtual gates (uses extra CPU)",
+            variable=self.animate_gates_var,
+            command=self._display_options_changed,
+        ).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+        ttk.Checkbutton(
+            controls,
+            text="Show activity log",
+            variable=self.show_activity_var,
+            command=self._display_options_changed,
+        ).grid(row=2, column=3, columnspan=3, sticky=tk.W, pady=(8, 0))
 
         gates = ttk.LabelFrame(self, text="Virtual sorting line", padding=10)
         gates.pack(fill=tk.X, padx=10, pady=(0, 10))
@@ -114,7 +132,7 @@ class SorterApp(tk.Tk):
         if service is not None:
             service.close()
         self.status_var.set("Stopped")
-        self._update_gate_states({})
+        self._paint_gate_states({})
 
     def _draw_gates(self) -> None:
         self.canvas.delete("all")
@@ -140,8 +158,13 @@ class SorterApp(tk.Tk):
                 fill="#dce3ea",
             )
             self._gate_items[gate] = item
+        self._paint_gate_states(
+            self._displayed_gate_states if self.animate_gates_var.get() else {}
+        )
 
     def _post_activity(self, activity: SorterActivity) -> None:
+        if not self._activity_display_enabled.is_set():
+            return
         try:
             self._activities.put_nowait(activity)
         except queue.Full:
@@ -169,11 +192,12 @@ class SorterApp(tk.Tk):
                 message += f" · gates {item.gate_indices}"
             if item.detail:
                 message += f" · {item.detail}"
-            self.activity.configure(state=tk.NORMAL)
-            self.activity.insert("1.0", message + "\n")
-            if int(self.activity.index("end-1c").split(".")[0]) > 400:
-                self.activity.delete("400.0", tk.END)
-            self.activity.configure(state=tk.DISABLED)
+            if self._activity_display_enabled.is_set():
+                self.activity.configure(state=tk.NORMAL)
+                self.activity.insert("1.0", message + "\n")
+                if int(self.activity.index("end-1c").split(".")[0]) > 400:
+                    self.activity.delete("400.0", tk.END)
+                self.activity.configure(state=tk.DISABLED)
         service = self.service
         if service is not None:
             self._update_gate_states(service.gate_states)
@@ -181,15 +205,36 @@ class SorterApp(tk.Tk):
                 f"decisions {service.decisions} · actuations {service.actuations} · "
                 f"errors {service.errors}"
             )
-        self.after(25, self._poll)
+        self.after(50, self._poll)
 
     def _update_gate_states(self, states: dict[int, bool]) -> None:
+        normalized = {gate: bool(active) for gate, active in states.items() if active}
+        if (
+            not self.animate_gates_var.get()
+            or normalized == self._displayed_gate_states
+        ):
+            return
+        self._paint_gate_states(normalized)
+
+    def _paint_gate_states(self, states: dict[int, bool]) -> None:
+        self._displayed_gate_states = dict(states)
         for gate, item in self._gate_items.items():
             self.canvas.itemconfigure(
                 item,
                 fill="#ed3038" if states.get(gate, False) else "#111111",
                 outline="#ff9196" if states.get(gate, False) else "#8b98a6",
             )
+
+    def _display_options_changed(self) -> None:
+        if self.show_activity_var.get():
+            self._activity_display_enabled.set()
+        else:
+            self._activity_display_enabled.clear()
+        if self.animate_gates_var.get():
+            states = {} if self.service is None else self.service.gate_states
+            self._paint_gate_states(states)
+        else:
+            self._paint_gate_states({})
 
     def _close(self) -> None:
         self.stop_service()

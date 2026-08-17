@@ -16,18 +16,24 @@ from .inference_transport import ZeroMQCropClient
 from .models import FrameAnalysis
 from .registry_models import InferenceStatus, RunSession, RunState
 from .registry_zmq import RegistryRemoteError, ZeroMQRegistryClient
-from .source import ReplaySource
+from .source import ReplaySource, SourceError
 
 
 @dataclass(frozen=True, slots=True)
 class ReplaySettings:
     target_fps: float = 60.0
-    preview_enabled: bool = True
+    preview_enabled: bool = False
+    prebuffer_frames: int = 60
+    maximum_frames: int = 1_000
     crop_queue_capacity: int = 16
 
     def validate(self) -> None:
         if not math.isfinite(self.target_fps) or self.target_fps < 0:
             raise ValueError("target FPS must be finite and non-negative")
+        if not 0 <= self.prebuffer_frames <= 120:
+            raise ValueError("prebuffer frames must be between zero and 120")
+        if not 1 <= self.maximum_frames <= 1_000:
+            raise ValueError("maximum replay frames must be between 1 and 1000")
         if self.crop_queue_capacity <= 0:
             raise ValueError("crop queue capacity must be positive")
 
@@ -55,10 +61,119 @@ class ReplaySummary:
     max_source_read_ms: float
     mean_processing_ms: float
     max_processing_ms: float
+    prebuffered_frames: int
+    prebuffer_seconds: float
     missed_deadlines: int
     crops_submitted: int
     crops_dropped: int
     stopped: bool
+
+
+class DecodedFrameBuffer:
+    """Bounded sequential decoder that overlaps input work with analysis."""
+
+    def __init__(
+        self, source: ReplaySource, *, frame_count: int, capacity: int
+    ) -> None:
+        self.source = source
+        self.frame_count = max(0, min(frame_count, source.metadata.frame_count))
+        self.capacity = max(1, capacity)
+        self._target = min(self.frame_count, self.capacity)
+        self._queue: queue.Queue[tuple[int, object]] = queue.Queue(
+            maxsize=self.capacity
+        )
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._finished = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._error: Exception | None = None
+        self._next_index = 0
+
+    def prebuffer(
+        self,
+        cancellation: threading.Event,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> tuple[int, float]:
+        if self._thread is not None:
+            raise RuntimeError("decoded frame buffer has already been started")
+        started = time.perf_counter()
+        self._thread = threading.Thread(
+            target=self._decode,
+            name="beanoflight-frame-prefetch",
+            daemon=True,
+        )
+        self._thread.start()
+        reported = -1
+        while not self._ready.wait(0.025):
+            buffered = self._queue.qsize()
+            if buffered != reported and on_progress is not None:
+                on_progress(buffered, self._target)
+                reported = buffered
+            if cancellation.is_set():
+                self._stop.set()
+                break
+        buffered = self._queue.qsize()
+        if on_progress is not None and buffered != reported:
+            on_progress(buffered, self._target)
+        self._raise_error()
+        return buffered, time.perf_counter() - started
+
+    def frame(self, index: int):
+        if index != self._next_index:
+            raise SourceError(
+                "decoded frame buffer requires sequential access; "
+                f"expected {self._next_index}, received {index}"
+            )
+        while True:
+            try:
+                buffered_index, frame = self._queue.get(timeout=0.05)
+            except queue.Empty:
+                self._raise_error()
+                if self._finished.is_set():
+                    raise SourceError(f"decoded frame {index + 1} is unavailable")
+                continue
+            if buffered_index != index:
+                raise SourceError(
+                    f"decoded frame buffer returned {buffered_index}, expected {index}"
+                )
+            self._next_index += 1
+            return frame
+
+    def close(self) -> None:
+        self._stop.set()
+        self._ready.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(2.0)
+        self._thread = None
+
+    def _decode(self) -> None:
+        try:
+            for index in range(self.frame_count):
+                if self._stop.is_set():
+                    break
+                while self._queue.full() and not self._stop.wait(0.01):
+                    pass
+                if self._stop.is_set():
+                    break
+                frame = self.source.frame(index)
+                while not self._stop.is_set():
+                    try:
+                        self._queue.put((index, frame), timeout=0.05)
+                        break
+                    except queue.Full:
+                        continue
+                if self._queue.qsize() >= self._target:
+                    self._ready.set()
+        except Exception as exc:  # noqa: BLE001 - propagated on the replay thread
+            self._error = exc
+        finally:
+            self._finished.set()
+            self._ready.set()
+
+    def _raise_error(self) -> None:
+        if self._error is not None:
+            raise self._error
 
 
 class CropDispatcher:
@@ -197,10 +312,12 @@ class ReplayRunner:
         paused: threading.Event | None = None,
         on_preview: Callable[[object, FrameAnalysis], None] | None = None,
         on_progress: Callable[[ReplayProgress], None] | None = None,
+        on_prebuffer: Callable[[int, int], None] | None = None,
     ) -> ReplaySummary:
         cancellation = stop or threading.Event()
         pause = paused or threading.Event()
         metadata = self.source.metadata
+        frame_limit = min(metadata.frame_count, self.settings.maximum_frames)
         run_id = self.engine.tracker.run_id
         created_ns = time.time_ns()
         start_source_ns = self.source.timestamp_ns(0)
@@ -210,7 +327,7 @@ class ReplayRunner:
             state=RunState.CREATED,
             source_path=str(Path(self.source.path)),
             source_kind=self.source.source_kind,
-            frame_count=metadata.frame_count,
+            frame_count=frame_limit,
             source_fps=metadata.fps,
             target_fps=self.settings.target_fps,
             source_start_timestamp_ns=start_source_ns,
@@ -226,22 +343,21 @@ class ReplayRunner:
                     else self.crop_selector.settings.size_px
                 ),
                 "camera_id": "CamL",
+                "maximum_frames": self.settings.maximum_frames,
+                "prebuffer_frames": self.settings.prebuffer_frames,
+                "crops_per_bean": (
+                    None
+                    if self.crop_selector is None
+                    else self.crop_selector.settings.max_crops_per_bean
+                ),
             },
         )
         session = self.registry.put_session(session, expected_revision=0)
-        session = self.registry.put_session(
-            replace(
-                session,
-                state=RunState.RUNNING,
-                clock_monotonic_ns=time.monotonic_ns(),
-                updated_timestamp_ns=time.time_ns(),
-            ),
-            expected_revision=session.revision,
-        )
-        if self.crop_dispatcher is not None:
-            self.crop_dispatcher.start()
-        started = time.perf_counter()
-        next_deadline = started
+        frame_buffer = None
+        prebuffered_frames = 0
+        prebuffer_seconds = 0.0
+        started = 0.0
+        next_deadline = 0.0
         frame_count = 0
         processing_total = 0.0
         processing_max = 0.0
@@ -251,7 +367,29 @@ class ReplayRunner:
         was_paused = False
         failure: Exception | None = None
         try:
-            for index in range(metadata.frame_count):
+            if self.settings.prebuffer_frames > 0:
+                frame_buffer = DecodedFrameBuffer(
+                    self.source,
+                    frame_count=frame_limit,
+                    capacity=self.settings.prebuffer_frames,
+                )
+                prebuffered_frames, prebuffer_seconds = frame_buffer.prebuffer(
+                    cancellation, on_progress=on_prebuffer
+                )
+            session = self.registry.put_session(
+                replace(
+                    session,
+                    state=RunState.RUNNING,
+                    clock_monotonic_ns=time.monotonic_ns(),
+                    updated_timestamp_ns=time.time_ns(),
+                ),
+                expected_revision=session.revision,
+            )
+            if self.crop_dispatcher is not None:
+                self.crop_dispatcher.start()
+            started = time.perf_counter()
+            next_deadline = started
+            for index in range(frame_limit):
                 if cancellation.is_set():
                     break
                 if pause.is_set():
@@ -289,7 +427,11 @@ class ReplayRunner:
                     next_deadline = time.perf_counter()
                     was_paused = False
                 read_started = time.perf_counter_ns()
-                frame = self.source.frame(index)
+                frame = (
+                    self.source.frame(index)
+                    if frame_buffer is None
+                    else frame_buffer.frame(index)
+                )
                 source_read_ms = (time.perf_counter_ns() - read_started) / 1_000_000.0
                 source_read_total += source_read_ms
                 source_read_max = max(source_read_max, source_read_ms)
@@ -310,7 +452,7 @@ class ReplayRunner:
                     on_progress(
                         ReplayProgress(
                             index,
-                            metadata.frame_count,
+                            frame_limit,
                             source_timestamp,
                             source_read_ms,
                             analysis.processing_ms,
@@ -335,6 +477,8 @@ class ReplayRunner:
             failure = exc
             raise
         finally:
+            if frame_buffer is not None:
+                frame_buffer.close()
             if self.crop_dispatcher is not None:
                 self.crop_dispatcher.close(drain=True)
             final_state = RunState.FAILED if failure is not None else RunState.COMPLETED
@@ -364,6 +508,8 @@ class ReplayRunner:
             max_source_read_ms=source_read_max,
             mean_processing_ms=(processing_total / frame_count if frame_count else 0.0),
             max_processing_ms=processing_max,
+            prebuffered_frames=prebuffered_frames,
+            prebuffer_seconds=prebuffer_seconds,
             missed_deadlines=missed,
             crops_submitted=(
                 0 if self.crop_dispatcher is None else self.crop_dispatcher.submitted

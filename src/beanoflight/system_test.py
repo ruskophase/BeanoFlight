@@ -40,7 +40,7 @@ def parser() -> argparse.ArgumentParser:
         prog="beano-system-test",
         description=(
             "Replay a CamL recording through tracking, BeanRegistry and optional "
-            "crop inference without retaining full frames."
+            "crop inference with a bounded decoded-frame buffer."
         ),
     )
     result.add_argument("recording", type=Path)
@@ -60,6 +60,19 @@ def parser() -> argparse.ArgumentParser:
         help="replay rate; zero runs as fast as decoding and analysis allow",
     )
     result.add_argument("--crop-size", type=int, default=300)
+    result.add_argument("--crops-per-bean", type=int, default=1)
+    result.add_argument(
+        "--prebuffer-frames",
+        type=int,
+        default=60,
+        help="decoded frames held ahead of replay; zero disables buffering",
+    )
+    result.add_argument(
+        "--maximum-frames",
+        type=int,
+        default=1000,
+        help="maximum frames to replay (1-1000)",
+    )
     result.add_argument("--no-crops", action="store_true")
     result.add_argument("--registry", default=DEFAULT_COMMAND_ENDPOINT)
     result.add_argument("--crops", default=DEFAULT_CROP_ENDPOINT)
@@ -121,7 +134,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         selector = None
         dispatcher = None
         if not arguments.no_crops:
-            selector = BeanCropSelector(CropSettings(size_px=arguments.crop_size))
+            selector = BeanCropSelector(
+                CropSettings(
+                    size_px=arguments.crop_size,
+                    max_crops_per_bean=arguments.crops_per_bean,
+                )
+            )
             dispatcher = CropDispatcher(arguments.registry, arguments.crops)
         runner = ReplayRunner(
             source,
@@ -130,6 +148,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             settings=ReplaySettings(
                 target_fps=arguments.target_fps,
                 preview_enabled=False,
+                prebuffer_frames=arguments.prebuffer_frames,
+                maximum_frames=arguments.maximum_frames,
             ),
             crop_selector=selector,
             crop_dispatcher=dispatcher,
@@ -146,7 +166,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                     flush=True,
                 )
 
-        summary = runner.run(on_progress=progress)
+        def prebuffer_progress(buffered: int, target: int) -> None:
+            print(f"prebuffer {buffered}/{target} decoded frames", flush=True)
+
+        summary = runner.run(
+            on_progress=progress,
+            on_prebuffer=prebuffer_progress,
+        )
         print(json.dumps(asdict(summary), indent=2), flush=True)
     finally:
         if registry is not None:

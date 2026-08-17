@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import queue
+import threading
 import tkinter as tk
 from collections.abc import Sequence
+from dataclasses import replace
 from tkinter import messagebox, ttk
 
 import cv2
@@ -42,6 +44,10 @@ class MockInferencerApp(tk.Tk):
         self.service: MockInferencerService | None = None
         self._activities: queue.Queue[MockInferenceActivity] = queue.Queue(maxsize=128)
         self._photo = None
+        self._crop_display_enabled = threading.Event()
+        self._crop_display_enabled.set()
+        self._activity_display_enabled = threading.Event()
+        self._activity_display_enabled.set()
 
         defaults = MockInferenceSettings()
         self.latency_var = tk.StringVar(value=str(defaults.latency_ms))
@@ -54,6 +60,8 @@ class MockInferencerApp(tk.Tk):
         )
         self.status_var = tk.StringVar(value="Stopped")
         self.counts_var = tk.StringVar(value="received 0 · completed 0 · dropped 0")
+        self.show_crop_var = tk.BooleanVar(value=True)
+        self.show_activity_var = tk.BooleanVar(value=True)
         self._build()
         self.after(50, self._poll)
         self.after(100, self.start_service)
@@ -80,6 +88,18 @@ class MockInferencerApp(tk.Tk):
         ttk.Button(controls, text="Stop", command=self.stop_service).grid(
             row=1, column=len(fields) + 1
         )
+        ttk.Checkbutton(
+            controls,
+            text="Show latest crop (uses extra CPU)",
+            variable=self.show_crop_var,
+            command=self._display_options_changed,
+        ).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+        ttk.Checkbutton(
+            controls,
+            text="Show activity log",
+            variable=self.show_activity_var,
+            command=self._display_options_changed,
+        ).grid(row=2, column=3, columnspan=3, sticky=tk.W, pady=(8, 0))
 
         body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -137,6 +157,10 @@ class MockInferencerApp(tk.Tk):
         self.status_var.set("Stopped")
 
     def _post_activity(self, activity: MockInferenceActivity) -> None:
+        if activity.crop is not None and not self._crop_display_enabled.is_set():
+            activity = replace(activity, crop=None)
+        if activity.crop is None and not self._activity_display_enabled.is_set():
+            return
         try:
             self._activities.put_nowait(activity)
         except queue.Full:
@@ -160,16 +184,17 @@ class MockInferencerApp(tk.Tk):
                 message += f" {item.confidence:.1%}"
             if item.detail:
                 message += f" · {item.detail}"
-            if item.crop is not None:
+            if item.crop is not None and self._crop_display_enabled.is_set():
                 try:
                     self._show_crop(item.crop)
                 except Exception as exc:  # noqa: BLE001 - keep activity polling alive
                     message += f" · preview error: {exc}"
-            self.activity.configure(state=tk.NORMAL)
-            self.activity.insert("1.0", message + "\n")
-            if int(self.activity.index("end-1c").split(".")[0]) > 300:
-                self.activity.delete("300.0", tk.END)
-            self.activity.configure(state=tk.DISABLED)
+            if self._activity_display_enabled.is_set():
+                self.activity.configure(state=tk.NORMAL)
+                self.activity.insert("1.0", message + "\n")
+                if int(self.activity.index("end-1c").split(".")[0]) > 300:
+                    self.activity.delete("300.0", tk.END)
+                self.activity.configure(state=tk.DISABLED)
         service = self.service
         if service is not None:
             self.counts_var.set(
@@ -187,7 +212,20 @@ class MockInferencerApp(tk.Tk):
     def _show_crop(self, image_bgr) -> None:
         image = crop_preview_image(image_bgr)
         self._photo = ImageTk.PhotoImage(image)
-        self.image_label.configure(image=self._photo)
+        self.image_label.configure(image=self._photo, text="")
+
+    def _display_options_changed(self) -> None:
+        if self.show_crop_var.get():
+            self._crop_display_enabled.set()
+            self.image_label.configure(text="Waiting for a crop…")
+        else:
+            self._crop_display_enabled.clear()
+            self._photo = None
+            self.image_label.configure(image="", text="Crop preview disabled")
+        if self.show_activity_var.get():
+            self._activity_display_enabled.set()
+        else:
+            self._activity_display_enabled.clear()
 
     def _close(self) -> None:
         self.stop_service()

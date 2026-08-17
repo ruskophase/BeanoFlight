@@ -1,14 +1,38 @@
 import argparse
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
 from beanoflight.app import background_key_action
 from beanoflight.mock_inferencer_app import crop_preview_image
+from beanoflight.registry_monitor_app import actuation_display
 from beanoflight.system_test import _background_indices
 
 
 class GuiHelperTests(unittest.TestCase):
+    def test_registry_actuation_states_are_explicit(self):
+        waiting = SimpleNamespace(decision=None, actuation=None)
+        no_action = SimpleNamespace(
+            decision=SimpleNamespace(gate_indices=()), actuation=None
+        )
+        scheduled = SimpleNamespace(
+            decision=SimpleNamespace(gate_indices=(-1, 0)), actuation=None
+        )
+        completed = SimpleNamespace(
+            decision=SimpleNamespace(gate_indices=(2,)),
+            actuation=SimpleNamespace(success=True),
+        )
+        failed = SimpleNamespace(
+            decision=SimpleNamespace(gate_indices=(-3,)),
+            actuation=SimpleNamespace(success=False),
+        )
+        self.assertEqual(actuation_display(waiting), "Awaiting")
+        self.assertEqual(actuation_display(no_action), "Not required")
+        self.assertEqual(actuation_display(scheduled), "Scheduled G-1,G0")
+        self.assertEqual(actuation_display(completed), "OK G+2")
+        self.assertEqual(actuation_display(failed), "FAIL G-3")
+
     def test_background_shortcuts_are_case_insensitive(self):
         for key in ("u", "U", "y", "Y"):
             self.assertEqual(background_key_action(key), "use")

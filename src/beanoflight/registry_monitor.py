@@ -34,6 +34,8 @@ class RegistryMonitorWorker:
         self.registry_endpoint = registry_endpoint
         self.refresh_seconds = max(0.02, float(refresh_seconds))
         self._stop = threading.Event()
+        self._enabled = threading.Event()
+        self._enabled.set()
         self._thread: threading.Thread | None = None
         self._cursor = 0
 
@@ -51,10 +53,19 @@ class RegistryMonitorWorker:
             self._thread.join(2.0)
         self._thread = None
 
+    def set_enabled(self, enabled: bool) -> None:
+        if enabled:
+            self._enabled.set()
+        else:
+            self._enabled.clear()
+
     def _run(self) -> None:
         client = ZeroMQRegistryClient(self.registry_endpoint, timeout_ms=1_000)
         try:
             while not self._stop.is_set():
+                if not self._enabled.is_set():
+                    self._stop.wait(0.1)
+                    continue
                 try:
                     client.ping()
                     sessions = client.list_sessions()
