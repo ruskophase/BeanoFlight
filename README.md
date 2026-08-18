@@ -52,6 +52,9 @@ The simulation adds persistent run sessions, crop-job status, classification,
 sorting decisions and virtual actuation results. It still stores no images.
 Registry consumers bootstrap from the current journal cursor and current-run
 snapshot, so startup work no longer grows with every previous simulation.
+Frame commits use bounded undo data rather than copying the complete hot state.
+The durable record cache is capped while records remain queryable from SQLite,
+and bulk monitor/recovery queries do not populate that cache.
 
 ## Asynchronous simulation
 
@@ -98,6 +101,12 @@ beano-system-test /recordings/example \
   --crops-per-bean 1 \
   --target-fps 60
 ```
+
+For an isolated multi-run performance test, `beano-performance-benchmark`
+starts a private Registry, Mock Inferencer and Sorter, keeps them alive across
+all repetitions, and writes one JSON report containing stage timings and
+outcomes. See [simulation.md](docs/simulation.md#repeatable-performance-matrix)
+for the reference command and current results.
 
 See [simulation.md](docs/simulation.md) for the data flow, crop policy, clock
 contract and operating sequence.

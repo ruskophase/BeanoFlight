@@ -56,6 +56,9 @@ class FakeConsumerClient:
         events, self.events = self.events, ()
         return events[:limit]
 
+    def events_since_compact(self, cursor, *, limit=1_000):
+        return self.events_since(cursor, limit=limit)
+
     def get(self, bean_ref, *, include_history=True):
         self.get_calls.append((bean_ref, include_history))
         return self.record
@@ -147,6 +150,21 @@ class RegistryConsumerTests(unittest.TestCase):
             tuple(event.kind for event in snapshots[-1].significant_events),
             ("inference.completed",),
         )
+
+    def test_sorter_fetches_direct_enrichment_events(self):
+        event = BeanEvent(
+            "enrichment.added",
+            self.bean_ref,
+            103,
+            revision=3,
+            event_id="event-103",
+            stream_sequence=103,
+        )
+        client = FakeConsumerClient((), self.record, (event,))
+
+        SorterService()._process_events((event,), client)
+
+        self.assertEqual(client.get_calls, [(self.bean_ref, False)])
 
 
 if __name__ == "__main__":

@@ -13,7 +13,12 @@ from test_registry import track
 
 from beanoflight.models import BeanRef
 from beanoflight.registry import BeanRegistry
-from beanoflight.registry_models import Enrichment, SortingDecision
+from beanoflight.registry_models import (
+    Enrichment,
+    InferenceJob,
+    InferenceStatus,
+    SortingDecision,
+)
 from beanoflight.registry_sqlite import SQLiteBeanRepository
 
 
@@ -69,7 +74,7 @@ class ZeroMQRegistryTests(unittest.TestCase):
             self.assertEqual(len(created.track.history), 0)
             self.assertEqual(len(queried.track.history), 1)
 
-            batched = client.update_tracks(
+            revisions = client.update_track_revisions(
                 (
                     (
                         track(bean_ref, 1, 116_666_667, -10.0),
@@ -77,8 +82,24 @@ class ZeroMQRegistryTests(unittest.TestCase):
                         "track-1",
                     ),
                 )
-            )[0]
-            self.assertEqual(batched.revision, 2)
+            )
+            self.assertEqual(revisions, {bean_ref: 2})
+
+            job = InferenceJob(
+                "job-1",
+                bean_ref,
+                InferenceStatus.SUBMITTED,
+                "CamL",
+                1,
+                116_666_667,
+                2,
+                300,
+                300,
+                False,
+                116_666_667,
+                116_666_667,
+            )
+            self.assertEqual(client.submit_inference_job_revision(job), 3)
 
             enriched = client.add_enrichment(
                 bean_ref,
@@ -86,7 +107,7 @@ class ZeroMQRegistryTests(unittest.TestCase):
                     "resnet", "defect", "clear", 120, "model-v1", "result-1", 0.97
                 ),
             )
-            self.assertEqual(enriched.revision, 3)
+            self.assertEqual(enriched.revision, 4)
             decision = SortingDecision(
                 "decision-1",
                 "sorter",
@@ -99,8 +120,8 @@ class ZeroMQRegistryTests(unittest.TestCase):
             acknowledged = client.acknowledge_sorting_decision(
                 bean_ref, decision.decision_id, 181_000_000
             )
-            self.assertEqual(decided.revision, 4)
-            self.assertEqual(acknowledged.revision, 5)
+            self.assertEqual(decided.revision, 5)
+            self.assertEqual(acknowledged.revision, 6)
             self.assertEqual(client.list_active(run_id="zmq-run"), (acknowledged,))
             journal = client.events_since(0)
             self.assertEqual(
@@ -108,15 +129,21 @@ class ZeroMQRegistryTests(unittest.TestCase):
                 [
                     "bean.created",
                     "track.updated",
+                    "inference.submitted",
                     "enrichment.added",
                     "sorting.decision",
                     "sorting.acknowledged",
                 ],
             )
             self.assertEqual(
-                [event.stream_sequence for event in journal], [1, 2, 3, 4, 5]
+                [event.stream_sequence for event in journal], [1, 2, 3, 4, 5, 6]
             )
-            self.assertEqual(client.event_cursor(), 5)
+            self.assertEqual(client.event_cursor(), 6)
+            metrics = client.service_metrics()
+            self.assertGreater(
+                metrics["operations_ms"]["update_track_revisions"]["count"], 0
+            )
+            self.assertEqual(metrics["hot_state"]["records"], 1)
             without_history = client.get(bean_ref, include_history=False)
             self.assertEqual(without_history.track.history, ())
             with self.assertRaises(RegistryRemoteError):

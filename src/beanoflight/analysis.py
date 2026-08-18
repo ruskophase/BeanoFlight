@@ -14,7 +14,7 @@ from .background import BackgroundProvenance
 from .calibration import MetricPlaneCalibration
 from .detection import BeanDetector
 from .events import EventBus
-from .models import BeanRef, FrameAnalysis, Observation
+from .models import AnalysisTimings, BeanRef, FrameAnalysis, Observation
 from .prediction import GateLayout, TrajectoryPredictor
 from .source import RecordingVideoSource
 from .tracking import TrackerSettings, TrackManager
@@ -91,6 +91,7 @@ class AnalysisEngine:
     def process(self, frame_bgr, frame_index: int, timestamp_ns: int) -> FrameAnalysis:
         started = time.perf_counter_ns()
         detection_result = self.detector.detect(frame_bgr, self.background_bgr)
+        detection_finished = time.perf_counter_ns()
         observations = tuple(
             Observation(
                 frame_index=frame_index,
@@ -100,40 +101,47 @@ class AnalysisEngine:
             )
             for detection in detection_result.detections
         )
+        mapping_finished = time.perf_counter_ns()
         tracks = self.tracker.update(observations, timestamp_ns)
+        tracking_finished = time.perf_counter_ns()
         predictions = tuple(
             prediction
             for track in tracks
             if (prediction := self.predictor.predict(track)) is not None
         )
+        prediction_finished = time.perf_counter_ns()
         if self.registry is not None:
             prediction_by_ref = {
                 prediction.bean_ref: prediction for prediction in predictions
             }
-            records = self.registry.update_tracks(
-                tuple(
-                    (
-                        track,
-                        prediction_by_ref.get(track.bean_ref),
-                        ":".join(
-                            (
-                                "track",
-                                track.bean_ref.run_id,
-                                str(track.bean_ref.sequence),
-                                str(frame_index),
-                                track.status.value,
-                            )
-                        ),
-                    )
-                    for track in tracks
+            updates = tuple(
+                (
+                    track,
+                    prediction_by_ref.get(track.bean_ref),
+                    ":".join(
+                        (
+                            "track",
+                            track.bean_ref.run_id,
+                            str(track.bean_ref.sequence),
+                            str(frame_index),
+                            track.status.value,
+                        )
+                    ),
                 )
+                for track in tracks
             )
-            self.last_registry_revisions = {
-                record.bean_ref: record.revision for record in records
-            }
+            compact_update = getattr(self.registry, "update_track_revisions", None)
+            if compact_update is None:
+                records = self.registry.update_tracks(updates)
+                self.last_registry_revisions = {
+                    record.bean_ref: record.revision for record in records
+                }
+            else:
+                self.last_registry_revisions = compact_update(updates)
         else:
             self.last_registry_revisions = {}
-        processing_ms = (time.perf_counter_ns() - started) / 1_000_000.0
+        finished = time.perf_counter_ns()
+        processing_ms = (finished - started) / 1_000_000.0
         return FrameAnalysis(
             frame_index=frame_index,
             timestamp_ns=timestamp_ns,
@@ -142,6 +150,14 @@ class AnalysisEngine:
             tracks=tracks,
             predictions=predictions,
             processing_ms=processing_ms,
+            timings=AnalysisTimings(
+                detection_ms=(detection_finished - started) / 1_000_000.0,
+                coordinate_mapping_ms=(mapping_finished - detection_finished)
+                / 1_000_000.0,
+                tracking_ms=(tracking_finished - mapping_finished) / 1_000_000.0,
+                prediction_ms=(prediction_finished - tracking_finished) / 1_000_000.0,
+                registry_ms=(finished - prediction_finished) / 1_000_000.0,
+            ),
         )
 
 

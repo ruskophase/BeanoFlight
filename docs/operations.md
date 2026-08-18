@@ -113,9 +113,27 @@ confirmed empty-frame indices and prints a JSON performance summary on
 completion. Add `--optimized-raw` to use the same fast path as the GUI.
 
 Every completed session stores its achieved FPS, source-read and analysis
-means/maxima, prebuffer time, missed deadlines and crop counts in the session
-`settings.performance` object. These values remain available after the
-BeanoFlight window closes.
+stage distributions, Registry/SQLite operation timings, crop-dispatch queue
+timings, process resource samples, prebuffer time, missed deadlines and crop
+counts in the session `settings.performance` object. These values remain
+available after the BeanoFlight window closes.
+
+For a repeatable acceptance matrix which does not depend on manually launched
+GUIs, run:
+
+```bash
+beano-performance-benchmark /path/to/recording-bundle \
+  --background-frames 43,222,347 \
+  --scenarios core,full --repeats 5 \
+  --target-fps 60 --maximum-frames 601 \
+  --prebuffer-frames 60 --crops-per-bean 1 \
+  --output ./performance-report.json
+```
+
+The benchmark owns isolated endpoints and keeps its Registry alive for every
+repetition. Confirm `passed` for both scenarios; this includes the FPS
+tolerance, zero dropped/failed jobs and complete expected decision counts.
+Then compare individual stage timings.
 
 After upgrading code that changes the registry command contract, stop all
 components and restart BeanRegistry before restarting its clients. For the

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -32,6 +33,7 @@ from .registry_models import (
     run_session_from_dict,
     run_session_to_dict,
 )
+from .telemetry import TimingAccumulator
 
 SCHEMA_VERSION = 2
 TRACK_EVENT_KINDS = {
@@ -57,6 +59,8 @@ class SQLiteBeanRepository:
         )
         self._connection.row_factory = sqlite3.Row
         self._batch_depth = 0
+        self._save_timing = TimingAccumulator()
+        self._batch_timing = TimingAccumulator()
         with self._lock:
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
@@ -75,11 +79,15 @@ class SQLiteBeanRepository:
             ).lower()
 
     def save(self, record: BeanRecord, event: BeanEvent) -> int:
+        started = time.perf_counter_ns()
         with self._lock:
-            if self._batch_depth:
-                return self._save_locked(record, event)
-            with self._connection:
-                return self._save_locked(record, event)
+            try:
+                if self._batch_depth:
+                    return self._save_locked(record, event)
+                with self._connection:
+                    return self._save_locked(record, event)
+            finally:
+                self._save_timing.add((time.perf_counter_ns() - started) / 1_000_000.0)
 
     @contextmanager
     def batch(self) -> Iterator[None]:
@@ -87,6 +95,7 @@ class SQLiteBeanRepository:
 
         with self._lock:
             outermost = self._batch_depth == 0
+            started = time.perf_counter_ns()
             if outermost:
                 self._connection.execute("BEGIN")
             self._batch_depth += 1
@@ -101,6 +110,19 @@ class SQLiteBeanRepository:
                 self._batch_depth -= 1
                 if outermost:
                     self._connection.commit()
+                    self._batch_timing.add(
+                        (time.perf_counter_ns() - started) / 1_000_000.0
+                    )
+
+    def performance_metrics(self) -> dict[str, dict[str, float | int]]:
+        return {
+            "event_save_ms": self._save_timing.summary(),
+            "frame_batch_ms": self._batch_timing.summary(),
+        }
+
+    def reset_performance_metrics(self) -> None:
+        self._save_timing.clear()
+        self._batch_timing.clear()
 
     def _save_locked(self, record: BeanRecord, event: BeanEvent) -> int:
         if record.bean_ref != event.bean_ref or record.revision != event.revision:

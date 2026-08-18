@@ -55,7 +55,7 @@ class RegistryMonitorApp(tk.Tk):
             self.status_var.set(
                 "Paused · registry polling and display updates disabled"
             )
-        self.after(100, self._poll)
+        self.after(100 if live_updates else 500, self._poll)
 
     def _build(self) -> None:
         header = ttk.Frame(self, padding=10)
@@ -121,7 +121,7 @@ class RegistryMonitorApp(tk.Tk):
                 break
         if latest is not None:
             self._render(latest)
-        self.after(100, self._poll)
+        self.after(100 if self.live_updates_var.get() else 500, self._poll)
 
     def _render(self, snapshot: RegistryMonitorSnapshot) -> None:
         if not snapshot.connected:

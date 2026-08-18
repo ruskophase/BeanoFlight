@@ -113,6 +113,13 @@ replaceable notifications. Each notification carries a persistent global
 stream sequence, so a critical consumer uses `events_since(cursor)` to recover
 any gap before proceeding.
 
+The 60 FPS frame transaction records undo information only for bean IDs and
+bounded journal/idempotency entries changed by that frame; it never copies the
+whole Registry cache. Track-update acknowledgements contain only bean ID and
+revision, and routine consumers read compact event headers before requesting a
+record they actually need. The durable hot-record cache is capped, bulk SQLite
+queries bypass it, and no persisted bean data is discarded by cache eviction.
+
 Recorded simulation uses a bounded sequential producer ahead of the analysis
 thread, and the replay clock is anchored only after that initial buffer is
 ready. In optimized mode it memory-maps CamL RG10 and stores one compact green

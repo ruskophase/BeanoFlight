@@ -6,8 +6,9 @@ import math
 import queue
 import threading
 import time
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections import defaultdict
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .analysis import AnalysisEngine
@@ -17,6 +18,7 @@ from .models import FrameAnalysis
 from .registry_models import InferenceStatus, RunSession, RunState
 from .registry_zmq import RegistryRemoteError, ZeroMQRegistryClient
 from .source import ReplaySource, SourceError
+from .telemetry import SystemTelemetrySampler, TimingAccumulator, summarize_samples
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +51,8 @@ class ReplayProgress:
     missed_deadlines: int
     crops_submitted: int
     crops_dropped: int
+    crop_ms: float = 0.0
+    frame_work_ms: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +71,7 @@ class ReplaySummary:
     crops_submitted: int
     crops_dropped: int
     stopped: bool
+    timings: dict[str, object] = field(default_factory=dict)
 
 
 class DecodedFrameBuffer:
@@ -202,11 +207,22 @@ class CropDispatcher:
         self.registry_endpoint = registry_endpoint
         self.inference_endpoint = inference_endpoint
         self.timeout_ms = timeout_ms
-        self._queue: queue.Queue[CropPayload] = queue.Queue(maxsize=max(1, capacity))
+        self._queue: queue.Queue[tuple[CropPayload, int]] = queue.Queue(
+            maxsize=max(1, capacity)
+        )
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.submitted = 0
         self.dropped = 0
+        self._timings = {
+            name: TimingAccumulator()
+            for name in (
+                "queue_delay_ms",
+                "registry_submit_ms",
+                "materialize_send_ms",
+                "registry_accept_ms",
+            )
+        }
 
     def start(self) -> None:
         if self._thread is not None:
@@ -219,9 +235,17 @@ class CropDispatcher:
     def register_and_enqueue(
         self, payload: CropPayload, registry: ZeroMQRegistryClient
     ) -> bool:
-        registry.submit_inference_job(payload.job, event_id=payload.job.job_id)
+        stage_started = time.perf_counter_ns()
+        compact_submit = getattr(registry, "submit_inference_job_revision", None)
+        if compact_submit is None:
+            registry.submit_inference_job(payload.job, event_id=payload.job.job_id)
+        else:
+            compact_submit(payload.job, event_id=payload.job.job_id)
+        self._timings["registry_submit_ms"].add(
+            (time.perf_counter_ns() - stage_started) / 1_000_000.0
+        )
         try:
-            self._queue.put_nowait(payload)
+            self._queue.put_nowait((payload, time.perf_counter_ns()))
         except queue.Full:
             self.dropped += 1
             registry.update_inference_job(
@@ -235,6 +259,9 @@ class CropDispatcher:
             return False
         self.submitted += 1
         return True
+
+    def performance_metrics(self) -> dict[str, dict[str, float | int]]:
+        return {name: timing.summary() for name, timing in self._timings.items()}
 
     def close(self, *, drain: bool = True) -> None:
         if drain:
@@ -253,18 +280,29 @@ class CropDispatcher:
         try:
             while not self._stop.is_set() or not self._queue.empty():
                 try:
-                    payload = self._queue.get(timeout=0.05)
+                    payload, enqueued_ns = self._queue.get(timeout=0.05)
                 except queue.Empty:
                     continue
                 try:
+                    self._timings["queue_delay_ms"].add(
+                        (time.perf_counter_ns() - enqueued_ns) / 1_000_000.0
+                    )
+                    stage_started = time.perf_counter_ns()
                     sender.submit(payload.materialized())
+                    self._timings["materialize_send_ms"].add(
+                        (time.perf_counter_ns() - stage_started) / 1_000_000.0
+                    )
                     try:
+                        stage_started = time.perf_counter_ns()
                         registry.update_inference_job(
                             payload.job.bean_ref,
                             payload.job.job_id,
                             InferenceStatus.ACCEPTED,
                             payload.job.capture_timestamp_ns,
                             event_id=f"accept:{payload.job.job_id}",
+                        )
+                        self._timings["registry_accept_ms"].add(
+                            (time.perf_counter_ns() - stage_started) / 1_000_000.0
                         )
                     except RegistryRemoteError:
                         # A zero-latency worker can complete the job between the
@@ -310,6 +348,7 @@ class ReplayRunner:
         settings: ReplaySettings | None = None,
         crop_selector: BeanCropSelector | None = None,
         crop_dispatcher: CropDispatcher | None = None,
+        profile_metadata: Mapping[str, object] | None = None,
     ) -> None:
         self.source = source
         self.engine = engine
@@ -318,6 +357,7 @@ class ReplayRunner:
         self.settings.validate()
         self.crop_selector = crop_selector
         self.crop_dispatcher = crop_dispatcher
+        self.profile_metadata = dict(profile_metadata or {})
 
     def run(
         self,
@@ -365,9 +405,11 @@ class ReplayRunner:
                     else self.crop_selector.settings.max_crops_per_bean
                 ),
                 "source_pipeline": getattr(self.source, "pipeline_metadata", {}),
+                "execution_profile": self.profile_metadata,
             },
         )
         session = self.registry.put_session(session, expected_revision=0)
+        registry_hot_start = _reset_registry_metrics(self.registry)
         frame_buffer = None
         prebuffered_frames = 0
         prebuffer_seconds = 0.0
@@ -382,6 +424,11 @@ class ReplayRunner:
         missed = 0
         was_paused = False
         failure: Exception | None = None
+        timing_samples: defaultdict[str, list[float]] = defaultdict(list)
+        system_telemetry = SystemTelemetrySampler()
+        system_metrics: dict[str, object] = {}
+        registry_metrics: dict[str, object] = {}
+        crop_dispatch_metrics: dict[str, object] = {}
         try:
             if self.settings.prebuffer_frames > 0:
                 frame_buffer = DecodedFrameBuffer(
@@ -403,6 +450,7 @@ class ReplayRunner:
             )
             if self.crop_dispatcher is not None:
                 self.crop_dispatcher.start()
+            system_telemetry.start()
             started = time.perf_counter()
             next_deadline = started
             for index in range(frame_limit):
@@ -443,6 +491,7 @@ class ReplayRunner:
                     next_deadline = time.perf_counter()
                     was_paused = False
                 read_started = time.perf_counter_ns()
+                frame_work_started = read_started
                 frame = None
                 try:
                     frame = (
@@ -457,11 +506,17 @@ class ReplayRunner:
                     )
                     source_read_total += source_read_ms
                     source_read_max = max(source_read_max, source_read_ms)
+                    timing_samples["source_read_ms"].append(source_read_ms)
                     source_timestamp = self.source.timestamp_ns(index)
                     analysis = self.engine.process(frame, index, source_timestamp)
                     frame_count += 1
                     processing_total += analysis.processing_ms
                     processing_max = max(processing_max, analysis.processing_ms)
+                    timing_samples["analysis_total_ms"].append(analysis.processing_ms)
+                    if analysis.timings is not None:
+                        for name, value in analysis.timings.as_dict().items():
+                            timing_samples[name].append(value)
+                    crop_started = time.perf_counter_ns()
                     if (
                         self.crop_selector is not None
                         and self.crop_dispatcher is not None
@@ -472,8 +527,14 @@ class ReplayRunner:
                             self.crop_dispatcher.register_and_enqueue(
                                 crop, self.registry
                             )
+                    crop_ms = (time.perf_counter_ns() - crop_started) / 1_000_000.0
+                    timing_samples["crop_select_register_ms"].append(crop_ms)
                     if self.settings.preview_enabled and on_preview is not None:
                         on_preview(_preview_frame(self.source, frame), analysis)
+                    frame_work_ms = (
+                        time.perf_counter_ns() - frame_work_started
+                    ) / 1_000_000.0
+                    timing_samples["frame_work_ms"].append(frame_work_ms)
                 finally:
                     if frame is not None:
                         _release_frame(self.source, frame)
@@ -494,6 +555,8 @@ class ReplayRunner:
                             0
                             if self.crop_dispatcher is None
                             else self.crop_dispatcher.dropped,
+                            crop_ms,
+                            frame_work_ms,
                         )
                     )
                 if self.settings.target_fps > 0:
@@ -514,6 +577,9 @@ class ReplayRunner:
                 frame_buffer.close()
             if self.crop_dispatcher is not None:
                 self.crop_dispatcher.close(drain=True)
+                crop_dispatch_metrics = self.crop_dispatcher.performance_metrics()
+            system_metrics = system_telemetry.stop()
+            registry_metrics = _registry_service_metrics(self.registry)
             final_state = RunState.FAILED if failure is not None else RunState.COMPLETED
             achieved_fps = (
                 frame_count / playback_elapsed if playback_elapsed > 0 else 0.0
@@ -526,6 +592,10 @@ class ReplayRunner:
             crops_dropped = (
                 0 if self.crop_dispatcher is None else self.crop_dispatcher.dropped
             )
+            timing_summary = {
+                name: summarize_samples(values)
+                for name, values in sorted(timing_samples.items())
+            }
             session = self.registry.put_session(
                 replace(
                     session,
@@ -548,11 +618,24 @@ class ReplayRunner:
                             "missed_deadlines": missed,
                             "crops_submitted": crops_submitted,
                             "crops_dropped": crops_dropped,
+                            "timings_ms": timing_summary,
+                            "registry": {
+                                "hot_start": registry_hot_start,
+                                "service": registry_metrics,
+                            },
+                            "system": system_metrics,
+                            "crop_dispatch": crop_dispatch_metrics,
                         },
                     },
                 ),
                 expected_revision=session.revision,
             )
+            evict_completed = getattr(self.registry, "evict_completed", None)
+            if evict_completed is not None:
+                evict_completed(
+                    before_timestamp_ns=(1 << 63) - 1,
+                    run_id=run_id,
+                )
         return ReplaySummary(
             run_id=run_id,
             frames_processed=frame_count,
@@ -568,6 +651,15 @@ class ReplayRunner:
             crops_submitted=crops_submitted,
             crops_dropped=crops_dropped,
             stopped=cancellation.is_set(),
+            timings={
+                "timings_ms": timing_summary,
+                "registry": {
+                    "hot_start": registry_hot_start,
+                    "service": registry_metrics,
+                },
+                "system": system_metrics,
+                "crop_dispatch": crop_dispatch_metrics,
+            },
         )
 
 
@@ -575,6 +667,26 @@ def _release_frame(source: ReplaySource, frame: object) -> None:
     release = getattr(source, "release_frame", None)
     if release is not None:
         release(frame)
+
+
+def _reset_registry_metrics(registry) -> dict[str, object]:
+    reset = getattr(registry, "reset_service_metrics", None)
+    if reset is None:
+        return {"available": False}
+    try:
+        return {"available": True, **reset()}
+    except Exception as exc:  # noqa: BLE001 - profiling must not stop replay
+        return {"available": False, "error": str(exc)}
+
+
+def _registry_service_metrics(registry) -> dict[str, object]:
+    metrics = getattr(registry, "service_metrics", None)
+    if metrics is None:
+        return {"available": False}
+    try:
+        return {"available": True, **metrics()}
+    except Exception as exc:  # noqa: BLE001 - profiling must not stop replay
+        return {"available": False, "error": str(exc)}
 
 
 def _preview_frame(source: ReplaySource, frame: object):

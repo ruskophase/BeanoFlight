@@ -92,7 +92,7 @@ class RegistryMonitorWorker:
                             }
                         )
                     cursor = 0 if self._cursor is None else self._cursor
-                    events = client.events_since(cursor, limit=1_000)
+                    events = client.events_since_compact(cursor, limit=1_000)
                     if events:
                         self._cursor = events[-1].stream_sequence
                     changed_refs = dict.fromkeys(

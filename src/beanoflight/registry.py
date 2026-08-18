@@ -10,7 +10,7 @@ import uuid
 from collections import OrderedDict, deque
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from .events import EventBus
@@ -55,6 +55,22 @@ class RegistryHistoryGapError(RegistryError):
     pass
 
 
+_MISSING = object()
+
+
+@dataclass(slots=True)
+class _BatchUndo:
+    """Changes made to hot state while one durable frame transaction is open."""
+
+    stream_sequence: int
+    records: dict[BeanRef, BeanRecord | object]
+    processed_added: list[str]
+    processed_evicted: list[tuple[str, tuple[BeanRef, str]]]
+    journal_initial_length: int
+    journal_added: int
+    journal_evicted: list[BeanEvent]
+
+
 class RegistryRepository(Protocol):
     def save(self, record: BeanRecord, event: BeanEvent) -> int: ...
 
@@ -94,11 +110,13 @@ class BeanRegistry:
         events: EventBus | None = None,
         idempotency_capacity: int = 8_192,
         event_history_capacity: int = 8_192,
+        record_cache_capacity: int = 256,
     ) -> None:
         self.repository = repository
         self.events = events or EventBus()
         self._lock = threading.RLock()
         self._records: dict[BeanRef, BeanRecord] = {}
+        self._record_cache_capacity = max(16, int(record_cache_capacity))
         self._sessions: dict[str, RunSession] = {}
         self._processed: OrderedDict[str, tuple[BeanRef, str]] = OrderedDict()
         self._idempotency_capacity = max(128, int(idempotency_capacity))
@@ -106,6 +124,7 @@ class BeanRegistry:
             maxlen=max(128, int(event_history_capacity))
         )
         self._stream_sequence = 0 if repository is None else repository.event_cursor()
+        self._batch_undo: _BatchUndo | None = None
 
     def subscribe(self, *, capacity: int = 1_024):
         return self.events.subscribe(capacity=capacity)
@@ -162,6 +181,7 @@ class BeanRegistry:
             if self.repository is not None:
                 self.repository.save_session(stored)
             self._sessions[stored.run_id] = stored
+            self._trim_record_cache()
             return stored
 
     def get_session(self, run_id: str) -> RunSession:
@@ -208,10 +228,18 @@ class BeanRegistry:
         published: list[BeanEvent] = []
         records: list[BeanRecord] = []
         with self._lock:
-            previous_records = self._records.copy()
-            previous_processed = self._processed.copy()
-            previous_journal = deque(self._journal, maxlen=self._journal.maxlen)
-            previous_sequence = self._stream_sequence
+            if self._batch_undo is not None:
+                raise RegistryConflictError("nested registry frame batches are invalid")
+            undo = _BatchUndo(
+                self._stream_sequence,
+                {},
+                [],
+                [],
+                len(self._journal),
+                0,
+                [],
+            )
+            self._batch_undo = undo
             transaction = (
                 nullcontext() if self.repository is None else self.repository.batch()
             )
@@ -225,11 +253,10 @@ class BeanRegistry:
                         if event is not None:
                             published.append(event)
             except Exception:
-                self._records = previous_records
-                self._processed = previous_processed
-                self._journal = previous_journal
-                self._stream_sequence = previous_sequence
+                self._rollback_batch(undo)
                 raise
+            finally:
+                self._batch_undo = None
         for event in published:
             self.events.publish(event)
         return tuple(records)
@@ -687,10 +714,10 @@ class BeanRegistry:
     ) -> tuple[BeanRecord, ...]:
         with self._lock:
             if self.repository is not None:
-                for record in self.repository.list_records(
-                    run_id=run_id, statuses=statuses
-                ):
-                    self._records.setdefault(record.bean_ref, record)
+                # Large monitor/recovery queries must not turn the hot cache into
+                # an unbounded mirror of SQLite. The durable snapshot is already
+                # complete and ordered, so return it directly.
+                return self.repository.list_records(run_id=run_id, statuses=statuses)
             allowed = None if statuses is None else frozenset(statuses)
             records = (
                 record
@@ -738,13 +765,16 @@ class BeanRegistry:
         with self._lock:
             return self._stream_sequence
 
-    def evict_completed(self, *, before_timestamp_ns: int) -> int:
+    def evict_completed(
+        self, *, before_timestamp_ns: int, run_id: str | None = None
+    ) -> int:
         terminal = {TrackStatus.EXITED, TrackStatus.CANCELLED}
         with self._lock:
             targets = tuple(
                 bean_ref
                 for bean_ref, record in self._records.items()
-                if record.status in terminal
+                if (run_id is None or bean_ref.run_id == run_id)
+                and record.status in terminal
                 and record.updated_timestamp_ns < before_timestamp_ns
                 and (
                     record.decision is None
@@ -769,7 +799,7 @@ class BeanRegistry:
         if record is None and self.repository is not None:
             record = self.repository.load(bean_ref)
             if record is not None:
-                self._records[bean_ref] = record
+                self._set_hot_record(record)
         return record
 
     def _require_locked(self, bean_ref: BeanRef) -> BeanRecord:
@@ -842,8 +872,8 @@ class BeanRegistry:
             self._stream_sequence += 1
             stream_sequence = self._stream_sequence
         event = replace(event, stream_sequence=stream_sequence)
-        self._records[record.bean_ref] = record
-        self._journal.append(event)
+        self._set_hot_record(record)
+        self._append_journal(event)
         self._remember(
             event.event_id,
             record.bean_ref,
@@ -851,11 +881,90 @@ class BeanRegistry:
         )
         return event
 
+    def hot_state_metrics(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "records": len(self._records),
+                "record_capacity": self._record_cache_capacity,
+                "sessions": len(self._sessions),
+                "idempotency_entries": len(self._processed),
+                "journal_events": len(self._journal),
+            }
+
+    def _set_hot_record(self, record: BeanRecord) -> None:
+        undo = self._batch_undo
+        if undo is not None and record.bean_ref not in undo.records:
+            undo.records[record.bean_ref] = self._records.get(record.bean_ref, _MISSING)
+        self._records[record.bean_ref] = record
+        self._trim_record_cache()
+
+    def _trim_record_cache(self) -> None:
+        """Bound durable hot state while retaining beans in an active run."""
+
+        if self.repository is None:
+            # An in-memory registry has no durable copy from which to rehydrate.
+            return
+
+        while len(self._records) > self._record_cache_capacity:
+            candidate = next(
+                (
+                    bean_ref
+                    for bean_ref, cached in self._records.items()
+                    if cached.status in {TrackStatus.EXITED, TrackStatus.CANCELLED}
+                    or (
+                        (session := self._sessions.get(bean_ref.run_id)) is not None
+                        and session.state in {RunState.COMPLETED, RunState.FAILED}
+                    )
+                ),
+                None,
+            )
+            if candidate is None:
+                # Active beans from a running session are never evicted; their
+                # population is bounded by what is simultaneously in flight.
+                return
+            undo = self._batch_undo
+            if undo is not None and candidate not in undo.records:
+                undo.records[candidate] = self._records[candidate]
+            self._records.pop(candidate)
+
+    def _append_journal(self, event: BeanEvent) -> None:
+        undo = self._batch_undo
+        if undo is not None:
+            if (
+                len(self._journal) == self._journal.maxlen
+                and len(undo.journal_evicted) < undo.journal_initial_length
+            ):
+                undo.journal_evicted.append(self._journal[0])
+            undo.journal_added += 1
+        self._journal.append(event)
+
     def _remember(self, event_id: str, bean_ref: BeanRef, fingerprint: str) -> None:
+        undo = self._batch_undo
+        if undo is not None and event_id not in self._processed:
+            undo.processed_added.append(event_id)
         self._processed[event_id] = (bean_ref, fingerprint)
         self._processed.move_to_end(event_id)
         while len(self._processed) > self._idempotency_capacity:
-            self._processed.popitem(last=False)
+            evicted = self._processed.popitem(last=False)
+            if undo is not None and evicted[0] not in undo.processed_added:
+                undo.processed_evicted.append(evicted)
+
+    def _rollback_batch(self, undo: _BatchUndo) -> None:
+        self._stream_sequence = undo.stream_sequence
+        for bean_ref, previous in undo.records.items():
+            if previous is _MISSING:
+                self._records.pop(bean_ref, None)
+            else:
+                self._records[bean_ref] = previous  # type: ignore[assignment]
+        for event_id in undo.processed_added:
+            self._processed.pop(event_id, None)
+        for event_id, value in reversed(undo.processed_evicted):
+            self._processed[event_id] = value
+            self._processed.move_to_end(event_id, last=False)
+        for _ in range(min(undo.journal_added, len(self._journal))):
+            self._journal.pop()
+        for event in reversed(undo.journal_evicted):
+            self._journal.appendleft(event)
 
 
 def _track_created_timestamp(track: TrackSnapshot) -> int:

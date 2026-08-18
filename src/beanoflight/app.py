@@ -332,7 +332,7 @@ class BeanoFlightApp(tk.Tk):
         self.bind("<Left>", lambda _event: self.step_frame(-1))
         self.bind("<Right>", lambda _event: self.step_frame(1))
         self.bind("<space>", lambda _event: self.toggle_run())
-        self.after(40, self._poll_workers)
+        self.after(100 if self.performance_mode else 40, self._poll_workers)
         if initial_path is not None:
             self.after(100, lambda: self.load_path(initial_path))
 
@@ -1250,6 +1250,24 @@ class BeanoFlightApp(tk.Tk):
                     settings=replay_settings,
                     crop_selector=selector,
                     crop_dispatcher=dispatcher,
+                    profile_metadata={
+                        "name": (
+                            "launcher-performance"
+                            if self.performance_mode
+                            else "interactive"
+                        ),
+                        "launcher_performance_mode": self.performance_mode,
+                        "live_playback": replay_settings.preview_enabled,
+                        "background": {
+                            "method": self.background_provenance.method,
+                            "frame_indices": list(
+                                self.background_provenance.frame_indices
+                            ),
+                            "candidate_seed": (
+                                self.background_provenance.candidate_seed
+                            ),
+                        },
+                    },
                 )
 
                 def preview(frame, result: FrameAnalysis) -> None:
@@ -1480,7 +1498,7 @@ class BeanoFlightApp(tk.Tk):
                     )
         except queue.Empty:
             pass
-        self.after(30, self._poll_workers)
+        self.after(100 if self.performance_mode else 30, self._poll_workers)
 
     def set_frame(self, index: int) -> None:
         if self.source is None:

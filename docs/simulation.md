@@ -91,25 +91,29 @@ still needs about 272 MiB for 60 decoded BGR frames. BeanoFlight limits either
 buffer to 120 frames and replay to 1,000 frames. Prebuffer time is reported
 separately and excluded from achieved playback FPS.
 
-On 2026-08-17, after adding history-bounded registry consumers, the optimized
-path replayed all 601 frames of `20260816T134132.801241Z-beans` on the
-development Jetson at 60.00 FPS against a 60 FPS clock. Registry Monitor, Mock
-Inferencer and BeanoSorter ran concurrently in separate processes. The run
-included SQLite/ZeroMQ registry updates, 25 ms mock inference, 141 calibrated
-300 x 300 crops, and zero crop drops. Mean RAW frame preparation was 6.74 ms and
-mean analysis was 12.23 ms. With crops disabled and an unlimited clock, an
-earlier run of the same path sustained 95.2 FPS. Individual timing spikes still
-exceed 16.67 ms, so the deadline counter remains useful even when later frames
-catch up and aggregate throughput reaches 60 FPS.
+On 2026-08-18, the isolated performance matrix replayed all 601 frames of
+`20260816T134132.801241Z-beans` five times per scenario while keeping one
+Registry process alive throughout. Core replay averaged 59.999 FPS (59.996
+minimum). The full Mock Inferencer and Sorter pipeline averaged 59.996 FPS
+(59.986 minimum), completed 141 crops and 141 decisions on every repetition,
+and dropped no jobs. Mean full-pipeline frame work was 12.53 ms, of which 11.70
+ms was analysis: detection was 4.76 ms, tracking 1.07 ms, prediction 0.41 ms,
+Registry IPC/commit 5.22 ms and durable crop selection/enqueue 0.68 ms. The
+highest sampled temperature was 46.2 C, with no evidence of throttling.
+Individual timing spikes can still exceed 16.67 ms, so the deadline counter
+remains useful even when later frames catch up and aggregate throughput reaches
+60 FPS.
 
 A separate startup check used an 81.7 MiB registry copy containing 1,143 beans
 and 14,208 events. The current-run snapshot took 53 ms once; subsequent idle
 journal polls averaged 0.20 ms and did not scan SQLite history.
 
 The final replay summary is also persisted under the run session's
-`settings.performance` field. This includes achieved FPS, source and analysis
-timings, prebuffer timing, deadline misses and crop counters, allowing a slow
-run to be diagnosed after its GUI has closed.
+`settings.performance` field. It includes achieved FPS; source, detection,
+coordinate mapping, tracking, prediction, Registry, crop-dispatch and total
+frame timings; SQLite and Registry-operation timings; queue delay; process
+CPU/RSS; available clock/temperature samples; prebuffer timing; deadline misses
+and crop counters. This allows a slow run to be diagnosed after its GUI closes.
 
 For the supplied exploratory recording, one useful confirmed-empty candidate
 set is:
@@ -133,6 +137,32 @@ beano-system-test /path/to/20260816T134132.801241Z-beans \
   --crops-per-bean 1 \
   --target-fps 60
 ```
+
+## Repeatable performance matrix
+
+Use the benchmark command when comparing code or machine configuration. It
+creates private IPC endpoints and a temporary database, starts independent
+Registry, Mock Inferencer and Sorter processes, and deliberately reuses them
+across repetitions so cumulative slowdown is visible. `core` disables crop
+dispatch; `full` exercises crop transfer, mock classification and sorting.
+
+```bash
+beano-performance-benchmark \
+  /path/to/20260816T134132.801241Z-beans \
+  --background-frames 43,222,347 \
+  --scenarios core,full \
+  --repeats 5 \
+  --target-fps 60 \
+  --maximum-frames 601 \
+  --prebuffer-frames 60 \
+  --crops-per-bean 1 \
+  --output ./performance-report.json
+```
+
+The report preserves every run summary and adds per-scenario distributions.
+`passed` requires both `all_outcomes_complete` and
+`all_within_one_fps_of_target`; a one-FPS tolerance allows normal
+operating-system scheduling jitter without hiding sustained under-performance.
 
 `--optimized-raw` selects the performance path. It mmaps native RG10, derives
 an sRGB-encoded green plane directly from the two green Bayer sites, and avoids
@@ -158,11 +188,14 @@ bean ID. The current sorter intentionally makes its immutable decision from the
 first completed classification. Later crop results remain auditable but do not
 revise that decision; confidence aggregation is a later policy change.
 
-Before enqueueing, BeanoFlight creates an `InferenceJob` in BeanRegistry. Its
-status moves through `submitted`, `accepted` and `completed`, or ends as
-`dropped`/`failed`. Both dispatch and inferencer queues are bounded. Frame
-tracking never waits for mock inference; overload is visible as a durable job
-outcome. Neither the crop nor the source frame is stored in SQLite.
+Before enqueueing, BeanoFlight creates a durable `InferenceJob` through a
+compact revision-only Registry acknowledgement. The dispatch worker
+colour-processes and sends the crop, then advances the job through `accepted`
+and `completed` (or `dropped`/`failed`). Both dispatch and inferencer queues are
+bounded; a full local queue is recorded synchronously as a dropped job. Frame
+tracking never waits for colour processing or mock inference, and a process
+failure cannot leave an unregistered crop in the queue. Neither the crop nor
+the source frame is stored in SQLite.
 
 ## Replay clock
 

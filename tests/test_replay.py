@@ -124,6 +124,8 @@ class ReplayBufferTests(unittest.TestCase):
         self.assertEqual(performance["crops_submitted"], 0)
         self.assertEqual(performance["crops_dropped"], 0)
         self.assertGreater(performance["achieved_fps"], 0)
+        self.assertEqual(performance["timings_ms"]["frame_work_ms"]["count"], 3)
+        self.assertIn("system", performance)
 
 
 if __name__ == "__main__":

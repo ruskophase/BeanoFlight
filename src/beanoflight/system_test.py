@@ -184,6 +184,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             ),
             crop_selector=selector,
             crop_dispatcher=dispatcher,
+            profile_metadata={
+                "name": "headless-system-test",
+                "optimized_raw": arguments.optimized_raw,
+                "crops_enabled": not arguments.no_crops,
+                "background": {
+                    "method": "explicit human-confirmed frames",
+                    "frame_indices": list(arguments.background_frames),
+                },
+            },
         )
 
         def progress(value) -> None:

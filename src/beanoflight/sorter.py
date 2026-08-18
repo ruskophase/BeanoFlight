@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from .models import BeanEvent
+from .models import BeanEvent, BeanRef
 from .registry_models import (
     ActuationResult,
     BeanRecord,
@@ -75,6 +75,7 @@ class SorterService:
         self._threads: list[threading.Thread] = []
         self._pending: dict[str, tuple[BeanRecord, int | None]] = {}
         self._pending_lock = threading.RLock()
+        self._awaiting_prediction: set[BeanRef] = set()
         self._gate_counts: dict[int, int] = {}
         self._cursor = 0
         self.decisions = 0
@@ -112,7 +113,7 @@ class SorterService:
                     if first:
                         self._recover_current_state(registry)
                         first = False
-                    events = registry.events_since(self._cursor, limit=500)
+                    events = registry.events_since_compact(self._cursor, limit=500)
                     if not events:
                         self._stop.wait(0.025)
                         continue
@@ -139,16 +140,30 @@ class SorterService:
         events: tuple[BeanEvent, ...],
         registry: ZeroMQRegistryClient,
     ) -> None:
-        # Many track updates for one bean can arrive between polls. The registry
-        # snapshot already contains the newest state, so one lookup per bean is
-        # sufficient and avoids replay work growing with the frame rate.
-        bean_refs = dict.fromkeys(event.bean_ref for event in events)
+        # A classification is the normal decision trigger. Track updates only
+        # matter for the rare classified bean which did not yet have a trajectory.
+        bean_refs = dict.fromkeys(
+            event.bean_ref
+            for event in events
+            if event.kind in {"inference.completed", "enrichment.added"}
+            or (
+                event.bean_ref in self._awaiting_prediction
+                and event.kind
+                in {
+                    "bean.created",
+                    "bean.confirmed",
+                    "track.updated",
+                    "bean.exited",
+                }
+            )
+        )
         for bean_ref in bean_refs:
             self._consider(registry.get(bean_ref, include_history=False), registry)
         self._cursor = events[-1].stream_sequence
 
     def _consider(self, record: BeanRecord, registry: ZeroMQRegistryClient) -> None:
         if record.decision is not None:
+            self._awaiting_prediction.discard(record.bean_ref)
             if record.actuation is None:
                 self._schedule(record)
             return
@@ -161,8 +176,12 @@ class SorterService:
             None,
         )
         prediction = record.prediction
-        if classification is None or prediction is None:
+        if classification is None:
             return
+        if prediction is None:
+            self._awaiting_prediction.add(record.bean_ref)
+            return
+        self._awaiting_prediction.discard(record.bean_ref)
         value = classification.value
         category = (
             str(value.get("category", "")) if isinstance(value, dict) else str(value)

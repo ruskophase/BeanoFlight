@@ -6,7 +6,9 @@ import json
 import os
 import queue
 import threading
+import time
 import uuid
+from collections import defaultdict
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -45,6 +47,7 @@ from .registry_models import (
     track_from_dict,
     track_to_dict,
 )
+from .telemetry import TimingAccumulator
 
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 
@@ -79,6 +82,9 @@ class ZeroMQRegistryServer:
         self.context = context or zmq.Context.instance()
         self._event_queue = registry.subscribe(capacity=event_capacity)
         self.event_observer = event_observer
+        self._operation_timings: defaultdict[str, TimingAccumulator] = defaultdict(
+            TimingAccumulator
+        )
 
     def serve_forever(
         self,
@@ -117,7 +123,9 @@ class ZeroMQRegistryServer:
             events.close(0)
 
     def _handle(self, encoded: bytes) -> bytes:
+        started = time.perf_counter_ns()
         request_id = ""
+        operation = "invalid"
         try:
             if len(encoded) > MAX_MESSAGE_BYTES:
                 raise ValueError("registry request exceeds the message limit")
@@ -145,7 +153,12 @@ class ZeroMQRegistryServer:
                 "ok": False,
                 "error": {"type": type(exc).__name__, "message": str(exc)},
             }
-        return _encode(response)
+        result = _encode(response)
+        if operation not in {"service_metrics", "reset_service_metrics"}:
+            self._operation_timings[operation].add(
+                (time.perf_counter_ns() - started) / 1_000_000.0
+            )
+        return result
 
     def _dispatch(
         self, operation: str, payload: Mapping[str, object], request_id: str
@@ -205,8 +218,49 @@ class ZeroMQRegistryServer:
                     limit=int(payload.get("limit", 1_000)),
                 )
             ]
+        if operation == "events_since_compact":
+            return [
+                {
+                    "event_id": event.event_id,
+                    "kind": event.kind,
+                    "bean_ref": bean_ref_to_dict(event.bean_ref),
+                    "timestamp_ns": event.timestamp_ns,
+                    "revision": event.revision,
+                    "stream_sequence": event.stream_sequence,
+                }
+                for event in self.registry.events_since(
+                    int(payload.get("after_sequence", 0)),
+                    limit=int(payload.get("limit", 1_000)),
+                )
+            ]
         if operation == "event_cursor":
             return self.registry.event_cursor()
+        if operation == "hot_state_metrics":
+            return self.registry.hot_state_metrics()
+        if operation == "service_metrics":
+            repository = self.registry.repository
+            repository_metrics = getattr(repository, "performance_metrics", None)
+            return {
+                "hot_state": self.registry.hot_state_metrics(),
+                "operations_ms": {
+                    name: timing.summary()
+                    for name, timing in sorted(self._operation_timings.items())
+                },
+                "sqlite": ({} if repository_metrics is None else repository_metrics()),
+            }
+        if operation == "reset_service_metrics":
+            self._operation_timings.clear()
+            repository = self.registry.repository
+            reset_repository = getattr(repository, "reset_performance_metrics", None)
+            if reset_repository is not None:
+                reset_repository()
+            return self.registry.hot_state_metrics()
+        if operation == "evict_completed":
+            run_id_value = payload.get("run_id")
+            return self.registry.evict_completed(
+                before_timestamp_ns=int(payload["before_timestamp_ns"]),
+                run_id=None if run_id_value is None else str(run_id_value),
+            )
         if operation == "update_track":
             track = track_from_dict(_object(payload["track"]))
             prediction_value = payload.get("prediction")
@@ -243,6 +297,31 @@ class ZeroMQRegistryServer:
                 record_to_dict(record, include_history=False)
                 for record in self.registry.update_tracks(tuple(updates))
             ]
+        if operation == "update_track_revisions":
+            updates = []
+            for raw_update in _array(payload["updates"]):
+                update = _object(raw_update)
+                track = track_from_dict(_object(update["track"]))
+                prediction_value = update.get("prediction")
+                prediction = (
+                    None
+                    if prediction_value is None
+                    else prediction_from_dict(_object(prediction_value))
+                )
+                updates.append(
+                    (
+                        track,
+                        prediction,
+                        str(update.get("event_id") or uuid.uuid4().hex),
+                    )
+                )
+            return [
+                {
+                    "bean_ref": bean_ref_to_dict(record.bean_ref),
+                    "revision": record.revision,
+                }
+                for record in self.registry.update_tracks(tuple(updates))
+            ]
         if operation == "add_enrichment":
             record = self.registry.add_enrichment(
                 bean_ref_from_dict(_object(payload["bean_ref"])),
@@ -256,6 +335,12 @@ class ZeroMQRegistryServer:
                 job, event_id=str(payload.get("event_id") or request_id)
             )
             return record_to_dict(record, include_history=False)
+        if operation == "submit_inference_job_revision":
+            job = inference_job_from_dict(_object(payload["job"]))
+            record = self.registry.submit_inference_job(
+                job, event_id=str(payload.get("event_id") or request_id)
+            )
+            return record.revision
         if operation == "update_inference_job":
             record = self.registry.update_inference_job(
                 bean_ref_from_dict(_object(payload["bean_ref"])),
@@ -401,8 +486,51 @@ class ZeroMQRegistryClient:
             )
         )
 
+    def events_since_compact(
+        self, after_sequence: int, *, limit: int = 1_000
+    ) -> tuple[BeanEvent, ...]:
+        return tuple(
+            event_from_dict(_object(item))
+            for item in _array(
+                self._request(
+                    "events_since_compact",
+                    {"after_sequence": after_sequence, "limit": limit},
+                )
+            )
+        )
+
     def event_cursor(self) -> int:
         return int(self._request("event_cursor", {}))
+
+    def hot_state_metrics(self) -> dict[str, int]:
+        return {
+            key: int(value)
+            for key, value in _object(self._request("hot_state_metrics", {})).items()
+        }
+
+    def service_metrics(self) -> dict[str, object]:
+        return _object(self._request("service_metrics", {}))
+
+    def reset_service_metrics(self) -> dict[str, int]:
+        return {
+            key: int(value)
+            for key, value in _object(
+                self._request("reset_service_metrics", {})
+            ).items()
+        }
+
+    def evict_completed(
+        self, *, before_timestamp_ns: int, run_id: str | None = None
+    ) -> int:
+        return int(
+            self._request(
+                "evict_completed",
+                {
+                    "before_timestamp_ns": int(before_timestamp_ns),
+                    "run_id": run_id,
+                },
+            )
+        )
 
     def update_track(
         self,
@@ -433,26 +561,27 @@ class ZeroMQRegistryClient:
         self,
         updates,
     ) -> tuple[BeanRecord, ...]:
-        encoded_updates: list[dict[str, object]] = []
-        for track, prediction, event_id in updates:
-            encoded_track = track_to_dict(track, include_history=False)
-            if track.history:
-                encoded_track["history"] = [observation_to_dict(track.history[-1])]
-            encoded_updates.append(
-                {
-                    "track": encoded_track,
-                    "prediction": (
-                        None if prediction is None else prediction_to_dict(prediction)
-                    ),
-                    "event_id": event_id or uuid.uuid4().hex,
-                }
-            )
+        encoded_updates = _encode_track_updates(updates)
         return tuple(
             record_from_dict(_object(item))
             for item in _array(
                 self._request("update_tracks", {"updates": encoded_updates})
             )
         )
+
+    def update_track_revisions(self, updates) -> dict[BeanRef, int]:
+        result: dict[BeanRef, int] = {}
+        for item in _array(
+            self._request(
+                "update_track_revisions",
+                {"updates": _encode_track_updates(updates)},
+            )
+        ):
+            value = _object(item)
+            result[bean_ref_from_dict(_object(value["bean_ref"]))] = int(
+                value["revision"]
+            )
+        return result
 
     def add_enrichment(
         self,
@@ -497,6 +626,19 @@ class ZeroMQRegistryClient:
                         "event_id": event_id or job.job_id,
                     },
                 )
+            )
+        )
+
+    def submit_inference_job_revision(
+        self, job: InferenceJob, *, event_id: str | None = None
+    ) -> int:
+        return int(
+            self._request(
+                "submit_inference_job_revision",
+                {
+                    "job": inference_job_to_dict(job),
+                    "event_id": event_id or job.job_id,
+                },
             )
         )
 
@@ -718,6 +860,24 @@ class ZeroMQRegistrySubscriber:
 
     def __exit__(self, _exc_type, _exc, _traceback) -> None:
         self.close()
+
+
+def _encode_track_updates(updates) -> list[dict[str, object]]:
+    encoded_updates: list[dict[str, object]] = []
+    for track, prediction, event_id in updates:
+        encoded_track = track_to_dict(track, include_history=False)
+        if track.history:
+            encoded_track["history"] = [observation_to_dict(track.history[-1])]
+        encoded_updates.append(
+            {
+                "track": encoded_track,
+                "prediction": (
+                    None if prediction is None else prediction_to_dict(prediction)
+                ),
+                "event_id": event_id or uuid.uuid4().hex,
+            }
+        )
+    return encoded_updates
 
 
 def _encode(value: object) -> bytes:

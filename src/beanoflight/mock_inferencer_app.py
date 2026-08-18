@@ -69,7 +69,7 @@ class MockInferencerApp(tk.Tk):
         self.show_activity_var = tk.BooleanVar(value=show_activity)
         self._build()
         self._display_options_changed()
-        self.after(50, self._poll)
+        self.after(50 if show_crop or show_activity else 500, self._poll)
         self.after(100, self.start_service)
 
     def _build(self) -> None:
@@ -213,7 +213,13 @@ class MockInferencerApp(tk.Tk):
                 self.status_var.set(
                     f"Running · crops {service.crop_endpoint} · registry {self.registry_endpoint}"
                 )
-        self.after(50, self._poll)
+        delay_ms = (
+            50
+            if self._crop_display_enabled.is_set()
+            or self._activity_display_enabled.is_set()
+            else 500
+        )
+        self.after(delay_ms, self._poll)
 
     def _show_crop(self, image_bgr) -> None:
         image = crop_preview_image(image_bgr)

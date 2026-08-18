@@ -125,6 +125,14 @@ is missed. BeanoSorter applies this pattern to live sessions and the most
 recent session, and coalesces each event page to one current-state lookup per
 bean.
 
+For frame-rate traffic, use `update_track_revisions()` when the caller only
+needs acknowledged revisions and `events_since_compact()` when a consumer only
+needs event identity, kind and cursor data. Full record and event payload
+queries remain available for diagnostics. Crop submission similarly uses a
+revision-only acknowledgement while preserving the durable-before-enqueue
+contract. `service_metrics()` exposes bounded operation, SQLite transaction and
+hot-cache measurements used by the replay benchmark.
+
 ## Memory and image copying
 
 Only the latest observation crosses ZeroMQ on a track update. The registry

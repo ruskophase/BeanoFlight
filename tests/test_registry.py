@@ -274,6 +274,112 @@ class BeanRegistryTests(unittest.TestCase):
         registry.update_track(exited)
         self.assertEqual(registry.evict_completed(before_timestamp_ns=301), 1)
 
+    def test_frame_rollback_restores_full_bounded_hot_caches(self):
+        registry = BeanRegistry(idempotency_capacity=128, event_history_capacity=128)
+        references = tuple(BeanRef("run", sequence) for sequence in range(1, 129))
+        for bean_ref in references:
+            registry.update_track(
+                track(bean_ref, 0, 100, -25.0), event_id=f"initial-{bean_ref.sequence}"
+            )
+        expected_metrics = registry.hot_state_metrics()
+        expected_events = registry.events_since(0)
+        expected_record = registry.get(references[0])
+
+        with self.assertRaises(RegistryConflictError):
+            registry.update_tracks(
+                (
+                    (
+                        track(references[0], 1, 200, -10.0),
+                        None,
+                        "batch-conflict",
+                    ),
+                    (
+                        track(references[1], 1, 200, -10.0),
+                        None,
+                        "batch-conflict",
+                    ),
+                )
+            )
+
+        self.assertEqual(registry.hot_state_metrics(), expected_metrics)
+        self.assertEqual(registry.events_since(0), expected_events)
+        self.assertEqual(registry.get(references[0]), expected_record)
+
+    def test_frame_rollback_handles_more_events_than_journal_capacity(self):
+        registry = BeanRegistry(idempotency_capacity=128, event_history_capacity=128)
+        original = BeanRef("run", 1)
+        registry.update_track(track(original, 0, 100, -25.0), event_id="original")
+        updates = [
+            (
+                track(BeanRef("run", sequence), 0, 100 + sequence, -25.0),
+                None,
+                f"batch-{sequence}",
+            )
+            for sequence in range(2, 142)
+        ]
+        updates.append(
+            (
+                track(BeanRef("run", 142), 0, 242, -25.0),
+                None,
+                "batch-141",
+            )
+        )
+
+        with self.assertRaises(RegistryConflictError):
+            registry.update_tracks(tuple(updates))
+
+        self.assertEqual(registry.events_since(0)[0].event_id, "original")
+        self.assertEqual(len(registry.events_since(0)), 1)
+        self.assertEqual(registry.list_records(), (registry.get(original),))
+
+    def test_completed_eviction_can_be_limited_to_one_run(self):
+        registry = BeanRegistry()
+        first = BeanRef("first-run", 1)
+        second = BeanRef("second-run", 1)
+        registry.update_track(track(first, 2, 300, 40.0, status=TrackStatus.EXITED))
+        registry.update_track(track(second, 2, 300, 40.0, status=TrackStatus.EXITED))
+
+        self.assertEqual(
+            registry.evict_completed(before_timestamp_ns=301, run_id=first.run_id),
+            1,
+        )
+        self.assertEqual(registry.hot_state_metrics()["records"], 1)
+        self.assertEqual(registry.get(second).bean_ref, second)
+
+    def test_durable_record_cache_is_bounded_without_evicting_active_beans(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = SQLiteBeanRepository(Path(temporary) / "registry.db")
+            try:
+                registry = BeanRegistry(repository, record_cache_capacity=16)
+                active = BeanRef("run", 100)
+                registry.update_track(track(active, 0, 100, -20.0))
+                for sequence in range(1, 21):
+                    bean_ref = BeanRef("run", sequence)
+                    registry.update_track(
+                        track(
+                            bean_ref,
+                            2,
+                            300 + sequence,
+                            40.0,
+                            status=TrackStatus.EXITED,
+                        )
+                    )
+
+                metrics = registry.hot_state_metrics()
+                self.assertEqual(metrics["record_capacity"], 16)
+                self.assertLessEqual(metrics["records"], 16)
+                self.assertEqual(registry.get(active).bean_ref, active)
+                self.assertEqual(
+                    len(registry.list_records(run_id="run")),
+                    21,
+                )
+                self.assertLessEqual(
+                    registry.hot_state_metrics()["records"],
+                    16,
+                )
+            finally:
+                repository.close()
+
 
 class SQLiteRegistryTests(unittest.TestCase):
     def test_track_persistence_does_not_replace_session_wall_clock(self):
