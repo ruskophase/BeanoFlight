@@ -9,6 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .analysis import AnalysisEngine
+from .background import parse_background_frame_indices
 from .calibration import MetricPlaneCalibration, find_pinkplane_homography
 from .crop import BeanCropSelector, CropSettings
 from .detection import (
@@ -22,22 +23,16 @@ from .prediction import GateLayout
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
 from .registry_zmq import ZeroMQRegistryClient
 from .replay import CropDispatcher, ReplayRunner, ReplaySettings
+from .sorting_context_transport import DEFAULT_SORTING_CONTEXT_ENDPOINT
 from .source import MMapRawVideoSource, SourceError, open_replay_source
 from .tracking import TrackerSettings
 
 
 def _background_indices(value: str) -> tuple[int, ...]:
     try:
-        result = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+        return parse_background_frame_indices(value)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            "background frames must be comma-separated integers"
-        ) from exc
-    if len(result) != 3 or len(set(result)) != 3 or min(result, default=-1) < 0:
-        raise argparse.ArgumentTypeError(
-            "exactly 3 distinct non-negative background frame indices are required"
-        )
-    return result
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def parser() -> argparse.ArgumentParser:
@@ -104,9 +99,23 @@ def parser() -> argparse.ArgumentParser:
         default=1000,
         help="maximum frames to replay (1-1000)",
     )
+    result.add_argument(
+        "--keep-stale-frames",
+        action="store_true",
+        help="process every recorded frame even when replay has fallen behind",
+    )
+    result.add_argument(
+        "--maximum-frame-age-ms",
+        type=float,
+        default=30.0,
+        help="drop replay frames older than this when stale-frame dropping is enabled",
+    )
     result.add_argument("--no-crops", action="store_true")
     result.add_argument("--registry", default=DEFAULT_COMMAND_ENDPOINT)
     result.add_argument("--crops", default=DEFAULT_CROP_ENDPOINT)
+    result.add_argument(
+        "--sorting-contexts", default=DEFAULT_SORTING_CONTEXT_ENDPOINT
+    )
     result.add_argument("--hole-pitch-mm", type=float, default=9.16)
     result.add_argument("--sorting-offset-mm", type=float, default=30.0)
     result.add_argument("--progress-every", type=int, default=60)
@@ -202,9 +211,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 preview_enabled=False,
                 prebuffer_frames=arguments.prebuffer_frames,
                 maximum_frames=arguments.maximum_frames,
+                drop_stale_frames=not arguments.keep_stale_frames,
+                maximum_frame_age_ms=arguments.maximum_frame_age_ms,
             ),
             crop_selector=selector,
             crop_dispatcher=dispatcher,
+            sorting_context_endpoint=arguments.sorting_contexts,
             profile_metadata={
                 "name": "headless-system-test",
                 "optimized_raw": arguments.optimized_raw,
@@ -228,6 +240,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 print(
                     f"frame {completed}/{value.frame_count}: "
                     f"{value.achieved_fps:.1f} FPS, "
+                    f"timeline {value.source_timeline_fps:.1f} FPS, "
+                    f"age {value.frame_age_ms:.1f} ms, "
+                    f"skipped {value.frames_skipped}, "
                     f"read {value.source_read_ms:.2f} ms, "
                     f"analyse {value.processing_ms:.2f} ms",
                     flush=True,

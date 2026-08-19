@@ -171,6 +171,9 @@ class BeanCropSelector:
                     "first_fully_visible_source_ns": observation.timestamp_ns,
                     "crop_capture_source_ns": observation.timestamp_ns,
                     "crop_selected_monotonic_ns": time.monotonic_ns(),
+                    "expected_inference_samples": (
+                        self.settings.max_crops_per_bean
+                    ),
                 },
             )
             self._counts[track.bean_ref] = count + 1

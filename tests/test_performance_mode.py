@@ -1,5 +1,6 @@
 import unittest
 
+from beanoflight.actuator_app import parser as actuator_parser
 from beanoflight.cli import build_parser as flight_parser
 from beanoflight.mock_inferencer_app import parser as inferencer_parser
 from beanoflight.registry_monitor_app import parser as monitor_parser
@@ -19,6 +20,10 @@ class PerformanceModeTests(unittest.TestCase):
             ("--no-crop-preview", "--no-activity-log"),
         )
         self.assertEqual(
+            performance_mode_arguments("actuator", True),
+            ("--no-activity-log",),
+        )
+        self.assertEqual(
             performance_mode_arguments("sorter", True),
             ("--no-gate-animation", "--no-activity-log"),
         )
@@ -27,7 +32,14 @@ class PerformanceModeTests(unittest.TestCase):
         )
 
     def test_visual_mode_adds_no_overrides(self):
-        for component in ("registry", "monitor", "inferencer", "sorter", "flight"):
+        for component in (
+            "registry",
+            "monitor",
+            "inferencer",
+            "actuator",
+            "sorter",
+            "flight",
+        ):
             self.assertEqual(performance_mode_arguments(component, False), ())
 
     def test_component_parsers_accept_launcher_flags(self):
@@ -42,6 +54,10 @@ class PerformanceModeTests(unittest.TestCase):
         self.assertTrue(inferencer.no_crop_preview)
         self.assertTrue(inferencer.no_activity_log)
 
+        self.assertTrue(
+            actuator_parser().parse_args(["--no-activity-log"]).no_activity_log
+        )
+
         sorter = sorter_parser().parse_args(
             ["--no-gate-animation", "--no-activity-log"]
         )
@@ -50,6 +66,15 @@ class PerformanceModeTests(unittest.TestCase):
         self.assertTrue(
             flight_parser().parse_args(["--performance-mode"]).performance_mode
         )
+
+    def test_sorter_diagnostics_are_opt_in(self):
+        defaults = sorter_parser().parse_args([])
+        self.assertFalse(defaults.gate_animation)
+        self.assertFalse(defaults.activity_log)
+
+        enabled = sorter_parser().parse_args(["--gate-animation", "--activity-log"])
+        self.assertTrue(enabled.gate_animation)
+        self.assertTrue(enabled.activity_log)
 
 
 if __name__ == "__main__":

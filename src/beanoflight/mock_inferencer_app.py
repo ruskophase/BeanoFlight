@@ -13,6 +13,7 @@ from tkinter import messagebox, ttk
 import cv2
 from PIL import Image, ImageTk
 
+from .classification_transport import DEFAULT_DIRECT_EVIDENCE_ENDPOINT
 from .inference_transport import DEFAULT_CROP_ENDPOINT
 from .mock_inference import (
     DEFAULT_STEREO_LATENCY_CURVE,
@@ -37,6 +38,7 @@ class MockInferencerApp(tk.Tk):
         self,
         registry_endpoint: str,
         crop_endpoint: str,
+        classification_endpoint: str,
         *,
         show_crop: bool = True,
         show_activity: bool = True,
@@ -49,6 +51,7 @@ class MockInferencerApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.registry_endpoint = registry_endpoint
         self.crop_endpoint = crop_endpoint
+        self.classification_endpoint = classification_endpoint
         self.service: MockInferencerService | None = None
         self._activities: queue.Queue[MockInferenceActivity] = queue.Queue(maxsize=128)
         self._photo = None
@@ -209,12 +212,14 @@ class MockInferencerApp(tk.Tk):
         self.service = MockInferencerService(
             registry_endpoint=self.registry_endpoint,
             crop_endpoint=self.crop_endpoint,
+            classification_endpoint=self.classification_endpoint,
             settings=settings,
             activity=self._post_activity,
         )
         self.service.start()
         self.status_var.set(
-            f"Starting · crops {self.crop_endpoint} · registry {self.registry_endpoint}"
+            f"Starting · crops {self.crop_endpoint} · direct results "
+            f"{self.classification_endpoint}"
         )
 
     def stop_service(self) -> None:
@@ -272,7 +277,8 @@ class MockInferencerApp(tk.Tk):
             self.counts_var.set(
                 f"received {stats['received']} · completed {stats['completed']} · "
                 f"batches {stats['batches']} · queued {stats['queued']} · "
-                f"dropped {stats['dropped']}"
+                f"dropped {stats['dropped']} · direct {stats['direct_evidence_sent']} · "
+                f"direct dropped {stats['direct_evidence_dropped']}"
             )
             self.batch_stats_var.set(
                 f"mean batch {stats['mean_batch_size']:.1f} · "
@@ -287,7 +293,8 @@ class MockInferencerApp(tk.Tk):
             elif service.ready.is_set():
                 self.status_var.set(
                     "Running · source-frame logical stereo batching · "
-                    f"crops {service.crop_endpoint} · registry {self.registry_endpoint}"
+                    f"crops {service.crop_endpoint} · direct results "
+                    f"{service.classification_endpoint}"
                 )
         delay_ms = (
             50
@@ -324,6 +331,9 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="BeanoFlight mock inference GUI")
     result.add_argument("--registry", default=DEFAULT_COMMAND_ENDPOINT)
     result.add_argument("--crops", default=DEFAULT_CROP_ENDPOINT)
+    result.add_argument(
+        "--classifications", default=DEFAULT_DIRECT_EVIDENCE_ENDPOINT
+    )
     result.add_argument(
         "--no-crop-preview",
         action="store_true",
@@ -363,6 +373,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     MockInferencerApp(
         arguments.registry,
         arguments.crops,
+        arguments.classifications,
         show_crop=not arguments.no_crop_preview,
         show_activity=not arguments.no_activity_log,
     ).mainloop()

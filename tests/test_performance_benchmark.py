@@ -7,6 +7,24 @@ from beanoflight.system_test import parser as system_test_parser
 
 
 class PerformanceBenchmarkTests(unittest.TestCase):
+    def test_hardware_actuator_is_opt_in(self):
+        default = benchmark_parser().parse_args(
+            ["/recording", "--background-frames", "1,2,3"]
+        )
+        enabled = benchmark_parser().parse_args(
+            [
+                "/recording",
+                "--background-frames",
+                "1,2,3",
+                "--esp32-actuator",
+                "--esp32-port",
+                "/dev/test-actuator",
+            ]
+        )
+        self.assertFalse(default.esp32_actuator)
+        self.assertTrue(enabled.esp32_actuator)
+        self.assertEqual(enabled.esp32_port, "/dev/test-actuator")
+
     def test_scenarios_are_validated_and_deduplicated(self):
         self.assertEqual(_scenarios("core,full,core"), ("core", "full"))
         with self.assertRaises(argparse.ArgumentTypeError):

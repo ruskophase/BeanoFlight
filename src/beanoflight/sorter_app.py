@@ -1,4 +1,4 @@
-"""Tk policy controls and virtual gate display for BeanoSorter."""
+"""Tk policy controls and optional diagnostics for BeanoSorter."""
 
 from __future__ import annotations
 
@@ -9,8 +9,10 @@ import tkinter as tk
 from collections.abc import Sequence
 from tkinter import messagebox, ttk
 
+from .classification_transport import DEFAULT_DIRECT_EVIDENCE_ENDPOINT
 from .registry_service import DEFAULT_COMMAND_ENDPOINT, DEFAULT_EVENT_ENDPOINT
 from .sorter import SorterActivity, SorterService, SorterSettings
+from .sorting_context_transport import DEFAULT_SORTING_CONTEXT_ENDPOINT
 
 
 class SorterApp(tk.Tk):
@@ -19,17 +21,23 @@ class SorterApp(tk.Tk):
         registry_endpoint: str,
         *,
         event_endpoint: str = DEFAULT_EVENT_ENDPOINT,
-        animate_gates: bool = True,
-        show_activity: bool = True,
+        classification_endpoint: str = DEFAULT_DIRECT_EVIDENCE_ENDPOINT,
+        sorting_context_endpoint: str = DEFAULT_SORTING_CONTEXT_ENDPOINT,
+        actuation_endpoint: str = "",
+        animate_gates: bool = False,
+        show_activity: bool = False,
     ) -> None:
         super().__init__(className="Beano Sorter")
-        self.title("BeanoSorter — Virtual Gates")
+        self.title("BeanoSorter — Policy and Scheduling")
         self.iconname("BeanoSorter")
         self.geometry("1150x720")
         self.minsize(900, 600)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.registry_endpoint = registry_endpoint
         self.event_endpoint = event_endpoint
+        self.classification_endpoint = classification_endpoint
+        self.sorting_context_endpoint = sorting_context_endpoint
+        self.actuation_endpoint = actuation_endpoint
         self.service: SorterService | None = None
         self._activities: queue.Queue[SorterActivity] = queue.Queue(maxsize=256)
         self._gate_items: dict[int, int] = {}
@@ -45,11 +53,16 @@ class SorterApp(tk.Tk):
         self.lead_var = tk.StringVar(value=str(defaults.open_lead_ms))
         self.lag_var = tk.StringVar(value=str(defaults.close_lag_ms))
         self.notice_var = tk.StringVar(value=str(defaults.minimum_notice_ms))
+        self.ensemble_reserve_var = tk.StringVar(
+            value=str(defaults.ensemble_deadline_reserve_ms)
+        )
         self.adjacent_pair_var = tk.BooleanVar(
             value=defaults.allow_adjacent_gate_pair
         )
         self.status_var = tk.StringVar(value="Stopped")
-        self.counts_var = tk.StringVar(value="decisions 0 · actuations 0 · errors 0")
+        self.counts_var = tk.StringVar(
+            value="decisions 0 · actuations 0 · low-confidence defects 0 · errors 0"
+        )
         self.animate_gates_var = tk.BooleanVar(value=animate_gates)
         self.show_activity_var = tk.BooleanVar(value=show_activity)
         self._build()
@@ -67,6 +80,7 @@ class SorterApp(tk.Tk):
             ("Open lead ms", self.lead_var, 10),
             ("Close lag ms", self.lag_var, 10),
             ("Min notice ms", self.notice_var, 10),
+            ("Pool reserve ms", self.ensemble_reserve_var, 10),
         )
         for column, (label, variable, width) in enumerate(fields):
             ttk.Label(controls, text=label).grid(row=0, column=column, sticky=tk.W)
@@ -81,7 +95,7 @@ class SorterApp(tk.Tk):
         )
         ttk.Checkbutton(
             controls,
-            text="Animate virtual gates (uses extra CPU)",
+            text="Diagnostic screen mirror (ESP32 LEDs are authoritative)",
             variable=self.animate_gates_var,
             command=self._display_options_changed,
         ).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
@@ -128,6 +142,9 @@ class SorterApp(tk.Tk):
                 open_lead_ms=float(self.lead_var.get()),
                 close_lag_ms=float(self.lag_var.get()),
                 minimum_notice_ms=float(self.notice_var.get()),
+                ensemble_deadline_reserve_ms=float(
+                    self.ensemble_reserve_var.get()
+                ),
                 allow_adjacent_gate_pair=self.adjacent_pair_var.get(),
             )
             settings.validate()
@@ -138,11 +155,22 @@ class SorterApp(tk.Tk):
         self.service = SorterService(
             registry_endpoint=self.registry_endpoint,
             event_endpoint=self.event_endpoint,
+            classification_endpoint=self.classification_endpoint,
+            sorting_context_endpoint=self.sorting_context_endpoint,
+            actuation_endpoint=self.actuation_endpoint,
             settings=settings,
             activity=self._post_activity,
         )
         self.service.start()
-        self.status_var.set(f"Running · registry {self.registry_endpoint}")
+        self.status_var.set(
+            f"Running · direct results {self.classification_endpoint} · "
+            f"contexts {self.sorting_context_endpoint} · "
+            + (
+                f"ESP32 plans {self.actuation_endpoint}"
+                if self.actuation_endpoint
+                else "virtual actuator"
+            )
+        )
 
     def stop_service(self) -> None:
         service = self.service
@@ -221,6 +249,15 @@ class SorterApp(tk.Tk):
             self._update_gate_states(service.gate_states)
             self.counts_var.set(
                 f"decisions {service.decisions} · actuations {service.actuations} · "
+                f"pools {service.pooled_classifications} · "
+                f"fallbacks {service.deadline_fallbacks} · "
+                f"direct evidence {service.direct_evidence_received} · "
+                f"context hits {service.context_cache_hits} · "
+                f"context misses {service.context_cache_misses} · "
+                f"Registry recoveries {service.registry_recovery_decisions} · "
+                f"ESP32 plans {service.external_plans_accepted}/"
+                f"{service.external_plans_rejected} · "
+                f"low-confidence defects {service.low_confidence_defects} · "
                 f"errors {service.errors}"
             )
         delay_ms = (
@@ -269,14 +306,38 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--registry", default=DEFAULT_COMMAND_ENDPOINT)
     result.add_argument("--events", default=DEFAULT_EVENT_ENDPOINT)
     result.add_argument(
+        "--classifications", default=DEFAULT_DIRECT_EVIDENCE_ENDPOINT
+    )
+    result.add_argument(
+        "--sorting-contexts", default=DEFAULT_SORTING_CONTEXT_ENDPOINT
+    )
+    result.add_argument(
+        "--actuator",
+        default="",
+        help=(
+            "approved-plan endpoint for external BeanoActuator; blank keeps the "
+            "virtual diagnostic actuator"
+        ),
+    )
+    result.add_argument(
+        "--gate-animation",
+        action="store_true",
+        help="start with the optional diagnostic screen mirror enabled",
+    )
+    result.add_argument(
         "--no-gate-animation",
         action="store_true",
-        help="start with virtual gate animation disabled",
+        help="compatibility flag: keep diagnostic gate animation disabled",
+    )
+    result.add_argument(
+        "--activity-log",
+        action="store_true",
+        help="start with sorter activity rendering enabled",
     )
     result.add_argument(
         "--no-activity-log",
         action="store_true",
-        help="start with sorter activity rendering disabled",
+        help="compatibility flag: keep sorter activity rendering disabled",
     )
     return result
 
@@ -286,8 +347,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     SorterApp(
         arguments.registry,
         event_endpoint=arguments.events,
-        animate_gates=not arguments.no_gate_animation,
-        show_activity=not arguments.no_activity_log,
+        classification_endpoint=arguments.classifications,
+        sorting_context_endpoint=arguments.sorting_contexts,
+        actuation_endpoint=arguments.actuator,
+        animate_gates=(
+            arguments.gate_animation and not arguments.no_gate_animation
+        ),
+        show_activity=arguments.activity_log and not arguments.no_activity_log,
     ).mainloop()
 
 

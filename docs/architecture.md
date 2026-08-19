@@ -114,11 +114,50 @@ replaceable notifications. Each notification carries a persistent global
 stream sequence, so a critical consumer uses `events_since(cursor)` to recover
 any gap before proceeding.
 
-The sorter reads the compact materialized record already embedded in a normal
-live notification, rather than rereading SQLite. The journal remains the
-durable restart/gap path. Inference jobs and sorting decisions persist their
-source-clock and host-monotonic timing marks alongside crop provenance; no
-image data enters that ledger.
+The normal classification control path is a dedicated acknowledged ZeroMQ
+REQ/REP socket from the inferencer to the single sorter. One bounded message represents the GPU
+batch and carries inference-job metadata, class probabilities and logits only.
+Before dispatching crops, BeanoFlight sends the current tracks, predictions and
+replay-clock anchor over a second bounded PUSH/PULL socket. The sorter joins the
+two compact messages from local caches and can plan a valve before the
+inferencer's separate Registry commit finishes. Their independent sockets may
+arrive in either order, so evidence waits briefly for its matching context;
+Registry notifications remain the loss-recovery path. Routine Registry
+lifecycle notifications are header-only to avoid duplicating full records at
+frame rate. Inference jobs and sorting decisions persist their source-clock and
+host-monotonic timing marks alongside crop provenance; no image data enters
+either transport or ledger.
+
+The direct evidence message uses a 3 ms acknowledgement deadline and bounded
+retry. The sorter acknowledges validated evidence before doing classification
+policy work. A Registry classification notification is held for a short
+preference interval and then used as recovery if all direct attempts fail; the
+durable journal remains the restart and sequence-gap path.
+
+The sorter control worker performs no Registry or SQLite work. Registry
+snapshots, event recovery and audits have separate workers. Approved plans cross
+a second acknowledged IPC channel to BeanoActuator. That process synchronizes
+the host monotonic clock with the ESP32-S2 and transfers absolute gate-open and
+gate-close timestamps. A 1 MHz board GPTimer checks the bounded plan table every
+100 us, so host scheduling jitter and SQLite latency are no longer in the final
+edge-timing loop. The actuator's audit worker persists the observed hardware
+result after the cycle.
+
+Each inference is stored as immutable `classification_evidence` containing its
+class order, complete probability vector, logits, ensemble ID and sample index.
+When all requested samples arrive, BeanoSorter can append one local
+`classification_pooled` result using mean probability and schedule immediately;
+its audit worker persists the pool and decision afterwards. BeanRegistry also
+materializes the identical pool atomically with the final completion, so either
+arrival order is idempotent. BeanoSorter acts only on the pooled result. Its
+deadline timer reserves the configured gate lead, minimum notice and an
+additional processing margin; if the ensemble is still incomplete at that
+cutoff, the sorter first drains evidence already queued on its direct socket,
+then uses a one-sample pooled fallback if necessary. Every decision also stores
+an immutable `classification_decision_basis` copy of the exact vector it used.
+This is intentionally separate from Registry's canonical first-writer-wins
+pool, so a concurrent complete pool cannot rewrite the historical explanation
+for a fallback decision.
 
 The 60 FPS frame transaction records undo information only for bean IDs and
 bounded journal/idempotency entries changed by that frame; it never copies the
@@ -139,5 +178,5 @@ The original `EventBus` and `BeanStore` remain small same-process adapters for
 simple workers and backwards compatibility. They are not the live
 multi-process source of truth. See `bean-registry.md` for the process contract.
 
-No physical hardware output is present in version 0.1. Gate selection and
-actuation are diagnostic virtual operations.
+The current physical output is an ESP32-S2 bank of low-current indicator LEDs.
+It demonstrates gate timing only; no valve power stage is implemented.

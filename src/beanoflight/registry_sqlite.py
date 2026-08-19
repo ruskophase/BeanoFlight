@@ -61,6 +61,14 @@ class SQLiteBeanRepository:
         self._batch_depth = 0
         self._save_timing = TimingAccumulator()
         self._batch_timing = TimingAccumulator()
+        self._checkpoint_timing = TimingAccumulator()
+        self._checkpoint_stop = threading.Event()
+        self._checkpoint_stats_lock = threading.Lock()
+        self._checkpoint_count = 0
+        self._checkpoint_busy = 0
+        self._checkpoint_pages = 0
+        self._checkpoint_errors = 0
+        self._checkpoint_thread: threading.Thread | None = None
         with self._lock:
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
@@ -69,7 +77,14 @@ class SQLiteBeanRepository:
                 self._connection.close()
                 raise RuntimeError(f"could not enable SQLite WAL mode: {mode}")
             self._connection.execute("PRAGMA synchronous=NORMAL")
+            self._connection.execute("PRAGMA wal_autocheckpoint=0")
             self._create_schema()
+        self._checkpoint_thread = threading.Thread(
+            target=self._checkpoint_loop,
+            name="beano-registry-wal-checkpoint",
+            daemon=True,
+        )
+        self._checkpoint_thread.start()
 
     @property
     def journal_mode(self) -> str:
@@ -115,14 +130,58 @@ class SQLiteBeanRepository:
                     )
 
     def performance_metrics(self) -> dict[str, dict[str, float | int]]:
+        with self._checkpoint_stats_lock:
+            checkpoint = {
+                **self._checkpoint_timing.summary(),
+                "checkpoints": self._checkpoint_count,
+                "busy": self._checkpoint_busy,
+                "pages_checkpointed": self._checkpoint_pages,
+                "errors": self._checkpoint_errors,
+            }
         return {
             "event_save_ms": self._save_timing.summary(),
             "frame_batch_ms": self._batch_timing.summary(),
+            "wal_checkpoint_ms": checkpoint,
         }
 
     def reset_performance_metrics(self) -> None:
         self._save_timing.clear()
         self._batch_timing.clear()
+        self._checkpoint_timing.clear()
+        with self._checkpoint_stats_lock:
+            self._checkpoint_count = 0
+            self._checkpoint_busy = 0
+            self._checkpoint_pages = 0
+            self._checkpoint_errors = 0
+
+    def _checkpoint_loop(self) -> None:
+        connection = sqlite3.connect(
+            self.path,
+            timeout=0.05,
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        try:
+            connection.execute("PRAGMA busy_timeout=50")
+            while not self._checkpoint_stop.wait(0.5):
+                started = time.perf_counter_ns()
+                try:
+                    busy, _log_pages, checkpointed = connection.execute(
+                        "PRAGMA wal_checkpoint(PASSIVE)"
+                    ).fetchone()
+                    elapsed_ms = (
+                        time.perf_counter_ns() - started
+                    ) / 1_000_000.0
+                    self._checkpoint_timing.add(elapsed_ms)
+                    with self._checkpoint_stats_lock:
+                        self._checkpoint_count += 1
+                        self._checkpoint_busy += int(busy)
+                        self._checkpoint_pages += int(checkpointed)
+                except sqlite3.Error:
+                    with self._checkpoint_stats_lock:
+                        self._checkpoint_errors += 1
+        finally:
+            connection.close()
 
     def _save_locked(self, record: BeanRecord, event: BeanEvent) -> int:
         if record.bean_ref != event.bean_ref or record.revision != event.revision:
@@ -644,7 +703,13 @@ class SQLiteBeanRepository:
             )
 
     def close(self) -> None:
+        self._checkpoint_stop.set()
+        thread = self._checkpoint_thread
+        if thread is not None:
+            thread.join(2.0)
+        self._checkpoint_thread = None
         with self._lock:
+            self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             self._connection.close()
 
     def __enter__(self) -> SQLiteBeanRepository:  # noqa: PYI034 - Python 3.10
@@ -779,7 +844,7 @@ class SQLiteBeanRepository:
 
     def _create_schema(self) -> None:
         current = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-        if current not in (0, 1, SCHEMA_VERSION):
+        if current not in (0, 1, 2, SCHEMA_VERSION):
             raise RuntimeError(
                 f"unsupported BeanRegistry database schema {current}; "
                 f"expected {SCHEMA_VERSION}"

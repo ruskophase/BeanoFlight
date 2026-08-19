@@ -10,6 +10,9 @@ from collections.abc import Sequence
 from pathlib import Path
 from tkinter import filedialog, ttk
 
+from .actuation_transport import DEFAULT_ACTUATION_ENDPOINT
+from .classification_transport import DEFAULT_DIRECT_EVIDENCE_ENDPOINT
+from .esp32_actuator import DEFAULT_ESP32_PORT
 from .inference_transport import DEFAULT_CROP_ENDPOINT
 from .registry_service import (
     DEFAULT_COMMAND_ENDPOINT,
@@ -17,17 +20,23 @@ from .registry_service import (
     ipc_endpoint_has_listener,
     registry_processes_for_database,
 )
-from .registry_zmq import ZeroMQRegistryClient
+from .registry_zmq import (
+    CAPABILITY_COMPLETE_INFERENCE_JOBS_ACK,
+    ZeroMQRegistryClient,
+)
+from .sorting_context_transport import DEFAULT_SORTING_CONTEXT_ENDPOINT
 
 REGISTRY_ABSENT = "absent"
 REGISTRY_CONFLICT = "conflict"
 REGISTRY_HEALTHY = "healthy"
+REGISTRY_LEGACY = "legacy"
 REGISTRY_UNRESPONSIVE = "unresponsive"
 
 PERFORMANCE_MODE_ARGUMENTS = {
     "registry": ("--quiet",),
     "monitor": ("--no-live-updates",),
     "inferencer": ("--no-crop-preview", "--no-activity-log"),
+    "actuator": ("--no-activity-log",),
     "sorter": ("--no-gate-animation", "--no-activity-log"),
     "flight": ("--performance-mode",),
 }
@@ -59,6 +68,11 @@ def registry_endpoint_state(
                 and Path(active_database).resolve() != database.expanduser().resolve()
             ):
                 return REGISTRY_CONFLICT
+            capabilities = {
+                str(item) for item in (response.get("capabilities") or ())
+            }
+            if CAPABILITY_COMPLETE_INFERENCE_JOBS_ACK not in capabilities:
+                return REGISTRY_LEGACY
             return REGISTRY_HEALTHY
     except Exception:  # noqa: BLE001 - transport failure becomes state
         occupied = ipc_endpoint_has_listener(endpoint) or (
@@ -89,6 +103,7 @@ class SimulationLauncherApp(tk.Tk):
         self.status_var = tk.StringVar(value="All components stopped")
         self._processes: dict[str, subprocess.Popen] = {}
         self._external_registry = False
+        self._legacy_registry = False
         self._registry_blocked = ""
         self._build()
         self.after(500, self._poll)
@@ -133,8 +148,9 @@ class SimulationLauncherApp(tk.Tk):
             ("registry", "1. BeanRegistry", self._start_registry),
             ("monitor", "2. Registry Monitor", self._start_monitor),
             ("inferencer", "3. Mock Inferencer", self._start_inferencer),
-            ("sorter", "4. BeanoSorter", self._start_sorter),
-            ("flight", "5. BeanoFlight", self._start_flight),
+            ("actuator", "4. BeanoActuator", self._start_actuator),
+            ("sorter", "5. BeanoSorter", self._start_sorter),
+            ("flight", "6. BeanoFlight", self._start_flight),
         )
         for row, (_key, label, command) in enumerate(components):
             ttk.Button(buttons, text=f"Start {label}", command=command).grid(
@@ -184,11 +200,22 @@ class SimulationLauncherApp(tk.Tk):
         )
         if state == REGISTRY_HEALTHY:
             self._external_registry = True
+            self._legacy_registry = False
             self._registry_blocked = ""
             self.status_var.set("Using the existing healthy BeanRegistry service")
             return True
+        if state == REGISTRY_LEGACY:
+            self._external_registry = True
+            self._legacy_registry = True
+            self._registry_blocked = ""
+            self.status_var.set(
+                "Using an older BeanRegistry in compatibility mode; restart it "
+                "to enable compact inference acknowledgements"
+            )
+            return True
         if state == REGISTRY_CONFLICT:
             self._external_registry = False
+            self._legacy_registry = False
             self._registry_blocked = (
                 "Registry endpoint is serving a different database. Stop that "
                 "registry or select its database before starting this simulation."
@@ -197,6 +224,7 @@ class SimulationLauncherApp(tk.Tk):
             return False
         if state == REGISTRY_UNRESPONSIVE:
             self._external_registry = False
+            self._legacy_registry = False
             self._registry_blocked = (
                 "Registry endpoint is occupied but not answering. Stop the old "
                 "registry process before starting another."
@@ -204,6 +232,7 @@ class SimulationLauncherApp(tk.Tk):
             self.status_var.set(self._registry_blocked)
             return False
         self._external_registry = False
+        self._legacy_registry = False
         self._registry_blocked = ""
         self.status_var.set("Starting BeanRegistry…")
         performance_mode = (
@@ -250,6 +279,8 @@ class SimulationLauncherApp(tk.Tk):
             DEFAULT_COMMAND_ENDPOINT,
             "--crops",
             DEFAULT_CROP_ENDPOINT,
+            "--classifications",
+            DEFAULT_DIRECT_EVIDENCE_ENDPOINT,
             *performance_mode_arguments("inferencer", performance_mode),
         )
 
@@ -266,7 +297,31 @@ class SimulationLauncherApp(tk.Tk):
             DEFAULT_COMMAND_ENDPOINT,
             "--events",
             DEFAULT_EVENT_ENDPOINT,
+            "--classifications",
+            DEFAULT_DIRECT_EVIDENCE_ENDPOINT,
+            "--sorting-contexts",
+            DEFAULT_SORTING_CONTEXT_ENDPOINT,
+            "--actuator",
+            DEFAULT_ACTUATION_ENDPOINT,
             *performance_mode_arguments("sorter", performance_mode),
+        )
+
+    def _start_actuator(self, *, performance_mode: bool | None = None) -> None:
+        performance_mode = (
+            self.performance_mode_var.get()
+            if performance_mode is None
+            else performance_mode
+        )
+        self._launch(
+            "actuator",
+            "beanoflight.actuator_app",
+            "--registry",
+            DEFAULT_COMMAND_ENDPOINT,
+            "--plans",
+            DEFAULT_ACTUATION_ENDPOINT,
+            "--serial",
+            DEFAULT_ESP32_PORT,
+            *performance_mode_arguments("actuator", performance_mode),
         )
 
     def _start_flight(self, *, performance_mode: bool | None = None) -> None:
@@ -278,6 +333,9 @@ class SimulationLauncherApp(tk.Tk):
         arguments = []
         if self.recording_var.get().strip():
             arguments.append(self.recording_var.get().strip())
+        arguments.extend(
+            ("--sorting-contexts", DEFAULT_SORTING_CONTEXT_ENDPOINT)
+        )
         arguments.extend(performance_mode_arguments("flight", performance_mode))
         self._launch("flight", "beanoflight.cli", *arguments)
 
@@ -285,12 +343,15 @@ class SimulationLauncherApp(tk.Tk):
         performance_mode = self.performance_mode_var.get()
         if not self._start_registry(performance_mode=performance_mode):
             return
+        self.after(250, lambda: self._start_actuator(performance_mode=performance_mode))
         self.after(350, lambda: self._start_monitor(performance_mode=performance_mode))
         self.after(
-            500, lambda: self._start_inferencer(performance_mode=performance_mode)
+            650, lambda: self._start_sorter(performance_mode=performance_mode)
         )
-        self.after(650, lambda: self._start_sorter(performance_mode=performance_mode))
-        self.after(800, lambda: self._start_flight(performance_mode=performance_mode))
+        self.after(
+            750, lambda: self._start_inferencer(performance_mode=performance_mode)
+        )
+        self.after(1100, lambda: self._start_flight(performance_mode=performance_mode))
 
     def stop_all(self) -> None:
         processes = tuple(self._processes.values())
@@ -321,7 +382,14 @@ class SimulationLauncherApp(tk.Tk):
         )
         visible = [*running]
         if self._external_registry:
-            visible.insert(0, "registry (existing)")
+            visible.insert(
+                0,
+                (
+                    "registry (existing legacy; compatibility mode)"
+                    if self._legacy_registry
+                    else "registry (existing)"
+                ),
+            )
         if self._registry_blocked:
             self.status_var.set(self._registry_blocked)
         elif visible:

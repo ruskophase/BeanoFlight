@@ -22,6 +22,10 @@ from beanoflight.registry_sqlite import SQLiteBeanRepository
 from beanoflight.registry_zmq import ZeroMQRegistryClient, ZeroMQRegistryServer
 from beanoflight.replay import CropDispatcher
 from beanoflight.sorter import SorterService, SorterSettings
+from beanoflight.sorting_context_transport import (
+    SortingContext,
+    ZeroMQSortingContextPublisher,
+)
 
 
 class SimulationStackTests(unittest.TestCase):
@@ -31,6 +35,8 @@ class SimulationStackTests(unittest.TestCase):
             commands = f"ipc://{root / 'commands.sock'}"
             events = f"ipc://{root / 'events.sock'}"
             crops = f"ipc://{root / 'crops.sock'}"
+            classifications = f"ipc://{root / 'classifications.sock'}"
+            sorting_contexts = f"ipc://{root / 'sorting-contexts.sock'}"
             repository = SQLiteBeanRepository(root / "registry.db")
             registry = BeanRegistry(repository)
             server = ZeroMQRegistryServer(
@@ -47,9 +53,26 @@ class SimulationStackTests(unittest.TestCase):
             server_thread.start()
             self.assertTrue(ready.wait(2.0))
 
+            sorter = SorterService(
+                registry_endpoint=commands,
+                event_endpoint=events,
+                classification_endpoint=classifications,
+                sorting_context_endpoint=sorting_contexts,
+                settings=SorterSettings(
+                    reject_categories=("mould",),
+                    minimum_confidence=0.9,
+                    gate_probability_threshold=0.05,
+                    open_lead_ms=8,
+                    close_lag_ms=12,
+                ),
+            )
+            sorter.start()
+            self.assertTrue(sorter.ready.wait(2.0))
+            self.assertFalse(sorter.startup_error)
             inferencer = MockInferencerService(
                 registry_endpoint=commands,
                 crop_endpoint=crops,
+                classification_endpoint=classifications,
                 settings=MockInferenceSettings(
                     latency_ms=0,
                     jitter_ms=0,
@@ -61,21 +84,12 @@ class SimulationStackTests(unittest.TestCase):
             )
             inferencer.start()
             self.assertTrue(inferencer.ready.wait(2.0))
-            sorter = SorterService(
-                registry_endpoint=commands,
-                event_endpoint=events,
-                settings=SorterSettings(
-                    reject_categories=("mould",),
-                    minimum_confidence=0.9,
-                    gate_probability_threshold=0.05,
-                    open_lead_ms=8,
-                    close_lag_ms=12,
-                ),
-            )
-            sorter.start()
+            # Allow the non-blocking PUSH/PULL connection to finish its local
+            # IPC handshake before the synthetic zero-latency inference.
+            time.sleep(0.1)
             client = ZeroMQRegistryClient(commands, timeout_ms=2_000)
             run_id = "stack-run"
-            client.put_session(
+            session = client.put_session(
                 RunSession(
                     run_id,
                     0,
@@ -98,6 +112,18 @@ class SimulationStackTests(unittest.TestCase):
             snapshot = track(bean_ref, 0, 100, -25.0)
             prediction = TrajectoryPredictor(GateLayout(60.0)).predict(snapshot)
             current = client.update_track(snapshot, prediction, event_id="track")
+            context_publisher = ZeroMQSortingContextPublisher(sorting_contexts)
+            self.assertTrue(
+                context_publisher.send_batch(
+                    run_id=run_id,
+                    frame_index=0,
+                    source_fps=session.source_fps,
+                    target_fps=session.target_fps,
+                    clock_source_timestamp_ns=session.clock_source_timestamp_ns,
+                    clock_monotonic_ns=session.clock_monotonic_ns,
+                    items=(SortingContext(snapshot, prediction),),
+                )
+            )
             job = InferenceJob(
                 "job-1",
                 bean_ref,
@@ -133,6 +159,9 @@ class SimulationStackTests(unittest.TestCase):
             self.assertEqual(result.enrichments[-1].value["category"], "mould")
             self.assertTrue(result.decision.gate_indices)
             self.assertGreater(sorter.event_notifications, 0)
+            self.assertGreater(sorter.direct_evidence_received, 0)
+            self.assertGreater(sorter.context_cache_hits, 0)
+            self.assertEqual(sorter.direct_registry_reads, 0)
             self.assertIn(
                 "registry_classification_received_monotonic_ns",
                 result.inference_jobs[0].timing_marks_ns,
@@ -141,8 +170,31 @@ class SimulationStackTests(unittest.TestCase):
                 "sorter_event_received_monotonic_ns",
                 result.decision.timing_marks_ns,
             )
+            self.assertEqual(
+                result.decision.timing_marks_ns["classification_direct_path"],
+                1,
+                (
+                    sorter.direct_evidence_received,
+                    sorter.registry_recovery_decisions,
+                    sorter.event_notifications,
+                    result.decision.timing_marks_ns,
+                ),
+            )
+            self.assertEqual(
+                result.decision.timing_marks_ns["sorting_context_direct_path"],
+                1,
+            )
+            self.assertGreater(
+                result.decision.timing_marks_ns[
+                    "sorter_direct_received_monotonic_ns"
+                ],
+                result.decision.timing_marks_ns[
+                    "direct_result_send_monotonic_ns"
+                ],
+            )
 
             dispatcher.close()
+            context_publisher.close()
             inferencer.close()
             sorter.close()
             client.close()

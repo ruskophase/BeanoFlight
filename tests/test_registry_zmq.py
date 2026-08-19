@@ -24,6 +24,56 @@ from beanoflight.registry_sqlite import SQLiteBeanRepository
 
 @unittest.skipIf(zmq is None, "pyzmq is not installed in this interpreter")
 class ZeroMQRegistryTests(unittest.TestCase):
+    def test_frame_events_share_one_transport_envelope(self):
+        from beanoflight.registry_zmq import (
+            ZeroMQRegistryClient,
+            ZeroMQRegistryServer,
+            ZeroMQRegistrySubscriber,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command_endpoint = f"ipc://{root}/commands.sock"
+            event_endpoint = f"ipc://{root}/events.sock"
+            registry = BeanRegistry()
+            server = ZeroMQRegistryServer(
+                registry,
+                command_endpoint=command_endpoint,
+                event_endpoint=event_endpoint,
+            )
+            stop = threading.Event()
+            ready = threading.Event()
+            worker = threading.Thread(
+                target=server.serve_forever,
+                args=(stop,),
+                kwargs={"ready": ready},
+                daemon=True,
+            )
+            worker.start()
+            self.assertTrue(ready.wait(2.0))
+            client = ZeroMQRegistryClient(command_endpoint, timeout_ms=2_000)
+            subscriber = ZeroMQRegistrySubscriber(event_endpoint)
+            time.sleep(0.1)
+
+            refs = (BeanRef("event-batch", 1), BeanRef("event-batch", 2))
+            client.update_tracks(
+                tuple(
+                    (track(bean_ref, 0, 100, -25.0), None, f"track-{index}")
+                    for index, bean_ref in enumerate(refs)
+                )
+            )
+            events = subscriber.receive_many(timeout_ms=2_000)
+
+            self.assertEqual(tuple(event.bean_ref for event in events), refs)
+            self.assertEqual(
+                tuple(event.stream_sequence for event in events), (1, 2)
+            )
+            client.close()
+            subscriber.close()
+            stop.set()
+            worker.join(2.0)
+            self.assertFalse(worker.is_alive())
+
     def test_acknowledged_commands_queries_and_event_fanout(self):
         from beanoflight.registry_zmq import (
             RegistryRemoteError,
@@ -57,6 +107,8 @@ class ZeroMQRegistryTests(unittest.TestCase):
             subscriber = ZeroMQRegistrySubscriber(event_endpoint)
             ping = client.ping()
             self.assertEqual(ping["service"], "BeanRegistry")
+            self.assertGreaterEqual(ping["api_version"], 2)
+            self.assertIn("complete_inference_jobs_ack", ping["capabilities"])
             self.assertEqual(ping["database"], str(repository.path.resolve()))
             # PUB/SUB subscriptions are asynchronous; allow the local handshake.
             time.sleep(0.1)
@@ -73,6 +125,10 @@ class ZeroMQRegistryTests(unittest.TestCase):
             self.assertEqual(created.track.state, queried.track.state)
             self.assertEqual(len(created.track.history), 0)
             self.assertEqual(len(queried.track.history), 1)
+            self.assertEqual(
+                client.get_many((bean_ref,), include_history=False),
+                (created,),
+            )
 
             revisions = client.update_track_revisions(
                 (

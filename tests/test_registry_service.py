@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from beanoflight.registry import BeanRegistry
 from beanoflight.registry_service import (
@@ -20,12 +21,33 @@ from beanoflight.simulation_launcher_app import (
     REGISTRY_ABSENT,
     REGISTRY_CONFLICT,
     REGISTRY_HEALTHY,
+    REGISTRY_LEGACY,
     REGISTRY_UNRESPONSIVE,
     registry_endpoint_state,
 )
 
 
 class RegistryServiceOwnershipTests(unittest.TestCase):
+    def test_launcher_identifies_registry_without_capability_metadata(self):
+        class LegacyClient:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def ping(self):
+                return {"service": "BeanRegistry", "database": ""}
+
+            def close(self):
+                pass
+
+        with patch(
+            "beanoflight.simulation_launcher_app.ZeroMQRegistryClient",
+            LegacyClient,
+        ):
+            self.assertEqual(
+                registry_endpoint_state("ipc:///unused", timeout_ms=25),
+                REGISTRY_LEGACY,
+            )
+
     def test_second_service_process_is_refused_for_the_same_database(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

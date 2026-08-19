@@ -1,13 +1,20 @@
 import threading
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 
-from beanoflight.models import FrameAnalysis
-from beanoflight.registry_models import RunState
-from beanoflight.replay import DecodedFrameBuffer, ReplayRunner, ReplaySettings
+from beanoflight.crop import CropPayload
+from beanoflight.models import BeanRef, FrameAnalysis
+from beanoflight.registry_models import InferenceJob, InferenceStatus, RunState
+from beanoflight.replay import (
+    CropDispatcher,
+    DecodedFrameBuffer,
+    ReplayRunner,
+    ReplaySettings,
+)
 from beanoflight.source import SourceError, SourceMetadata
 
 
@@ -43,6 +50,12 @@ class FakeEngine:
         return FrameAnalysis(index, timestamp, (), (), (), (), 0.1)
 
 
+class SlowEngine(FakeEngine):
+    def process(self, _frame, index, timestamp):
+        time.sleep(0.02)
+        return FrameAnalysis(index, timestamp, (), (), (), (), 20.0)
+
+
 class FakeRegistry:
     def __init__(self, source):
         self.source = source
@@ -57,6 +70,37 @@ class FakeRegistry:
 
 
 class ReplayBufferTests(unittest.TestCase):
+    def test_dispatcher_coalesces_track_only_backlog_through_urgent_crop(self):
+        dispatcher = CropDispatcher("inproc://registry", "inproc://crops")
+        for frame_index in range(3):
+            dispatcher.enqueue_frame(((f"track-{frame_index}",),), ())
+        job = InferenceJob(
+            "job-1",
+            BeanRef("dispatch-run", 1),
+            InferenceStatus.SUBMITTED,
+            "CamL",
+            3,
+            100,
+            1,
+            4,
+            4,
+            False,
+            100,
+            100,
+        )
+        dispatcher.enqueue_frame(
+            (("track-3",),),
+            (CropPayload(job, np.zeros((4, 4, 3), dtype=np.uint8)),),
+        )
+
+        with dispatcher._condition:
+            selected = dispatcher._take_dispatch_batch_locked()
+
+        self.assertEqual(len(selected), 4)
+        self.assertFalse(dispatcher._items)
+        self.assertFalse(any(item.payloads for item in selected[:-1]))
+        self.assertEqual(selected[-1].payloads[0].job.job_id, "job-1")
+
     def test_prebuffers_bounded_frames_and_delivers_in_order(self):
         source = FakeSequentialSource(frame_count=5)
         buffer = DecodedFrameBuffer(source, frame_count=4, capacity=3)
@@ -126,6 +170,26 @@ class ReplayBufferTests(unittest.TestCase):
         self.assertGreater(performance["achieved_fps"], 0)
         self.assertEqual(performance["timings_ms"]["frame_work_ms"]["count"], 3)
         self.assertIn("system", performance)
+
+    def test_runner_drops_stale_frames_and_reports_source_timeline(self):
+        source = FakeSequentialSource(frame_count=6)
+        registry = FakeRegistry(source)
+        summary = ReplayRunner(
+            source,
+            SlowEngine(),
+            registry,
+            settings=ReplaySettings(
+                target_fps=100,
+                prebuffer_frames=0,
+                maximum_frames=6,
+                maximum_frame_age_ms=1,
+            ),
+        ).run()
+
+        self.assertGreater(summary.frames_skipped, 0)
+        self.assertEqual(summary.frames_processed + summary.frames_skipped, 6)
+        self.assertGreater(summary.max_frame_age_ms, 0)
+        self.assertGreater(summary.source_timeline_fps, summary.achieved_fps)
 
 
 if __name__ == "__main__":

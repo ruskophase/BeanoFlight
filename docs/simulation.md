@@ -8,13 +8,15 @@ sorter. Only small immutable records cross BeanRegistry; each selected 224 x
 CamL mmap RG10 (fast) or calibrated MKV (fallback)
        |
        v
- BeanoFlight replay -- track/prediction --> BeanRegistry --> SQLite WAL
-       |                                      ^     ^            |
-       +-- BGR crop --> Mock Inferencer ------+     |            +--> Monitor
-                                                    |
-                           BeanoSorter decision ----+
-                                 |
-                                 +--> virtual gate cycle --> BeanRegistry
+ BeanoFlight replay -- async audit --------> BeanRegistry --> SQLite WAL
+       |                 |                       ^  ^             |
+       |                 +-- direct context ---> |  |             +--> Monitor
+       +-- BGR crop --> Mock Inferencer ==ACK==> Sorter
+                                                |  |
+                       decision audit -----------+  |
+                                                v  |
+                                      BeanoActuator ==USB==> ESP32 LEDs
+                                                +-- observed cycle audit
 ```
 
 ## Programs
@@ -31,18 +33,19 @@ CamL mmap RG10 (fast) or calibrated MKV (fallback)
   registry. Its default timing model charges for two views through a shared
   ResNet18 backbone and a feature-fusion head, even though only CamL is
   transported in this release.
-- `beano-sorter` consumes live Registry notifications carrying compact current
-  state and uses the SQLite journal only to recover a gap or restart. It owns
-  classification policy and timing. Recovery starts from the current cursor
-  plus live/latest run snapshots; it never replays unrelated historical runs.
-  Its actuator loop
-  translates source-time deadlines to its local monotonic clock once, turns
-  virtual 5 mm gate dots red while open, and records actual open/close
-  timestamps. An actuation succeeds only if the gate was actually open at the
-  predicted crossing.
-  An approved local valve plan is placed on that loop before its audit write,
-  so SQLite latency cannot postpone the gate deadline. If no individual gate
+- `beano-sorter` joins direct classification evidence with BeanoFlight's direct
+  track/prediction context. Registry notifications and the SQLite journal recover
+  a dropped message, sequence gap or restart. It owns classification policy and
+  timing. Recovery starts from the current cursor plus live/latest run snapshots;
+  it never replays unrelated historical runs. The GUI is a policy/settings
+  console. Its screen gate mirror and activity log are optional diagnostics.
+  An approved absolute valve plan is sent to BeanoActuator before its audit
+  write, so SQLite latency cannot postpone the gate deadline. If no individual gate
   qualifies, an optional adjacent pair can qualify on combined probability.
+- `beano-actuator` owns the ESP32-S2 USB connection. It clock-synchronizes the
+  board, admits acknowledged plans, converts host timestamps to the board clock,
+  and persists observed hardware cycles. The board's fixed GPTimer schedule and
+  watchdog own the final LED edge timing.
 - `beano-flight` owns detection, identity, tracking, prediction and crop
   selection. Its Simulation tab controls input path, rate, preview, prebuffer,
   replay limit, crops per bean, crop size and sockets.
@@ -57,19 +60,20 @@ CamL mmap RG10 (fast) or calibrated MKV (fallback)
 - `beano-system-test` is the non-GUI replay driver for repeatable acceptance
   tests against already-running registry, inferencer and sorter processes.
 
-The virtual actuator is a separate worker loop inside BeanoSorter for this
-simulation. A real valve driver should later be a distinct least-privilege
-process which consumes approved actuation plans and returns hardware results.
+BeanoSorter retains its virtual actuator only as a test fallback when no
+actuation endpoint is configured. The launcher always selects the separate
+BeanoActuator/ESP32 path.
 
 ## Start and run
 
-Install BeanoFlight, open five terminals, and start the first four components:
+Install BeanoFlight, open six terminals, and start the first five components:
 
 ```bash
 beano-registry --database ./beanoflight-simulation.db
 beano-registry-monitor
+beano-actuator
+beano-sorter --actuator ipc:///tmp/beanoflight-actuation-plans.ipc
 beano-mock-inferencer
-beano-sorter
 ```
 
 Then start the replay GUI:
@@ -122,6 +126,24 @@ notice would recover 4, 5, 8 and 9 of those 11 respectively. Mean analysis was
 counter remains useful even when later frames catch up and aggregate throughput
 reaches 60 FPS.
 
+After moving Registry frame/result traffic to atomic batches, deferring sorter
+audit writes, and moving WAL checkpoints off the writer, two fixed-seed
+acceptance runs each processed all 601 frames at 59.999 FPS with no stale skips
+or crop drops. Mean analysis fell to 6.21-6.24 ms and the largest SQLite event
+save was 6.01 ms. All 157 jobs completed in both runs; 40 and 45 reject
+decisions actuated successfully, while 9 and 4 were too late. Eleven
+reject-category results per run were explicitly recorded as below the 0.75
+confidence threshold. Late-decision p95 was 18.80-26.70 ms. This is a two-run
+confirmation, not yet the replacement five-run baseline.
+
+The 2026-08-19 ESP32-S2 integration acceptance run used the same recording,
+frames 43/222/347, 224 x 224 crops and 60-frame prebuffer. It processed all 601
+frames at 59.999 FPS, completed all 157 inference jobs, and produced 52 reject
+actuations. The board acknowledged and completed all 52 cycles with no failed
+or late sorting decisions. Observed GPIO open/close error was 0.052 ms at p50,
+0.091 ms at p95 and below 0.10 ms maximum. This is a single hardware acceptance
+run, not a statistical timing qualification.
+
 A separate startup check used an 81.7 MiB registry copy containing 1,143 beans
 and 14,208 events. The current-run snapshot took 53 ms once; subsequent idle
 journal polls averaged 0.20 ms and did not scan SQLite history.
@@ -131,7 +153,9 @@ The final replay summary is also persisted under the run session's
 coordinate mapping, tracking, prediction, Registry, crop-dispatch and total
 frame timings; SQLite and Registry-operation timings; queue delay; process
 CPU/RSS; available clock/temperature samples; prebuffer timing; deadline misses
-and crop counters. Full-pipeline benchmark output additionally contains a
+and crop counters. It separates processed FPS from source-timeline FPS and
+records stale-frame count plus mean/max frame age. Full-pipeline benchmark
+output additionally contains a
 per-bean timing ledger, p50/p95 lateness, equivalent sorting-line extension and
 shadow recovery counts for 5-50 ms of extra notice. This allows a slow run to
 be diagnosed after its GUI closes.
@@ -161,6 +185,11 @@ beano-system-test /path/to/20260816T134132.801241Z-beans \
   --target-fps 60
 ```
 
+Stale-frame dropping is enabled by default with a 30 ms age ceiling, matching
+the bounded-latency behaviour expected from a live camera. Use
+`--keep-stale-frames` only for exhaustive offline analysis, or adjust the ceiling
+with `--maximum-frame-age-ms`. The BeanoFlight GUI exposes the same policy.
+
 ## Repeatable performance matrix
 
 Use the benchmark command when comparing code or machine configuration. It
@@ -183,6 +212,11 @@ beano-performance-benchmark \
   --crops-per-bean 1 \
   --output ./performance-report.json
 ```
+
+Add `--esp32-actuator` for an isolated hardware-backed run. By default it opens
+the development board's stable `/dev/serial/by-path` name; override that with
+`--esp32-port`. The resulting JSON records the chosen port, hardware-cycle
+failures and observed open/close timing distributions.
 
 The report preserves every run summary and adds per-scenario distributions.
 `passed` requires both `all_outcomes_complete` and
@@ -220,20 +254,40 @@ This representation is intended for a model trained on the same pipeline, not
 for display. The selectable `calibrated` reference additionally applies the
 frozen photometric corrections and sRGB encoding.
 
-Every crop creates an independent job and classification attached to the same
-bean ID. The current sorter intentionally makes its immutable decision from the
-first completed classification. Later crop results remain auditable but do not
-revise that decision; confidence aggregation is a later policy change.
+Every crop creates an independent `classification_evidence` job attached to the
+same bean ID and ensemble ID. It records the full class order, probability
+vector and logits. The default BeanoFlight setting requests two temporal
+samples from two selected source frames. There is only one logical stereo
+inference for a bean on each frame pair; the simulator does not run the same
+pair twice. BeanoSorter mean-pools both vectors locally on its dedicated result
+path and only that immutable `classification_pooled` result drives sorting.
+BeanRegistry persists the evidence and independently guarantees the same pool
+for recovery and audit.
 
-Before enqueueing, BeanoFlight creates a durable `InferenceJob` through a
-compact revision-only Registry acknowledgement. All crops selected in the same
-source frame are enqueued and transported atomically as an explicit frame
-batch. The dispatch worker colour-processes the group and advances every job
-through `accepted` and `completed` (or `dropped`/`failed`). Both dispatch and
-inferencer queues are bounded; a full local queue is recorded synchronously as
-dropped jobs. Frame tracking never waits for colour processing or mock
-inference, and a process failure cannot leave an unregistered crop in the
-queue. Neither crops nor source frames are stored in SQLite.
+Waiting is bounded by the valve deadline. BeanoSorter subtracts open lead,
+minimum notice and the configurable **Pool reserve ms** from the predicted
+crossing. It drains evidence already queued at that cutoff before using a
+one-sample deadline fallback. Every decision stores a separate
+`classification_decision_basis` containing the exact pool it used, even if the
+Registry's canonical pool concurrently completes with two samples. Registry and
+timing-ledger output therefore distinguish complete pools from fallbacks without
+the former audit race.
+
+All crops selected in one source frame are enqueued and transported atomically
+as an explicit frame batch. The dispatch worker overlaps RAW colour processing
+with the Registry round trip. On crop frames it first commits the crop-owning
+tracks and jobs, sends the crop batch, then persists the other tracks; unrelated
+history therefore does not consume the current crop deadline. Queued track-only
+frames may share a transaction while retaining per-bean timestamp order.
+
+The mock GPU uses a physical crossing estimate to choose among frame batches
+that are already waiting; it never merges frames or delays a frame to make a
+larger batch. GPU execution and CPU-side result publication use separate
+workers, allowing the next simulated TensorRT batch to start while the previous
+result is sent to the sorter and commits. The direct batch carries no pixels and
+uses a bounded non-blocking queue; the Registry completion remains its durable
+fallback. Both queues remain bounded. Jobs finish as `completed`,
+`dropped`, or `failed`; neither crops nor source frames are stored in SQLite.
 
 ## Source-frame stereo inference model
 
@@ -246,7 +300,7 @@ batches receive up to 15% seeded jitter; one percent also receive a seeded
 15--30 ms tail penalty.
 
 The GUI reports batch count and size, queue and service latency, rare tails,
-deadline misses and drops. Each classification stores the same fields in its
+deadline misses and drops. Each evidence result stores the same fields in its
 Registry enrichment, including a source-frame batch ID and explicit
 `stereo_pair_complete: false` marker.
 
@@ -275,6 +329,7 @@ an untrusted network.
 
 The mock category is deterministic for a seed, camera and bean sequence, so a
 new run ID or earlier crop frame does not silently change the test population.
-It has no connection to crop content. Gate timing is a software simulation, not authority to drive
-hardware. Frame drops, delayed messages, corrupt results and process restarts
+It has no connection to crop content. The ESP32 outputs are indicator-only in
+this release: they validate schedule delivery and edge timing, but are not
+authority to drive valves. Frame drops, delayed messages, corrupt results and process restarts
 are planned fault-injection/analysis work after this baseline.

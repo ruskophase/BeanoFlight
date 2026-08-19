@@ -14,7 +14,12 @@ import cv2
 from PIL import Image, ImageTk
 
 from .analysis import AnalysisEngine, AnalysisRun, analyse_source, export_run_json
-from .background import BackgroundProvenance, stratified_random_candidates
+from .background import (
+    DEFAULT_BACKGROUND_FRAMES_TEXT,
+    BackgroundProvenance,
+    parse_background_frame_indices,
+    stratified_random_candidates,
+)
 from .calibration import (
     CalibrationError,
     MetricPlaneCalibration,
@@ -35,6 +40,7 @@ from .prediction import GateLayout
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
 from .registry_zmq import ZeroMQRegistryClient
 from .replay import CropDispatcher, ReplayRunner, ReplaySettings
+from .sorting_context_transport import DEFAULT_SORTING_CONTEXT_ENDPOINT
 from .source import (
     MMapRawVideoSource,
     ReplaySource,
@@ -264,6 +270,7 @@ class BeanoFlightApp(tk.Tk):
         hole_pitch_mm: float = 9.16,
         sorting_offset_mm: float = 30.0,
         performance_mode: bool = False,
+        sorting_context_endpoint: str = DEFAULT_SORTING_CONTEXT_ENDPOINT,
     ) -> None:
         super().__init__(className="BeanoFlight")
         self.title("BeanoFlight")
@@ -276,6 +283,7 @@ class BeanoFlightApp(tk.Tk):
         self.sorting_offset_mm = sorting_offset_mm
         self.explicit_homography = homography_path
         self.performance_mode = bool(performance_mode)
+        self.sorting_context_endpoint = sorting_context_endpoint
 
         self.source: ReplaySource | None = None
         self.source_prefer_raw = False
@@ -324,8 +332,13 @@ class BeanoFlightApp(tk.Tk):
         self.prebuffer_frames_var = tk.StringVar(value="60")
         self.maximum_frames_var = tk.StringVar(value="1000")
         self.crop_size_var = tk.StringVar(value="224")
-        self.crops_per_bean_var = tk.StringVar(value="1")
+        self.crops_per_bean_var = tk.StringVar(value="2")
         self.adaptive_edge_resize_var = tk.BooleanVar(value=True)
+        self.drop_stale_frames_var = tk.BooleanVar(value=True)
+        self.maximum_frame_age_var = tk.StringVar(value="30")
+        self.background_frames_var = tk.StringVar(
+            value=DEFAULT_BACKGROUND_FRAMES_TEXT
+        )
         self.registry_endpoint_var = tk.StringVar(value=DEFAULT_COMMAND_ENDPOINT)
         self.inference_endpoint_var = tk.StringVar(value=DEFAULT_CROP_ENDPOINT)
 
@@ -621,11 +634,22 @@ class BeanoFlightApp(tk.Tk):
             text="Use current frame as background",
             command=self.use_current_background,
         ).grid(row=button_row + 2, column=0, columnspan=2, sticky=tk.EW, pady=3)
+        ttk.Label(parent, text="Background frames (3, zero-based)").grid(
+            row=button_row + 3, column=0, columnspan=2, sticky=tk.W, pady=(8, 2)
+        )
+        ttk.Entry(parent, textvariable=self.background_frames_var).grid(
+            row=button_row + 4, column=0, sticky=tk.EW, pady=3
+        )
+        ttk.Button(
+            parent,
+            text="Build entered frames",
+            command=self.build_manual_background,
+        ).grid(row=button_row + 4, column=1, sticky=tk.EW, padx=(5, 0), pady=3)
         ttk.Button(
             parent,
             text="Choose 3 empty frames for background…",
             command=self.build_guided_background,
-        ).grid(row=button_row + 3, column=0, columnspan=2, sticky=tk.EW, pady=3)
+        ).grid(row=button_row + 5, column=0, columnspan=2, sticky=tk.EW, pady=3)
         ttk.Label(
             parent,
             text=(
@@ -634,7 +658,7 @@ class BeanoFlightApp(tk.Tk):
             ),
             wraplength=360,
             style="Muted.TLabel",
-        ).grid(row=button_row + 4, column=0, columnspan=2, sticky=tk.W, pady=(12, 0))
+        ).grid(row=button_row + 6, column=0, columnspan=2, sticky=tk.W, pady=(12, 0))
         parent.columnconfigure(0, weight=1)
 
     def _build_inspector_tab(self, parent: ttk.Frame) -> None:
@@ -824,7 +848,7 @@ class BeanoFlightApp(tk.Tk):
             increment=2,
             width=18,
         ).grid(row=8, column=1, sticky=tk.EW, pady=3)
-        ttk.Label(parent, text="Crops per bean").grid(
+        ttk.Label(parent, text="Inference samples per bean").grid(
             row=9, column=0, sticky=tk.W, pady=3
         )
         ttk.Spinbox(
@@ -839,20 +863,35 @@ class BeanoFlightApp(tk.Tk):
             text="Resize smaller complete crops near frame edge",
             variable=self.adaptive_edge_resize_var,
         ).grid(row=10, column=0, columnspan=2, sticky=tk.W, pady=5)
-        ttk.Label(parent, text="Registry command endpoint").grid(
-            row=11, column=0, sticky=tk.W, pady=3
-        )
-        ttk.Entry(parent, textvariable=self.registry_endpoint_var).grid(
-            row=11, column=1, sticky=tk.EW, pady=3
-        )
-        ttk.Label(parent, text="Inference crop endpoint").grid(
+        ttk.Checkbutton(
+            parent,
+            text="Drop stale replay frames (live-stream behaviour)",
+            variable=self.drop_stale_frames_var,
+        ).grid(row=11, column=0, columnspan=2, sticky=tk.W, pady=5)
+        ttk.Label(parent, text="Maximum frame age (ms)").grid(
             row=12, column=0, sticky=tk.W, pady=3
         )
+        ttk.Spinbox(
+            parent,
+            textvariable=self.maximum_frame_age_var,
+            from_=5,
+            to=250,
+            width=18,
+        ).grid(row=12, column=1, sticky=tk.EW, pady=3)
+        ttk.Label(parent, text="Registry command endpoint").grid(
+            row=13, column=0, sticky=tk.W, pady=3
+        )
+        ttk.Entry(parent, textvariable=self.registry_endpoint_var).grid(
+            row=13, column=1, sticky=tk.EW, pady=3
+        )
+        ttk.Label(parent, text="Inference crop endpoint").grid(
+            row=14, column=0, sticky=tk.W, pady=3
+        )
         ttk.Entry(parent, textvariable=self.inference_endpoint_var).grid(
-            row=12, column=1, sticky=tk.EW, pady=3
+            row=14, column=1, sticky=tk.EW, pady=3
         )
         ttk.Separator(parent).grid(
-            row=13, column=0, columnspan=2, sticky=tk.EW, pady=12
+            row=15, column=0, columnspan=2, sticky=tk.EW, pady=12
         )
         ttk.Label(
             parent,
@@ -864,7 +903,7 @@ class BeanoFlightApp(tk.Tk):
             ),
             wraplength=390,
             style="Muted.TLabel",
-        ).grid(row=14, column=0, columnspan=2, sticky=tk.W)
+        ).grid(row=16, column=0, columnspan=2, sticky=tk.W)
         parent.columnconfigure(1, weight=1)
 
     def open_video(self) -> None:
@@ -902,6 +941,22 @@ class BeanoFlightApp(tk.Tk):
         self.run = None
         self.background = source.frame(0).copy()
         self.background_provenance = BackgroundProvenance("temporary first frame", (0,))
+        background_status = (
+            "Frame 1 is the temporary background; enter three clean frame indices "
+            "or use guided selection."
+        )
+        try:
+            indices = self._entered_background_indices()
+            self._set_background_from_indices(
+                indices,
+                method="manually entered temporal median",
+            )
+            background_status = (
+                "Background automatically built from zero-based frames "
+                f"{', '.join(str(index) for index in indices)}."
+            )
+        except (ValueError, SourceError, DetectorError) as exc:
+            background_status += f" Default entry was not applied: {exc}"
         self.timeline.configure(to=max(1, source.metadata.frame_count - 1))
         self.frame_var.set(0)
         timestamp_label = (
@@ -921,10 +976,7 @@ class BeanoFlightApp(tk.Tk):
             self.calibration_var.set(
                 "No homography.json found — detector inspection only"
             )
-        self.status_var.set(
-            "Frame 1 is the temporary background; select a clean frame or choose "
-            "3 confirmed-empty frames."
-        )
+        self.status_var.set(background_status)
         self._refresh_display()
 
     def select_homography(self) -> None:
@@ -1010,6 +1062,54 @@ class BeanoFlightApp(tk.Tk):
         )
         self._refresh_display()
 
+    def _entered_background_indices(self) -> tuple[int, ...]:
+        if self.source is None:
+            raise ValueError("open a recording before selecting background frames")
+        return parse_background_frame_indices(
+            self.background_frames_var.get(),
+            frame_count=self.source.metadata.frame_count,
+        )
+
+    def _set_background_from_indices(
+        self,
+        indices: tuple[int, ...],
+        *,
+        method: str,
+        candidate_seed: int | None = None,
+    ) -> None:
+        if self.source is None:
+            raise ValueError("open a recording before selecting background frames")
+        frames = [self.source.frame(index) for index in indices]
+        self.background = temporal_median_background(frames)
+        self.background_provenance = BackgroundProvenance(
+            method,
+            indices,
+            candidate_seed,
+        )
+
+    def build_manual_background(self) -> None:
+        if self.source is None:
+            messagebox.showinfo(
+                "Background model", "Open a recording first.", parent=self
+            )
+            return
+        self.stop_work()
+        try:
+            indices = self._entered_background_indices()
+            self._set_background_from_indices(
+                indices,
+                method="manually entered temporal median",
+            )
+        except (ValueError, SourceError, DetectorError) as exc:
+            messagebox.showerror("Background model", str(exc), parent=self)
+            return
+        self._invalidate_run(
+            "Background built from zero-based frames "
+            f"{', '.join(str(index) for index in indices)}; "
+            "track IDs require reanalysis."
+        )
+        self._refresh_display()
+
     def build_guided_background(self) -> None:
         if self.source is None:
             return
@@ -1024,14 +1124,15 @@ class BeanoFlightApp(tk.Tk):
             return
         indices, seed = result
         try:
-            frames = [self.source.frame(index) for index in indices]
-            self.background = temporal_median_background(frames)
+            self._set_background_from_indices(
+                indices,
+                method="human-confirmed stratified temporal median",
+                candidate_seed=seed,
+            )
         except (SourceError, DetectorError) as exc:
             messagebox.showerror("Background model", str(exc), parent=self)
             return
-        self.background_provenance = BackgroundProvenance(
-            "human-confirmed stratified temporal median", indices, seed
-        )
+        self.background_frames_var.set(",".join(str(index) for index in indices))
         self._invalidate_run(
             f"Background built from {len(indices)} confirmed-empty frames; "
             "track IDs require reanalysis."
@@ -1172,6 +1273,16 @@ class BeanoFlightApp(tk.Tk):
         if self._worker is not None and self._worker.is_alive():
             return
         try:
+            background_indices = self._entered_background_indices()
+            if self.background_provenance.frame_indices != background_indices:
+                self._set_background_from_indices(
+                    background_indices,
+                    method="manually entered temporal median",
+                )
+        except (ValueError, SourceError, DetectorError) as exc:
+            messagebox.showerror("Background model", str(exc), parent=self)
+            return
+        try:
             fps_text = self.target_fps_var.get().strip().lower()
             target_fps = 0.0 if fps_text == "unlimited" else float(fps_text)
             crop_settings = CropSettings(
@@ -1192,6 +1303,8 @@ class BeanoFlightApp(tk.Tk):
                     else 0
                 ),
                 maximum_frames=int(self.maximum_frames_var.get()),
+                drop_stale_frames=self.drop_stale_frames_var.get(),
+                maximum_frame_age_ms=float(self.maximum_frame_age_var.get()),
             )
             replay_settings.validate()
         except ValueError as exc:
@@ -1220,7 +1333,7 @@ class BeanoFlightApp(tk.Tk):
         tracker_settings = self.tracker_settings
         registry_endpoint = self.registry_endpoint_var.get().strip()
         inference_endpoint = self.inference_endpoint_var.get().strip()
-        background_indices = self.background_provenance.frame_indices or (0,)
+        background_indices = self.background_provenance.frame_indices
 
         def worker() -> None:
             source = None
@@ -1276,6 +1389,7 @@ class BeanoFlightApp(tk.Tk):
                     settings=replay_settings,
                     crop_selector=selector,
                     crop_dispatcher=dispatcher,
+                    sorting_context_endpoint=self.sorting_context_endpoint,
                     profile_metadata={
                         "name": (
                             "launcher-performance"
@@ -1491,6 +1605,8 @@ class BeanoFlightApp(tk.Tk):
                     self.status_var.set(
                         f"Simulation frame {value.frame_index + 1:,} / "
                         f"{value.frame_count:,} · {value.achieved_fps:.1f} FPS · "
+                        f"age {value.frame_age_ms:.1f} ms · skipped "
+                        f"{value.frames_skipped} · "
                         f"read {value.source_read_ms:.2f} ms · analyse "
                         f"{value.processing_ms:.2f} ms · crops {value.crops_submitted} "
                         f"({value.crops_dropped} dropped)"
@@ -1507,13 +1623,15 @@ class BeanoFlightApp(tk.Tk):
                     self.run_button.configure(text="Run")
                     self.performance_var.set(
                         f"{summary.frames_processed:,} streamed frames; "
-                        f"{summary.achieved_fps:.1f} FPS; source mean "
+                        f"{summary.achieved_fps:.1f} processed FPS; "
+                        f"{summary.source_timeline_fps:.1f} timeline FPS; source mean "
                         f"{summary.mean_source_read_ms:.2f} ms; analysis mean "
                         f"{summary.mean_processing_ms:.2f} ms; analysis max "
                         f"{summary.max_processing_ms:.2f} ms; "
                         f"prebuffer {summary.prebuffered_frames} frames in "
                         f"{summary.prebuffer_seconds:.2f} s; "
-                        f"{summary.missed_deadlines} missed deadlines"
+                        f"{summary.missed_deadlines} missed deadlines; "
+                        f"{summary.frames_skipped} stale frames skipped"
                     )
                     self.status_var.set(
                         f"Simulation complete · run {summary.run_id[:12]} · "

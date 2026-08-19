@@ -3,9 +3,9 @@
 1. Open a FastCap recording folder or its `CamL-calibrated.mkv`.
 2. Confirm that the status line says `exact FastCap timestamps`.
 3. Confirm that the metric calibration has loaded and reports its RMS.
-4. Find a frame without beans and choose **Use current frame as background**.
-   For a more representative model, choose **Choose 3 empty frames for
-   background**. Mark each stratified candidate `Empty` or `Contains
+4. Enter three zero-based indices in **Background frames** and choose **Build
+   entered frames**. The current default is `43,222,347`. Alternatively choose
+   **Choose 3 empty frames for background**. Mark each candidate `Empty` or `Contains
    foreground`; only accepted frames enter the median. `U`/`Y` means use and
    `N` means do not use, in either upper or lower case.
 5. Enable **Inspect frozen frame step-by-step**.
@@ -53,9 +53,10 @@ probability that the centre crosses within that 5 mm interval. Gate
 probabilities may sum to less than 100% when the distribution extends beyond
 the displayed virtual gate bank.
 
-These probabilities do not yet model bean width, nozzle plume width, valve
-latency or category-specific sorting policy. They must not be used to actuate
-real hardware in version 0.1.
+These probabilities do not yet model bean width, nozzle plume width, measured
+SX11F-LH valve latency or a validated category-specific sorting policy. The
+ESP32 outputs are suitable for the current LED timing demonstration only; they
+must not drive valves in version 0.1.
 
 ## Registry service check
 
@@ -75,7 +76,7 @@ filesystem.
 ## Multi-process simulation check
 
 Start `beano-simulation` for a convenience control panel, or run the registry,
-monitor, mock inferencer, sorter and BeanoFlight in separate terminals. Select
+monitor, actuator, sorter, mock inferencer and BeanoFlight in separate terminals. Select
 the same command and crop endpoints in each GUI. Start the registry first;
 BeanoFlight refuses to begin Simulation if its ping is not acknowledged.
 The launcher reuses a healthy existing registry only when it reports the
@@ -83,6 +84,12 @@ selected database. If the endpoint is serving a different database, or if the
 endpoint or selected database is owned but unresponsive, **Start all** stops
 immediately with a recovery message instead of creating a second database
 writer.
+
+The launcher labels an already-running Registry without current capability
+metadata as **legacy; compatibility mode**. The mock inferencer then uses the
+older atomic result-batch operation. Restarting the Registry enables the newer
+compact acknowledgement, but version skew no longer turns classifications into
+failed jobs.
 
 When using `beano-simulation`, leave **Performance mode** selected for a
 repeatable throughput run. It starts newly launched components with registry
@@ -99,8 +106,9 @@ useful fallback and review reference, but software decoding can be its limiting
 stage. The default 60-frame prebuffer starts before the replay clock and then
 overlaps RAW preparation or video decoding with analysis. Set the maximum replay
 length between 1 and 1,000 frames. Inspect the registry monitor for a complete
-chain of `inference.submitted`, `inference.accepted`, `inference.completed`,
-`sorting.decision`, and, where policy selects a gate, `sorting.actuated`.
+chain of `inference.submitted`, `inference.completed`, `sorting.decision`, and,
+where policy selects a gate, `sorting.actuated`. Crop receipt timing remains in
+the completed job ledger without a separate hot-path `accepted` write.
 
 The Actuation column reads `Awaiting`, `Not required`, `Scheduled`, `OK` or
 `FAIL`; a blank result is no longer used for the normal no-gate case. Turn off
@@ -120,10 +128,28 @@ timings, process resource samples, prebuffer time, missed deadlines and crop
 counts in the session `settings.performance` object. These values remain
 available after the BeanoFlight window closes.
 
+**Start all** launches BeanoActuator, then BeanoSorter, before Mock Inferencer so
+the dedicated plan and inference-evidence receivers own their IPC endpoints
+before the producers connect. Starting the components individually should follow
+the same order. Exhausted evidence retries are not fatal: BeanoFlight and the
+inferencer still commit authoritative state to BeanRegistry, and the sorter
+recovers it from Registry notifications after a short preference interval. The
+Mock Inferencer and BeanoSorter status panels show direct sent/received and
+context cache counts; the timing ledger labels evidence and trajectory delivery
+independently as `direct` or `registry`.
+
+For real-time runs, inspect `source_timeline_fps`, `frames_skipped`, and
+`frame_age_ms` together. Processed FPS intentionally falls when an old replay
+frame is discarded; source-timeline FPS shows whether the input clock was kept,
+while frame-age telemetry proves that latency remained bounded.
+
 An isolated full-pipeline benchmark also reports `outcome.timing_ledger`.
 Inspect `late_by_ms`, `equivalent_line_extension_mm`,
 `shadow_recovered_with_extra_notice`, and the bounded `per_bean` entries before
 changing the physical sorting-line offset or valve timing assumptions.
+The same ledger reports `actuator_open_lateness_ms` and
+`actuator_close_lateness_ms`; these measure host scheduler behaviour separately
+from a classification decision that was already too late.
 
 For a repeatable acceptance matrix which does not depend on manually launched
 GUIs, run:
@@ -136,6 +162,11 @@ beano-performance-benchmark /path/to/recording-bundle \
   --prebuffer-frames 60 --crops-per-bean 1 \
   --output ./performance-report.json
 ```
+
+Add `--esp32-actuator` to include the connected ESP32-S2 in an isolated
+hardware-backed run. The benchmark then starts its own BeanoActuator service,
+uses the stable USB path, and requires every reported cycle to complete. Use
+`--esp32-port` if the board is connected at a different path.
 
 The benchmark owns isolated endpoints and keeps its Registry alive for every
 repetition. Confirm `passed` for both scenarios; this includes the FPS

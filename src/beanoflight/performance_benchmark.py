@@ -13,6 +13,12 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+from .classification import (
+    CLASSIFICATION_DECISION_BASIS,
+    CLASSIFICATION_EVIDENCE,
+    CLASSIFICATION_POOLED,
+)
+from .esp32_actuator import DEFAULT_ESP32_PORT, ESP32ActuatorService
 from .mock_inference import MockInferencerService
 from .registry_models import InferenceStatus
 from .registry_zmq import ZeroMQRegistryClient
@@ -58,6 +64,12 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--database", type=Path)
     result.add_argument("--output", type=Path)
+    result.add_argument(
+        "--esp32-actuator",
+        action="store_true",
+        help="send approved plans to the connected ESP32-S2 actuator",
+    )
+    result.add_argument("--esp32-port", default=DEFAULT_ESP32_PORT)
     return result
 
 
@@ -74,20 +86,47 @@ def main(argv: Sequence[str] | None = None) -> int:
     commands = f"ipc://{root / 'commands.ipc'}"
     events = f"ipc://{root / 'events.ipc'}"
     crops = f"ipc://{root / 'crops.ipc'}"
+    classifications = f"ipc://{root / 'classifications.ipc'}"
+    sorting_contexts = f"ipc://{root / 'sorting-contexts.ipc'}"
+    actuation_plans = f"ipc://{root / 'actuation-plans.ipc'}"
     registry_process = None
     context = multiprocessing.get_context("spawn")
     service_stop = context.Event()
     inference_ready = context.Event()
     sorter_ready = context.Event()
+    actuator_ready = context.Event()
     inferencer = context.Process(
         target=_run_inferencer,
-        args=(commands, crops, service_stop, inference_ready),
+        args=(commands, crops, classifications, service_stop, inference_ready),
         name="beano-benchmark-inferencer",
     )
     sorter = context.Process(
         target=_run_sorter,
-        args=(commands, events, service_stop, sorter_ready),
+        args=(
+            commands,
+            events,
+            classifications,
+            sorting_contexts,
+            actuation_plans if arguments.esp32_actuator else "",
+            service_stop,
+            sorter_ready,
+        ),
         name="beano-benchmark-sorter",
+    )
+    actuator = (
+        context.Process(
+            target=_run_actuator,
+            args=(
+                commands,
+                actuation_plans,
+                arguments.esp32_port,
+                service_stop,
+                actuator_ready,
+            ),
+            name="beano-benchmark-actuator",
+        )
+        if arguments.esp32_actuator
+        else None
     )
     try:
         registry_process = subprocess.Popen(
@@ -108,15 +147,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             text=True,
         )
         _wait_for_registry(commands, registry_process)
-        inferencer.start()
+        if actuator is not None:
+            actuator.start()
+            if not actuator_ready.wait(5.0):
+                raise RuntimeError(
+                    "benchmark ESP32 actuator did not connect and synchronize"
+                )
         sorter.start()
-        if not inference_ready.wait(5.0) or not sorter_ready.wait(5.0):
-            raise RuntimeError("benchmark services did not become ready")
+        if not sorter_ready.wait(5.0):
+            raise RuntimeError("benchmark sorter did not become ready")
+        inferencer.start()
+        if not inference_ready.wait(5.0):
+            raise RuntimeError("benchmark inferencer did not become ready")
 
         runs: list[dict[str, object]] = []
         for scenario in arguments.scenarios:
             for repeat in range(1, arguments.repeats + 1):
-                summary = _run_replay(arguments, commands, crops, scenario)
+                summary = _run_replay(
+                    arguments,
+                    commands,
+                    crops,
+                    sorting_contexts,
+                    scenario,
+                )
                 outcome = _wait_for_outcome(
                     commands,
                     str(summary["run_id"]),
@@ -133,6 +186,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{scenario} {repeat}/{arguments.repeats}: "
                     f"{float(summary['achieved_fps']):.2f} FPS · "
                     f"analysis {float(summary['mean_processing_ms']):.2f} ms · "
+                    f"skipped {int(summary.get('frames_skipped', 0))} · "
                     f"crops {int(summary['crops_submitted'])} · "
                     f"drops {int(summary['crops_dropped'])}",
                     flush=True,
@@ -144,6 +198,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "target_fps": arguments.target_fps,
             "repeats": arguments.repeats,
             "adaptive_edge_resize": not arguments.no_adaptive_edge_resize,
+            "esp32_actuator": bool(arguments.esp32_actuator),
+            "esp32_port": arguments.esp32_port,
             "summaries": _scenario_summaries(runs, arguments.target_fps),
             "runs": runs,
         }
@@ -156,7 +212,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     finally:
         service_stop.set()
-        for process in (sorter, inferencer):
+        for process in (sorter, inferencer, actuator):
+            if process is None:
+                continue
             if process.pid is not None:
                 process.join(3.0)
                 if process.is_alive():
@@ -172,10 +230,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         temporary.cleanup()
 
 
-def _run_inferencer(commands, crops, stop, ready) -> None:
+def _run_inferencer(commands, crops, classifications, stop, ready) -> None:
     service = MockInferencerService(
         registry_endpoint=commands,
         crop_endpoint=crops,
+        classification_endpoint=classifications,
         activity=None,
     )
     service.start()
@@ -185,16 +244,51 @@ def _run_inferencer(commands, crops, stop, ready) -> None:
     service.close(drain=False)
 
 
-def _run_sorter(commands, events, stop, ready) -> None:
+def _run_sorter(
+    commands,
+    events,
+    classifications,
+    sorting_contexts,
+    actuation_plans,
+    stop,
+    ready,
+) -> None:
     service = SorterService(
         registry_endpoint=commands,
         event_endpoint=events,
+        classification_endpoint=classifications,
+        sorting_context_endpoint=sorting_contexts,
+        actuation_endpoint=actuation_plans,
         activity=None,
     )
     service.start()
-    ready.set()
+    if service.ready.wait(5.0) and not service.startup_error:
+        ready.set()
     stop.wait()
     service.close()
+
+
+def _run_actuator(commands, plans, serial_port, stop, ready) -> None:
+    service = ESP32ActuatorService(
+        registry_endpoint=commands,
+        actuation_endpoint=plans,
+        serial_port=serial_port,
+        activity=None,
+    )
+    service.start()
+    service.ready.wait(5.0)
+    deadline = time.monotonic() + 5.0
+    while (
+        not stop.is_set()
+        and not service.startup_error
+        and not service.synchronized
+        and time.monotonic() < deadline
+    ):
+        stop.wait(0.02)
+    if service.synchronized and not service.startup_error:
+        ready.set()
+    stop.wait()
+    service.close(drain=False)
 
 
 def _wait_for_registry(endpoint: str, process: subprocess.Popen) -> None:
@@ -214,7 +308,13 @@ def _wait_for_registry(endpoint: str, process: subprocess.Popen) -> None:
     raise RuntimeError("benchmark registry did not become ready")
 
 
-def _run_replay(arguments, commands: str, crops: str, scenario: str) -> dict:
+def _run_replay(
+    arguments,
+    commands: str,
+    crops: str,
+    sorting_contexts: str,
+    scenario: str,
+) -> dict:
     command = [
         sys.executable,
         "-m",
@@ -239,6 +339,8 @@ def _run_replay(arguments, commands: str, crops: str, scenario: str) -> dict:
         commands,
         "--crops",
         crops,
+        "--sorting-contexts",
+        sorting_contexts,
         "--progress-every",
         str(arguments.maximum_frames + 1),
     ]
@@ -311,6 +413,33 @@ def _wait_for_outcome(
     finally:
         client.close()
     jobs = tuple(job for record in records for job in record.inference_jobs)
+    actuation_failures = tuple(
+        {
+            "bean_id": str(record.bean_ref),
+            "source": record.actuation.source,
+            "detail": record.actuation.detail,
+        }
+        for record in records
+        if record.actuation is not None and not record.actuation.success
+    )
+    evidence = tuple(
+        item
+        for record in records
+        for item in record.enrichments
+        if item.kind == CLASSIFICATION_EVIDENCE
+    )
+    pooled = tuple(
+        item
+        for record in records
+        for item in record.enrichments
+        if item.kind == CLASSIFICATION_POOLED
+    )
+    decision_bases = tuple(
+        item
+        for record in records
+        for item in record.enrichments
+        if item.kind == CLASSIFICATION_DECISION_BASIS
+    )
     return {
         "beans": len(records),
         "beans_with_jobs": sum(bool(record.inference_jobs) for record in records),
@@ -318,6 +447,21 @@ def _wait_for_outcome(
         "jobs_completed": sum(job.status == InferenceStatus.COMPLETED for job in jobs),
         "jobs_dropped": sum(job.status == InferenceStatus.DROPPED for job in jobs),
         "jobs_failed": sum(job.status == InferenceStatus.FAILED for job in jobs),
+        "classification_evidence": len(evidence),
+        "classification_pooled": len(pooled),
+        "classification_decision_bases": len(decision_bases),
+        "classification_complete_pools": sum(
+            isinstance(item.value, dict)
+            and isinstance(item.value.get("ensemble"), dict)
+            and not item.value["ensemble"].get("deadline_fallback", False)
+            for item in pooled
+        ),
+        "classification_deadline_fallbacks": sum(
+            isinstance(item.value, dict)
+            and isinstance(item.value.get("ensemble"), dict)
+            and bool(item.value["ensemble"].get("deadline_fallback", False))
+            for item in pooled
+        ),
         "decisions": sum(record.decision is not None for record in records),
         "actuations": sum(record.actuation is not None for record in records),
         "actuations_succeeded": sum(
@@ -328,6 +472,7 @@ def _wait_for_outcome(
             record.actuation is not None and not record.actuation.success
             for record in records
         ),
+        "actuation_failures": actuation_failures,
         "two_gate_decisions": sum(
             record.decision is not None and len(record.decision.gate_indices) == 2
             for record in records
@@ -335,6 +480,11 @@ def _wait_for_outcome(
         "combined_probability_decisions": sum(
             record.decision is not None
             and "adjacent gates combined probability" in record.decision.reason
+            for record in records
+        ),
+        "low_confidence_defects": sum(
+            record.decision is not None
+            and "below confidence threshold" in record.decision.reason
             for record in records
         ),
         "hot_records_evicted": evicted,
@@ -353,6 +503,17 @@ def _scenario_summaries(
         if not selected:
             continue
         fps = [float(run["summary"]["achieved_fps"]) for run in selected]
+        timeline_fps = [
+            float(
+                run["summary"].get(
+                    "source_timeline_fps", run["summary"]["achieved_fps"]
+                )
+            )
+            for run in selected
+        ]
+        frames_skipped = [
+            int(run["summary"].get("frames_skipped", 0)) for run in selected
+        ]
         analysis = [float(run["summary"]["mean_processing_ms"]) for run in selected]
         within_target = all(value >= minimum_acceptable_fps for value in fps)
         outcomes_complete = all(
@@ -367,6 +528,8 @@ def _scenario_summaries(
         )
         scenarios[scenario] = {
             "fps": summarize_samples(fps),
+            "source_timeline_fps": summarize_samples(timeline_fps),
+            "frames_skipped": summarize_samples(frames_skipped),
             "mean_analysis_ms": summarize_samples(analysis),
             "minimum_fps": min(fps),
             "minimum_acceptable_fps": minimum_acceptable_fps,

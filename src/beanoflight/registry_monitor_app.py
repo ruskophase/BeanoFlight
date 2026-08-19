@@ -8,6 +8,7 @@ import tkinter as tk
 from collections.abc import Sequence
 from tkinter import ttk
 
+from .classification import CLASSIFICATION_POOLED, LEGACY_CLASSIFICATION
 from .registry_models import BeanRecord
 from .registry_monitor import RegistryMonitorSnapshot, RegistryMonitorWorker
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
@@ -154,7 +155,7 @@ class RegistryMonitorApp(tk.Tk):
                 (
                     item
                     for item in reversed(record.enrichments)
-                    if item.kind == "classification"
+                    if item.kind in {CLASSIFICATION_POOLED, LEGACY_CLASSIFICATION}
                 ),
                 None,
             )
@@ -168,6 +169,18 @@ class RegistryMonitorApp(tk.Tk):
                 )
                 if classification.confidence is not None:
                     category += f" {classification.confidence:.1%}"
+                if (
+                    classification.kind == CLASSIFICATION_POOLED
+                    and isinstance(value, dict)
+                    and isinstance(value.get("ensemble"), dict)
+                ):
+                    ensemble = value["ensemble"]
+                    category += (
+                        f" · {int(ensemble.get('sample_count', 1))}/"
+                        f"{int(ensemble.get('expected_samples', 1))}"
+                    )
+                    if ensemble.get("deadline_fallback", False):
+                        category += " fallback"
             decision = record.decision
             values = (
                 str(record.bean_ref),

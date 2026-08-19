@@ -10,6 +10,9 @@ from beanoflight.crop import CropPayload
 from beanoflight.mock_inference import (
     MockInferencerService,
     MockInferenceSettings,
+    _batch_priority_deadline_ns,
+    _complete_inference_batch,
+    _registry_capabilities,
     _stable_job_key,
 )
 from beanoflight.models import BeanRef
@@ -114,12 +117,17 @@ class MockInferenceBatchTests(unittest.TestCase):
             "beanoflight.mock_inference.ZeroMQRegistryClient", _RegistryClient
         ):
             worker = threading.Thread(target=service._worker_loop, daemon=True)
+            publisher = threading.Thread(target=service._result_loop, daemon=True)
             worker.start()
+            publisher.start()
             service._queue.join()
+            service._results.join()
             service._stop.set()
             worker.join(1.0)
+            publisher.join(1.0)
 
         self.assertFalse(worker.is_alive())
+        self.assertFalse(publisher.is_alive())
         stats = service.statistics()
         self.assertEqual(stats["batches"], 1)
         self.assertEqual(stats["completed"], 4)
@@ -127,7 +135,16 @@ class MockInferenceBatchTests(unittest.TestCase):
         self.assertEqual(len(_RegistryClient.instances), 1)
         completions = _RegistryClient.instances[0].completions
         self.assertEqual(len(completions), 4)
-        inference = completions[0][2].value["inference"]
+        enrichment = completions[0][2]
+        self.assertEqual(enrichment.kind, "classification_evidence")
+        self.assertEqual(
+            enrichment.value["class_order"],
+            ["mould"],
+        )
+        self.assertEqual(enrichment.value["probabilities"], [1.0])
+        self.assertEqual(enrichment.value["ensemble"]["sample_index"], 1)
+        self.assertEqual(enrichment.value["ensemble"]["expected_samples"], 1)
+        inference = enrichment.value["inference"]
         self.assertEqual(inference["input_mode"], "logical_stereo")
         self.assertEqual(inference["transported_camera"], "CamL")
         self.assertEqual(inference["transported_views"], 1)
@@ -154,6 +171,65 @@ class MockInferenceBatchTests(unittest.TestCase):
         )
         self.assertEqual(service.statistics()["dropped"], 3)
         self.assertEqual(service._queue.qsize(), 0)
+
+    def test_physical_crossing_estimate_sets_batch_priority(self):
+        relaxed = _payload(1)
+        urgent = _payload(2)
+        relaxed = replace(
+            relaxed,
+            job=replace(
+                relaxed.job,
+                capture_timestamp_ns=1_000,
+                timing_marks_ns={
+                    "inference_priority_crossing_source_ns": 101_001_000
+                },
+            ),
+        )
+        urgent = replace(
+            urgent,
+            job=replace(
+                urgent.job,
+                capture_timestamp_ns=1_000,
+                timing_marks_ns={
+                    "inference_priority_crossing_source_ns": 11_001_000
+                },
+            ),
+        )
+
+        relaxed_deadline = _batch_priority_deadline_ns(
+            (relaxed,), 1_000_000, 60.0
+        )
+        urgent_deadline = _batch_priority_deadline_ns(
+            (urgent,), 2_000_000, 60.0
+        )
+
+        self.assertLess(urgent_deadline, relaxed_deadline)
+
+    def test_legacy_registry_uses_supported_batch_completion(self):
+        class LegacyRegistry:
+            def __init__(self):
+                self.ack_calls = 0
+                self.batches = []
+
+            def ping(self):
+                return {"service": "BeanRegistry", "schema": 3}
+
+            def complete_inference_jobs_ack(self, _completions):
+                self.ack_calls += 1
+                raise AssertionError("unsupported acknowledgement must not be called")
+
+            def complete_inference_jobs(self, completions):
+                self.batches.append(completions)
+
+        registry = LegacyRegistry()
+        completions = (("bean", "job", "result", {}, "event"),)
+
+        capabilities = _registry_capabilities(registry)
+        _complete_inference_batch(registry, completions, capabilities)
+
+        self.assertEqual(capabilities, frozenset())
+        self.assertEqual(registry.ack_calls, 0)
+        self.assertEqual(registry.batches, [completions])
 
 
 if __name__ == "__main__":

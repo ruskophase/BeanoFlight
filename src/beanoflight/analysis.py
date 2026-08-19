@@ -93,7 +93,14 @@ class AnalysisEngine:
             ),
         )
 
-    def process(self, frame_bgr, frame_index: int, timestamp_ns: int) -> FrameAnalysis:
+    def process(
+        self,
+        frame_bgr,
+        frame_index: int,
+        timestamp_ns: int,
+        *,
+        on_tracked: Callable[[FrameAnalysis], None] | None = None,
+    ) -> FrameAnalysis:
         started = time.perf_counter_ns()
         detection_result = self.detector.detect(frame_bgr, self.background_bgr)
         detection_finished = time.perf_counter_ns()
@@ -119,6 +126,19 @@ class AnalysisEngine:
         mapping_finished = time.perf_counter_ns()
         tracks = self.tracker.update(observations, timestamp_ns)
         tracking_finished = time.perf_counter_ns()
+        if on_tracked is not None:
+            on_tracked(
+                FrameAnalysis(
+                    frame_index,
+                    timestamp_ns,
+                    detection_result.detections,
+                    self.tracker.last_rejections,
+                    tracks,
+                    (),
+                    (tracking_finished - started) / 1_000_000.0,
+                )
+            )
+        crop_finished = time.perf_counter_ns()
         predictions = tuple(
             prediction
             for track in tracks
@@ -170,7 +190,7 @@ class AnalysisEngine:
                 coordinate_mapping_ms=(mapping_finished - detection_finished)
                 / 1_000_000.0,
                 tracking_ms=(tracking_finished - mapping_finished) / 1_000_000.0,
-                prediction_ms=(prediction_finished - tracking_finished) / 1_000_000.0,
+                prediction_ms=(prediction_finished - crop_finished) / 1_000_000.0,
                 registry_ms=(finished - prediction_finished) / 1_000_000.0,
             ),
         )

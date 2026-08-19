@@ -8,7 +8,7 @@ import queue
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -50,6 +50,15 @@ from .registry_models import (
 from .telemetry import TimingAccumulator
 
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
+REGISTRY_API_VERSION = 2
+CAPABILITY_COMPLETE_INFERENCE_JOBS_ACK = "complete_inference_jobs_ack"
+CAPABILITY_ADD_ENRICHMENTS = "add_enrichments"
+REGISTRY_CAPABILITIES = (
+    CAPABILITY_COMPLETE_INFERENCE_JOBS_ACK,
+    CAPABILITY_ADD_ENRICHMENTS,
+    "event_batches",
+    "events_since_compact",
+)
 
 
 class RegistryTransportError(RuntimeError):
@@ -168,6 +177,8 @@ class ZeroMQRegistryServer:
             return {
                 "service": "BeanRegistry",
                 "schema": REGISTRY_SCHEMA,
+                "api_version": REGISTRY_API_VERSION,
+                "capabilities": list(REGISTRY_CAPABILITIES),
                 "pid": os.getpid(),
                 "database": ("" if database is None else str(Path(database).resolve())),
             }
@@ -194,6 +205,15 @@ class ZeroMQRegistryServer:
             return record_to_dict(
                 record, include_history=bool(payload.get("include_history", True))
             )
+        if operation == "get_many":
+            include_history = bool(payload.get("include_history", False))
+            return [
+                record_to_dict(
+                    self.registry.get(bean_ref_from_dict(_object(raw_ref))),
+                    include_history=include_history,
+                )
+                for raw_ref in _array(payload.get("bean_refs", []))
+            ]
         if operation in {"list", "list_active"}:
             run_id_value = payload.get("run_id")
             run_id = None if run_id_value is None else str(run_id_value)
@@ -322,6 +342,26 @@ class ZeroMQRegistryServer:
                 }
                 for record in self.registry.update_tracks(tuple(updates))
             ]
+        if operation == "update_frame_and_submit_jobs":
+            updates = _decode_track_updates(_array(payload.get("updates", [])))
+            jobs = []
+            for raw_item in _array(payload.get("jobs", [])):
+                item = _object(raw_item)
+                job = inference_job_from_dict(_object(item["job"]))
+                jobs.append((job, str(item.get("event_id") or job.job_id)))
+            revisions, canonical_jobs = self.registry.update_frame_and_submit_jobs(
+                updates, tuple(jobs)
+            )
+            return {
+                "revisions": [
+                    {
+                        "bean_ref": bean_ref_to_dict(bean_ref),
+                        "revision": revision,
+                    }
+                    for bean_ref, revision in revisions.items()
+                ],
+                "jobs": [inference_job_to_dict(job) for job in canonical_jobs],
+            }
         if operation == "add_enrichment":
             record = self.registry.add_enrichment(
                 bean_ref_from_dict(_object(payload["bean_ref"])),
@@ -329,6 +369,26 @@ class ZeroMQRegistryServer:
                 event_id=str(payload.get("event_id") or request_id),
             )
             return record_to_dict(record, include_history=False)
+        if operation == "add_enrichments":
+            additions = []
+            for raw_item in _array(payload.get("additions", [])):
+                item = _object(raw_item)
+                enrichment = enrichment_from_dict(_object(item["enrichment"]))
+                additions.append(
+                    (
+                        bean_ref_from_dict(_object(item["bean_ref"])),
+                        enrichment,
+                        str(
+                            item.get("event_id")
+                            or enrichment.result_id
+                            or request_id
+                        ),
+                    )
+                )
+            return [
+                record_to_dict(record, include_history=False)
+                for record in self.registry.add_enrichments(tuple(additions))
+            ]
         if operation == "submit_inference_job":
             job = inference_job_from_dict(_object(payload["job"]))
             record = self.registry.submit_inference_job(
@@ -377,6 +437,38 @@ class ZeroMQRegistryServer:
                 event_id=str(payload.get("event_id") or request_id),
             )
             return record_to_dict(record, include_history=False)
+        if operation in {
+            "complete_inference_jobs",
+            "complete_inference_jobs_ack",
+        }:
+            received_ns = time.monotonic_ns()
+            completions = []
+            for raw_item in _array(payload.get("completions", [])):
+                item = _object(raw_item)
+                timing_marks = {
+                    str(key): int(value)
+                    for key, value in _object(
+                        item.get("timing_marks_ns", {})
+                    ).items()
+                }
+                timing_marks.setdefault(
+                    "registry_classification_received_monotonic_ns", received_ns
+                )
+                completions.append(
+                    (
+                        bean_ref_from_dict(_object(item["bean_ref"])),
+                        str(item["job_id"]),
+                        enrichment_from_dict(_object(item["enrichment"])),
+                        timing_marks,
+                        str(item.get("event_id") or f"complete:{item['job_id']}"),
+                    )
+                )
+            records = self.registry.complete_inference_jobs(tuple(completions))
+            if operation == "complete_inference_jobs_ack":
+                return len(records)
+            return [
+                record_to_dict(record, include_history=False) for record in records
+            ]
         if operation == "set_sorting_decision":
             record = self.registry.set_sorting_decision(
                 bean_ref_from_dict(_object(payload["bean_ref"])),
@@ -402,13 +494,29 @@ class ZeroMQRegistryServer:
         raise ValueError(f"unknown registry operation: {operation}")
 
     def _publish_waiting(self, socket: zmq.Socket) -> None:
+        waiting = []
         while True:
             try:
-                event = self._event_queue.get_nowait()
+                waiting.append(self._event_queue.get_nowait())
             except queue.Empty:
-                return
+                break
+        if not waiting:
+            return
+        if len(waiting) == 1:
+            event = waiting[0]
+            topic = event.kind
             envelope = {"schema": REGISTRY_SCHEMA, "event": event_to_dict(event)}
-            socket.send_multipart((event.kind.encode("utf-8"), _encode(envelope)))
+        else:
+            kinds = {event.kind for event in waiting}
+            topic = waiting[0].kind if len(kinds) == 1 else "registry.batch"
+            envelope = {
+                "schema": REGISTRY_SCHEMA,
+                "events": [event_to_dict(event) for event in waiting],
+            }
+        # One source-frame transaction or one GPU completion batch becomes one
+        # transport message. Durable journal events remain individually ordered.
+        socket.send_multipart((topic.encode("utf-8"), _encode(envelope)))
+        for event in waiting:
             if self.event_observer is not None:
                 self.event_observer(event)
 
@@ -465,6 +573,27 @@ class ZeroMQRegistryClient:
                     "get",
                     {
                         "bean_ref": bean_ref_to_dict(bean_ref),
+                        "include_history": include_history,
+                    },
+                )
+            )
+        )
+
+    def get_many(
+        self,
+        bean_refs,
+        *,
+        include_history: bool = False,
+    ) -> tuple[BeanRecord, ...]:
+        return tuple(
+            record_from_dict(_object(item))
+            for item in _array(
+                self._request(
+                    "get_many",
+                    {
+                        "bean_refs": [
+                            bean_ref_to_dict(bean_ref) for bean_ref in bean_refs
+                        ],
                         "include_history": include_history,
                     },
                 )
@@ -601,6 +730,36 @@ class ZeroMQRegistryClient:
             )
         return result
 
+    def update_frame_and_submit_jobs(
+        self, updates, jobs
+    ) -> tuple[dict[BeanRef, int], tuple[InferenceJob, ...]]:
+        response = _object(
+            self._request(
+                "update_frame_and_submit_jobs",
+                {
+                    "updates": _encode_track_updates(updates),
+                    "jobs": [
+                        {
+                            "job": inference_job_to_dict(job),
+                            "event_id": event_id or job.job_id,
+                        }
+                        for job, event_id in jobs
+                    ],
+                },
+            )
+        )
+        revisions: dict[BeanRef, int] = {}
+        for raw_item in _array(response.get("revisions", [])):
+            item = _object(raw_item)
+            revisions[bean_ref_from_dict(_object(item["bean_ref"]))] = int(
+                item["revision"]
+            )
+        canonical_jobs = tuple(
+            inference_job_from_dict(_object(item))
+            for item in _array(response.get("jobs", []))
+        )
+        return revisions, canonical_jobs
+
     def add_enrichment(
         self,
         bean_ref: BeanRef,
@@ -627,6 +786,30 @@ class ZeroMQRegistryClient:
                         "bean_ref": bean_ref_to_dict(bean_ref),
                         "enrichment": enrichment_to_dict(enrichment),
                         "event_id": identifier,
+                    },
+                )
+            )
+        )
+
+    def add_enrichments(self, additions) -> tuple[BeanRecord, ...]:
+        return tuple(
+            record_from_dict(_object(item))
+            for item in _array(
+                self._request(
+                    "add_enrichments",
+                    {
+                        "additions": [
+                            {
+                                "bean_ref": bean_ref_to_dict(bean_ref),
+                                "enrichment": enrichment_to_dict(enrichment),
+                                "event_id": (
+                                    event_id
+                                    or enrichment.result_id
+                                    or uuid.uuid4().hex
+                                ),
+                            }
+                            for bean_ref, enrichment, event_id in additions
+                        ]
                     },
                 )
             )
@@ -709,6 +892,27 @@ class ZeroMQRegistryClient:
                         "event_id": event_id or f"complete:{job_id}",
                     },
                 )
+            )
+        )
+
+    def complete_inference_jobs(self, completions) -> tuple[BeanRecord, ...]:
+        return tuple(
+            record_from_dict(_object(item))
+            for item in _array(
+                self._request(
+                    "complete_inference_jobs",
+                    {"completions": _encode_inference_completions(completions)},
+                )
+            )
+        )
+
+    def complete_inference_jobs_ack(self, completions) -> int:
+        """Commit a GPU result batch without echoing materialized records."""
+
+        return int(
+            self._request(
+                "complete_inference_jobs_ack",
+                {"completions": _encode_inference_completions(completions)},
             )
         )
 
@@ -862,17 +1066,43 @@ class ZeroMQRegistrySubscriber:
         self.socket.setsockopt(zmq.RCVHWM, max(1, int(capacity)))
         self.socket.setsockopt_string(zmq.SUBSCRIBE, topic)
         self.socket.connect(event_endpoint)
+        self._pending: deque[BeanEvent] = deque()
 
     def receive(self, *, timeout_ms: int | None = None) -> BeanEvent | None:
+        if self._pending:
+            return self._pending.popleft()
+        events = self.receive_many(timeout_ms=timeout_ms)
+        if not events:
+            return None
+        self._pending.extend(events[1:])
+        return events[0]
+
+    def receive_many(
+        self, *, timeout_ms: int | None = None
+    ) -> tuple[BeanEvent, ...]:
+        """Receive one transport envelope containing one or more journal events."""
+
+        if self._pending:
+            events = tuple(self._pending)
+            self._pending.clear()
+            return events
         if timeout_ms is not None and not self.socket.poll(
             max(0, int(timeout_ms)), zmq.POLLIN
         ):
-            return None
+            return ()
         _topic, encoded = self.socket.recv_multipart()
         envelope = _object(json.loads(encoded.decode("utf-8")))
         if envelope.get("schema") != REGISTRY_SCHEMA:
             raise RegistryTransportError("invalid BeanRegistry event schema")
-        return event_from_dict(_object(envelope["event"]))
+        if "events" in envelope:
+            events = tuple(
+                event_from_dict(_object(item))
+                for item in _array(envelope["events"])
+            )
+            if not events:
+                raise RegistryTransportError("empty BeanRegistry event batch")
+            return events
+        return (event_from_dict(_object(envelope["event"])),)
 
     def close(self) -> None:
         self.socket.close(0)
@@ -900,6 +1130,44 @@ def _encode_track_updates(updates) -> list[dict[str, object]]:
             }
         )
     return encoded_updates
+
+
+def _encode_inference_completions(completions) -> list[dict[str, object]]:
+    return [
+        {
+            "bean_ref": bean_ref_to_dict(bean_ref),
+            "job_id": job_id,
+            "enrichment": enrichment_to_dict(enrichment),
+            "timing_marks_ns": dict(timing_marks_ns or {}),
+            "event_id": event_id or f"complete:{job_id}",
+        }
+        for (
+            bean_ref,
+            job_id,
+            enrichment,
+            timing_marks_ns,
+            event_id,
+        ) in completions
+    ]
+
+
+def _decode_track_updates(values: list[object]):
+    updates = []
+    for raw_update in values:
+        update = _object(raw_update)
+        prediction_value = update.get("prediction")
+        updates.append(
+            (
+                track_from_dict(_object(update["track"])),
+                (
+                    None
+                    if prediction_value is None
+                    else prediction_from_dict(_object(prediction_value))
+                ),
+                str(update.get("event_id") or uuid.uuid4().hex),
+            )
+        )
+    return tuple(updates)
 
 
 def _encode(value: object) -> bytes:

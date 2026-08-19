@@ -7,8 +7,9 @@ image positions into millimetres using PinkPlane's 9.16 mm hole grid, assigns
 stable bean IDs, and predicts where and when each bean will cross a virtual
 sorting line.
 
-The first release is deliberately a human-verification and software-simulation
-tool. It does not operate physical valves.
+The current release is deliberately a human-verification and system-simulation
+tool. Its ESP32-S2 output is restricted to low-current gate-indicator LEDs; it
+does not drive physical valves.
 
 ## Review and Simulation modes
 
@@ -51,10 +52,28 @@ event has a persistent stream sequence; critical consumers recover through the
 `events_since` query rather than assuming publish/subscribe delivery. Frame
 images are never written to the registry or its database.
 
-BeanoSorter normally reacts directly to the live state carried by each Registry
-notification. It consults the durable event journal only after a sequence gap or
-during periodic recovery, so a 25 ms polling interval is no longer present in
-the valve-decision path.
+The mock inferencer sends each completed probability vector over a dedicated,
+bounded inference-to-sorter socket before committing it to BeanRegistry. The
+message contains job metadata, probabilities and logits only—never an image.
+BeanoFlight sends the current tracks, predictions and replay-clock anchor over
+a second bounded socket before crop dispatch. BeanoSorter joins those two local
+messages, mean-pools temporal evidence and schedules an eligible valve without
+a Registry query or write in the normal decision path. The pooled result and
+decision are then persisted by its audit worker. Each selected frame contributes
+only one logical CamL/CamR inference per bean; the second requested sample
+remains a later frame, not a duplicate inference of the same frame pair.
+
+The direct inference notification uses a short acknowledgement deadline and
+bounded retry. BeanRegistry still atomically stores every completed job and can
+materialize the same immutable
+`classification_pooled` result. Registry notifications and the durable event
+journal recover a lost direct message. If the later temporal sample would
+consume the safe valve window, the sorter uses an auditable first-sample
+deadline fallback. Thus neither routine persistence nor polling is present in
+the valve-decision path, while restart and delivery recovery remain durable.
+The exact pool used by every decision is additionally stored as
+`classification_decision_basis`; it remains accurate if Registry independently
+finalizes a different pool during a second-result/deadline race.
 
 BeanRegistry holds exclusive OS locks for its SQLite database and both IPC
 endpoints. A second instance exits with a clear ownership error instead of
@@ -70,14 +89,15 @@ and bulk monitor/recovery queries do not populate that cache.
 
 ## Asynchronous simulation
 
-Five independently startable GUI/service processes exercise the process
+Six independently startable GUI/service processes exercise the process
 boundaries intended for the machine:
 
 ```bash
 beano-registry --database ./beanoflight-simulation.db
 beano-registry-monitor
+beano-actuator
 beano-mock-inferencer
-beano-sorter
+beano-sorter --actuator ipc:///tmp/beanoflight-actuation-plans.ipc
 beano-flight /recordings/example
 ```
 
@@ -90,19 +110,50 @@ a future CamL/CamR pair and feature-fusion head, and adds a deterministic
 random category/confidence. Only CamL is transported today, so Registry
 telemetry explicitly distinguishes the physical input from the logical
 two-view compute model. The sorter waits for a confirmed trajectory before it
-makes an immutable decision, then applies its configurable policy and shows
-virtual 5 mm gates in black or red while active.
+makes an immutable decision, then applies its configurable policy and sends an
+absolute gate plan to BeanoActuator. BeanoSorter's GUI is primarily a settings
+console; its screen gate mirror is an opt-in diagnostic. Hardware gate state is
+visualized by the ESP32 indicator LEDs.
 When no individual gate reaches the configured probability threshold, the
 sorter may select the strongest adjacent pair if their combined, disjoint
 crossing probability qualifies.
-Crop previews, activity logs, monitor polling and gate animation can be turned
+Crop previews, activity logs, monitor polling and diagnostic gate animation can be turned
 off independently without stopping their worker services.
+
+## ESP32-S2 indicator actuator
+
+`beano-actuator` is the only host process that opens the ESP32 USB device. It
+clock-synchronizes with the board, converts approved host-monotonic plans to
+absolute board timestamps, and records observed `OPEN`/`CLOSE` events back in
+BeanRegistry. The board uses a fixed schedule table and GPTimer tick, supports
+overlapping plans through per-gate reference counts, validates CRC32 on every
+line, rejects late or excessive pulses, and forces every output low after a
+500 ms communications watchdog timeout.
+
+The 21 active-high indicator outputs are:
+
+```text
+G-10..G+3  -> GPIO1..GPIO14
+G+4..G+6   -> GPIO16..GPIO18
+G+7        -> GPIO21
+G+8..G+10  -> GPIO33..GPIO35
+```
+
+GPIO15 is reserved for the board status LED. GPIO19 and GPIO20 are reserved for
+native USB. Connect each selected GPIO to an LED through its own series resistor
+(1 kΩ is a conservative starting value), then connect the LED cathode to GND.
+These 3.3 V pins must never drive a solenoid or valve directly.
+
+The firmware and build instructions are in
+[`firmware/esp32_s2_actuator`](firmware/esp32_s2_actuator/README.md).
 
 `beano-simulation /recordings/example` is a convenience launcher; each button
 still creates an independent operating-system process. The launcher adopts a
 healthy registry that is already serving the selected database. It blocks
 startup when a different database is using the endpoint, or when an old
-registry owns the database or endpoint but is not answering. This remains safe
+registry owns the database or endpoint but is not answering. A responsive older
+Registry is labelled as compatibility mode; the inferencer automatically uses
+its original atomic batch-completion operation. This remains safe
 after closing and reopening the launcher, even though its components
 deliberately survive closing the launcher window. Its default **Performance
 mode** suppresses registry event printing and starts with monitor polling, crop
@@ -131,6 +182,8 @@ outcomes. See [simulation.md](docs/simulation.md#repeatable-performance-matrix)
 for the reference command and current results. Pass
 `--no-adaptive-edge-resize` to reproduce the BeanoFlight simulation
 checkbox-off crop policy while holding the other benchmark settings fixed.
+Pass `--esp32-actuator` to include the connected indicator board and require
+observed hardware cycles in the acceptance result.
 
 See [simulation.md](docs/simulation.md) for the data flow, crop policy, clock
 contract and operating sequence.
@@ -161,8 +214,11 @@ width, height, centroids and bounding boxes are still reported in native image
 pixels, and inspector masks are enlarged to the native display size without
 smoothing so individual processing pixels remain visible.
 
-Use **Use current frame as background** on a genuinely empty frame, or choose
-**Choose 3 empty frames for background**. The guided selector presents frames
+Enter three zero-based indices in **Background frames** and choose **Build
+entered frames**, or use **Choose 3 empty frames for background**. The field
+defaults to `43,222,347`; Simulation validates and uses those entered frames
+even if a single temporary Review background was selected earlier. The guided
+selector presents frames
 chosen randomly within three evenly distributed sections of the recording,
 followed by replacement passes when a candidate contains foreground. Mark each
 candidate empty or containing foreground; only human-confirmed empty frames

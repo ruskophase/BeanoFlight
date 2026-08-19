@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from .classification import (
+    CLASSIFICATION_DECISION_BASIS,
+    CLASSIFICATION_POOLED,
+    LEGACY_CLASSIFICATION,
+)
 from .registry_models import BeanRecord
 from .telemetry import summarize_samples
 
@@ -13,7 +18,39 @@ SHADOW_NOTICE_STEPS_MS = (5, 10, 15, 20, 25, 30, 50)
 def bean_timing_ledger(record: BeanRecord) -> dict[str, object]:
     """Materialize one auditable ledger from timestamps already on the record."""
 
-    job = record.inference_jobs[0] if record.inference_jobs else None
+    classification = next(
+        (
+            enrichment
+            for enrichment in reversed(record.enrichments)
+            if enrichment.kind == CLASSIFICATION_DECISION_BASIS
+        ),
+        None,
+    )
+    if classification is None:
+        classification = next(
+            (
+                enrichment
+                for enrichment in reversed(record.enrichments)
+                if enrichment.kind
+                in {CLASSIFICATION_POOLED, LEGACY_CLASSIFICATION}
+            ),
+            None,
+        )
+    member_ids: set[str] = set()
+    if classification is not None and isinstance(classification.value, dict):
+        ensemble = classification.value.get("ensemble")
+        if isinstance(ensemble, dict):
+            member_ids = {
+                str(item) for item in ensemble.get("member_result_ids", ())
+            }
+    member_jobs = tuple(
+        job for job in record.inference_jobs if job.job_id in member_ids
+    )
+    job = (
+        max(member_jobs, key=lambda item: item.updated_timestamp_ns)
+        if member_jobs
+        else (record.inference_jobs[0] if record.inference_jobs else None)
+    )
     decision = record.decision
     marks: dict[str, int] = {}
     if job is not None:
@@ -28,14 +65,6 @@ def bean_timing_ledger(record: BeanRecord) -> dict[str, object]:
         marks,
         "first_detection_source_ns",
         "crop_capture_source_ns",
-    )
-    classification = next(
-        (
-            enrichment
-            for enrichment in reversed(record.enrichments)
-            if enrichment.kind == "classification"
-        ),
-        None,
     )
     if classification is not None:
         first_detection = marks.get("first_detection_source_ns")
@@ -91,11 +120,58 @@ def bean_timing_ledger(record: BeanRecord) -> dict[str, object]:
     )
     _duration(
         durations,
+        "inference_result_publish_queue_ms",
+        marks,
+        "inference_completed_monotonic_ns",
+        "registry_classification_request_monotonic_ns",
+    )
+    _duration(
+        durations,
         "inference_complete_to_sorter_ms",
         marks,
         "inference_completed_monotonic_ns",
         "sorter_event_received_monotonic_ns",
     )
+    if marks.get("classification_direct_path", 0):
+        _duration(
+            durations,
+            "inference_complete_to_direct_send_ms",
+            marks,
+            "inference_completed_monotonic_ns",
+            "direct_result_send_monotonic_ns",
+        )
+        _duration(
+            durations,
+            "direct_send_to_sorter_ms",
+            marks,
+            "direct_result_send_monotonic_ns",
+            "sorter_direct_received_monotonic_ns",
+        )
+        _duration(
+            durations,
+            "direct_receive_to_decision_ms",
+            marks,
+            "sorter_direct_received_monotonic_ns",
+            "sorter_decision_started_monotonic_ns",
+        )
+    if marks.get("sorting_context_direct_path", 0):
+        _duration(
+            durations,
+            "context_receive_to_decision_ms",
+            marks,
+            "sorter_context_received_monotonic_ns",
+            "sorter_decision_started_monotonic_ns",
+        )
+    if decision is not None and record.actuation is not None:
+        durations["actuator_open_lateness_ms"] = (
+            record.actuation.actual_open_timestamp_ns
+            - decision.actuation_timestamp_ns
+        ) / 1_000_000.0
+        close_target = decision.close_timestamp_ns
+        if close_target is not None:
+            durations["actuator_close_lateness_ms"] = (
+                record.actuation.actual_close_timestamp_ns - close_target
+            ) / 1_000_000.0
 
     reason = "" if decision is None else decision.reason
     late_by_ns = max(0, marks.get("additional_notice_required_ns", 0))
@@ -103,6 +179,8 @@ def bean_timing_ledger(record: BeanRecord) -> dict[str, object]:
     if decision is not None:
         if "too late" in reason:
             result = "too_late"
+        elif "below confidence threshold" in reason:
+            result = "low_confidence_defect"
         elif "no gate" in reason:
             result = "no_gate"
         elif decision.gate_indices:
@@ -125,12 +203,45 @@ def bean_timing_ledger(record: BeanRecord) -> dict[str, object]:
             ]
         ),
         "resized_crop": False if job is None else job.resized,
+        "classification": _classification_details(classification),
+        "classification_delivery": (
+            "direct"
+            if marks.get("classification_direct_path", 0)
+            else "registry"
+        ),
+        "sorting_context_delivery": (
+            "direct"
+            if marks.get("sorting_context_direct_path", 0)
+            else "registry"
+        ),
         "gate_indices": [] if decision is None else list(decision.gate_indices),
         "available_notice_ms": marks.get("available_notice_ns", 0) / 1_000_000.0,
         "late_by_ms": late_by_ns / 1_000_000.0,
         "equivalent_line_extension_mm": _line_extension_mm(record, late_by_ns),
         "durations_ms": durations,
         "marks_ns": marks,
+    }
+
+
+def _classification_details(classification) -> dict[str, object]:
+    if classification is None:
+        return {
+            "kind": "",
+            "sample_count": 0,
+            "expected_samples": 0,
+            "deadline_fallback": False,
+            "pooling_method": "",
+        }
+    value = classification.value
+    ensemble = value.get("ensemble", {}) if isinstance(value, dict) else {}
+    if not isinstance(ensemble, dict):
+        ensemble = {}
+    return {
+        "kind": classification.kind,
+        "sample_count": int(ensemble.get("sample_count", 1)),
+        "expected_samples": int(ensemble.get("expected_samples", 1)),
+        "deadline_fallback": bool(ensemble.get("deadline_fallback", False)),
+        "pooling_method": str(ensemble.get("pooling_method", "legacy")),
     }
 
 
@@ -162,6 +273,7 @@ def summarize_timing_ledgers(
                 "scheduled",
                 "too_late",
                 "no_gate",
+                "low_confidence_defect",
                 "not_required",
                 "awaiting_decision",
             )
@@ -171,6 +283,29 @@ def summarize_timing_ledgers(
         "shadow_recovered_with_extra_notice": {
             str(extra_ms): sum(float(item["late_by_ms"]) <= extra_ms for item in late)
             for extra_ms in SHADOW_NOTICE_STEPS_MS
+        },
+        "classification_pooling": {
+            "complete_pools": sum(
+                item["classification"]["kind"]
+                in {CLASSIFICATION_POOLED, CLASSIFICATION_DECISION_BASIS}
+                and not item["classification"]["deadline_fallback"]
+                for item in ledgers
+            ),
+            "deadline_fallbacks": sum(
+                bool(item["classification"]["deadline_fallback"])
+                for item in ledgers
+            ),
+            "legacy_results": sum(
+                item["classification"]["kind"] == LEGACY_CLASSIFICATION
+                for item in ledgers
+            ),
+            "direct_decisions": sum(
+                item["classification_delivery"] == "direct" for item in ledgers
+            ),
+            "registry_recovery_decisions": sum(
+                item["classification_delivery"] == "registry"
+                for item in ledgers
+            ),
         },
         "durations_ms": {
             name: summarize_samples(

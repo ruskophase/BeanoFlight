@@ -4,6 +4,10 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from beanoflight.classification import (
+    CLASSIFICATION_EVIDENCE,
+    CLASSIFICATION_POOLED,
+)
 from beanoflight.models import (
     BeanRef,
     Detection,
@@ -71,6 +75,137 @@ def track(
 
 
 class BeanRegistryTests(unittest.TestCase):
+    def test_second_inference_atomically_materializes_mean_probability_pool(self):
+        registry = BeanRegistry()
+        bean_ref = BeanRef("ensemble-run", 1)
+        registry.update_track(track(bean_ref, 0, 100, -25.0))
+        jobs = tuple(
+            InferenceJob(
+                f"job-{index}",
+                bean_ref,
+                InferenceStatus.SUBMITTED,
+                "CamL",
+                index,
+                100 + index,
+                1,
+                224,
+                224,
+                False,
+                100 + index,
+                100 + index,
+            )
+            for index in (1, 2)
+        )
+        for job in jobs:
+            registry.submit_inference_job(job)
+
+        def result(index, probabilities):
+            classes = ("acceptable", "insect_damage", "mould", "broken")
+            winner = max(range(len(classes)), key=probabilities.__getitem__)
+            return Enrichment(
+                "mock",
+                CLASSIFICATION_EVIDENCE,
+                {
+                    "category": classes[winner],
+                    "class_order": list(classes),
+                    "probabilities": list(probabilities),
+                    "ensemble": {
+                        "id": "ensemble-run:1:model",
+                        "sample_index": index,
+                        "expected_samples": 2,
+                    },
+                },
+                110 + index,
+                result_id=f"job-{index}",
+                confidence=probabilities[winner],
+            )
+
+        first = registry.complete_inference_job(
+            bean_ref,
+            "job-1",
+            result(1, (0.51, 0.01, 0.47, 0.01)),
+        )
+        self.assertFalse(
+            any(item.kind == CLASSIFICATION_POOLED for item in first.enrichments)
+        )
+
+        second = registry.complete_inference_job(
+            bean_ref,
+            "job-2",
+            result(2, (0.01, 0.51, 0.47, 0.01)),
+        )
+        pooled = next(
+            item
+            for item in second.enrichments
+            if item.kind == CLASSIFICATION_POOLED
+        )
+        self.assertEqual(pooled.value["category"], "mould")
+        self.assertAlmostEqual(pooled.confidence, 0.47)
+        self.assertEqual(pooled.value["ensemble"]["sample_count"], 2)
+
+    def test_frame_jobs_and_result_batches_are_atomic(self):
+        registry = BeanRegistry()
+        first_ref = BeanRef("batch-run", 1)
+        second_ref = BeanRef("batch-run", 2)
+        first_job = InferenceJob(
+            "job-1",
+            first_ref,
+            InferenceStatus.SUBMITTED,
+            "CamL",
+            0,
+            100,
+            1,
+            224,
+            224,
+            False,
+            100,
+            100,
+        )
+
+        with self.assertRaises(BeanNotFoundError):
+            registry.update_frame_and_submit_jobs(
+                ((track(first_ref, 0, 100, -25.0), None, "track-1"),),
+                ((replace(first_job, bean_ref=second_ref), "job-missing"),),
+            )
+        with self.assertRaises(BeanNotFoundError):
+            registry.get(first_ref)
+
+        revisions, jobs = registry.update_frame_and_submit_jobs(
+            (
+                (track(first_ref, 0, 100, -25.0), None, "track-1"),
+                (track(second_ref, 0, 100, -24.0), None, "track-2"),
+            ),
+            (
+                (first_job, "job-1"),
+                (replace(first_job, job_id="job-1-right", camera_id="CamR"), "job-1-right"),
+                (replace(first_job, job_id="job-2", bean_ref=second_ref), "job-2"),
+            ),
+        )
+        self.assertEqual(revisions, {first_ref: 1, second_ref: 1})
+        self.assertEqual([job.source_registry_revision for job in jobs], [1, 1, 1])
+
+        first_result = Enrichment(
+            "mock", "classification", {"category": "mould"}, 120,
+            result_id="job-1", confidence=0.9,
+        )
+        with self.assertRaises(RegistryConflictError):
+            registry.complete_inference_jobs(
+                (
+                    (first_ref, "job-1", first_result, {}, "complete:job-1"),
+                    (
+                        second_ref,
+                        "unknown-job",
+                        replace(first_result, result_id="unknown-job"),
+                        {},
+                        "complete:unknown-job",
+                    ),
+                )
+            )
+        self.assertEqual(
+            registry.get(first_ref).inference_jobs[0].status,
+            InferenceStatus.SUBMITTED,
+        )
+
     def test_run_clock_inference_job_and_actuation_contract(self):
         registry = BeanRegistry()
         bean_ref = BeanRef("simulation-run", 1)
@@ -432,6 +567,53 @@ class SQLiteRegistryTests(unittest.TestCase):
                     self.assertEqual(
                         connection.execute("PRAGMA user_version").fetchone()[0], 3
                     )
+
+    def test_schema_two_is_migrated_in_place(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "version-two.db"
+            with SQLiteBeanRepository(path):
+                pass
+            with sqlite3.connect(path) as connection:
+                connection.execute(
+                    "ALTER TABLE sorting_decisions DROP COLUMN timing_marks_json"
+                )
+                for name in (
+                    "source_crop_width_px",
+                    "source_crop_height_px",
+                    "resized",
+                    "timing_marks_json",
+                ):
+                    connection.execute(
+                        f"ALTER TABLE inference_jobs DROP COLUMN {name}"
+                    )
+                connection.execute("PRAGMA user_version=2")
+
+            with SQLiteBeanRepository(path):
+                pass
+
+            with sqlite3.connect(path) as connection:
+                self.assertEqual(
+                    connection.execute("PRAGMA user_version").fetchone()[0], 3
+                )
+                decision_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(sorting_decisions)"
+                    )
+                }
+                inference_columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(inference_jobs)")
+                }
+            self.assertIn("timing_marks_json", decision_columns)
+            self.assertTrue(
+                {
+                    "source_crop_width_px",
+                    "source_crop_height_px",
+                    "resized",
+                    "timing_marks_json",
+                }.issubset(inference_columns)
+            )
 
     def test_session_and_async_state_survive_restart(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -9,13 +9,23 @@ import random
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from .classification import CLASSIFICATION_EVIDENCE
+from .classification_transport import (
+    DEFAULT_DIRECT_EVIDENCE_ENDPOINT,
+    DirectInferenceEvidence,
+    ZeroMQDirectEvidencePublisher,
+)
 from .crop import CropPayload
 from .inference_transport import DEFAULT_CROP_ENDPOINT, ZeroMQCropReceiver
 from .registry_models import Enrichment, InferenceJob, InferenceStatus
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
-from .registry_zmq import ZeroMQRegistryClient
+from .registry_zmq import (
+    CAPABILITY_COMPLETE_INFERENCE_JOBS_ACK,
+    RegistryRemoteError,
+    ZeroMQRegistryClient,
+)
 
 # Conservative TensorRT FP16 estimates for a shared ResNet18 backbone receiving
 # two views per bean. The x axis is the number of images in one GPU batch.
@@ -168,10 +178,27 @@ class _QueuedInference:
     accepted_monotonic_ns: int
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, order=True)
 class _QueuedBatch:
+    priority_deadline_ns: int
+    arrival_order: int
+    items: tuple[_QueuedInference, ...] = field(compare=False)
+    batch_id: str = field(compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedBatch:
     items: tuple[_QueuedInference, ...]
     batch_id: str
+    batch_started_ns: int
+    batch_ready_ns: int
+    delay_ms: float
+    image_count: int
+    queue_times_ms: tuple[float, ...]
+    service_times_ms: tuple[float, ...]
+    deadline_misses: tuple[bool, ...]
+    tail: bool
+    failure: str = ""
 
 
 class MockInferencerService:
@@ -182,17 +209,23 @@ class MockInferencerService:
         *,
         registry_endpoint: str = DEFAULT_COMMAND_ENDPOINT,
         crop_endpoint: str = DEFAULT_CROP_ENDPOINT,
+        classification_endpoint: str = DEFAULT_DIRECT_EVIDENCE_ENDPOINT,
         settings: MockInferenceSettings | None = None,
         activity: Callable[[MockInferenceActivity], None] | None = None,
     ) -> None:
         self.registry_endpoint = registry_endpoint
         self.crop_endpoint = crop_endpoint
+        self.classification_endpoint = classification_endpoint
         self.settings = settings or MockInferenceSettings()
         self.settings.validate()
         self.activity = activity
-        self._queue: queue.Queue[_QueuedBatch] = queue.Queue(
+        self._queue: queue.PriorityQueue[_QueuedBatch] = queue.PriorityQueue(
             maxsize=self.settings.queue_capacity
         )
+        self._results: queue.Queue[_CompletedBatch] = queue.Queue(
+            maxsize=self.settings.queue_capacity
+        )
+        self._arrival_order = 0
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._stats_lock = threading.Lock()
@@ -200,6 +233,8 @@ class MockInferencerService:
         self._total_batch_beans = 0
         self._total_queue_ms = 0.0
         self._total_service_ms = 0.0
+        self._sessions = {}
+        self._registry_capabilities: frozenset[str] | None = None
         self.ready = threading.Event()
         self.received = 0
         self.completed = 0
@@ -207,6 +242,11 @@ class MockInferencerService:
         self.batches = 0
         self.tail_batches = 0
         self.deadline_misses = 0
+        self.direct_batches_sent = 0
+        self.direct_batches_dropped = 0
+        self.direct_evidence_sent = 0
+        self.direct_evidence_dropped = 0
+        self.registry_completion_retries = 0
         self.last_batch_size = 0
         self.max_batch_size = 0
         self.last_batch_latency_ms = 0.0
@@ -225,13 +265,20 @@ class MockInferencerService:
             name="beano-mock-inferencer-gpu",
             daemon=True,
         )
-        self._threads.extend((receiver, worker))
+        publisher = threading.Thread(
+            target=self._result_loop,
+            name="beano-mock-inferencer-results",
+            daemon=True,
+        )
+        self._threads.extend((receiver, worker, publisher))
         receiver.start()
         worker.start()
+        publisher.start()
 
     def close(self, *, drain: bool = True) -> None:
         if drain:
             self._queue.join()
+            self._results.join()
         self._stop.set()
         for thread in self._threads:
             thread.join(2.0)
@@ -246,9 +293,15 @@ class MockInferencerService:
                 "dropped": self.dropped,
                 "queued": self._queued_beans,
                 "queued_batches": self._queue.qsize(),
+                "results_pending": self._results.qsize(),
                 "batches": batches,
                 "tail_batches": self.tail_batches,
                 "deadline_misses": self.deadline_misses,
+                "direct_batches_sent": self.direct_batches_sent,
+                "direct_batches_dropped": self.direct_batches_dropped,
+                "direct_evidence_sent": self.direct_evidence_sent,
+                "direct_evidence_dropped": self.direct_evidence_dropped,
+                "registry_completion_retries": self.registry_completion_retries,
                 "last_batch_size": self.last_batch_size,
                 "max_batch_size": self.max_batch_size,
                 "last_batch_latency_ms": self.last_batch_latency_ms,
@@ -300,7 +353,14 @@ class MockInferencerService:
                 )
             return False
         accepted_ns = time.monotonic_ns()
+        self._arrival_order += 1
         queued = _QueuedBatch(
+            _batch_priority_deadline_ns(
+                payloads,
+                accepted_ns,
+                self.settings.result_deadline_ms,
+            ),
+            self._arrival_order,
             tuple(_QueuedInference(payload, accepted_ns) for payload in payloads),
             _frame_batch_id(payloads),
         )
@@ -320,28 +380,50 @@ class MockInferencerService:
         return True
 
     def _worker_loop(self) -> None:
+        while not self._stop.is_set() or not self._queue.empty():
+            try:
+                queued = self._queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            with self._stats_lock:
+                self._queued_beans -= len(queued.items)
+            try:
+                completed = self._process_batch(queued.items, queued.batch_id)
+                self._results.put(completed)
+            finally:
+                self._queue.task_done()
+
+    def _result_loop(self) -> None:
         registry = ZeroMQRegistryClient(self.registry_endpoint, timeout_ms=2_000)
+        direct = (
+            ZeroMQDirectEvidencePublisher(self.classification_endpoint)
+            if self.classification_endpoint
+            else None
+        )
         try:
-            while not self._stop.is_set() or not self._queue.empty():
+            try:
+                self._registry_capabilities = _registry_capabilities(registry)
+            except Exception:  # noqa: BLE001 - retry on the first result batch
+                self._registry_capabilities = None
+            while not self._stop.is_set() or not self._results.empty():
                 try:
-                    queued = self._queue.get(timeout=0.05)
+                    completed = self._results.get(timeout=0.05)
                 except queue.Empty:
                     continue
-                with self._stats_lock:
-                    self._queued_beans -= len(queued.items)
                 try:
-                    self._process_batch(queued.items, queued.batch_id, registry)
+                    self._publish_completed_batch(completed, registry, direct)
                 finally:
-                    self._queue.task_done()
+                    self._results.task_done()
         finally:
+            if direct is not None:
+                direct.close()
             registry.close()
 
     def _process_batch(
         self,
         batch: tuple[_QueuedInference, ...],
         batch_id: str,
-        registry: ZeroMQRegistryClient,
-    ) -> None:
+    ) -> _CompletedBatch:
         batch_started_ns = time.monotonic_ns()
         job_ids = tuple(_stable_batch_job_key(item.payload.job) for item in batch)
         batch_randomizer = _batch_randomizer(
@@ -393,9 +475,28 @@ class MockInferencerService:
             ),
         )
         if self._stop.wait(delay_ms / 1_000.0):
-            for item in batch:
-                self._mark_failed(item.payload, "mock inferencer stopped")
-            return
+            stopped_ns = time.monotonic_ns()
+            queue_times_ms = tuple(
+                (batch_started_ns - item.accepted_monotonic_ns) / 1_000_000.0
+                for item in batch
+            )
+            service_times_ms = tuple(
+                (stopped_ns - item.accepted_monotonic_ns) / 1_000_000.0
+                for item in batch
+            )
+            return _CompletedBatch(
+                batch,
+                batch_id,
+                batch_started_ns,
+                stopped_ns,
+                delay_ms,
+                image_count,
+                queue_times_ms,
+                service_times_ms,
+                tuple(False for _item in batch),
+                tail,
+                "mock inferencer stopped",
+            )
 
         batch_ready_ns = time.monotonic_ns()
         service_times_ms = tuple(
@@ -410,83 +511,201 @@ class MockInferencerService:
             self._total_service_ms += sum(service_times_ms)
             self.deadline_misses += sum(deadline_misses)
 
-        sessions = {}
+        return _CompletedBatch(
+            batch,
+            batch_id,
+            batch_started_ns,
+            batch_ready_ns,
+            delay_ms,
+            image_count,
+            queue_times_ms,
+            service_times_ms,
+            deadline_misses,
+            tail,
+        )
+
+    def _publish_completed_batch(
+        self,
+        completed: _CompletedBatch,
+        registry: ZeroMQRegistryClient,
+        direct: ZeroMQDirectEvidencePublisher | None = None,
+    ) -> None:
+        batch = completed.items
+        batch_id = completed.batch_id
+        batch_started_ns = completed.batch_started_ns
+        batch_ready_ns = completed.batch_ready_ns
+        delay_ms = completed.delay_ms
+        image_count = completed.image_count
+        queue_times_ms = completed.queue_times_ms
+        service_times_ms = completed.service_times_ms
+        deadline_misses = completed.deadline_misses
+        tail = completed.tail
+        if completed.failure:
+            for item in batch:
+                self._mark_failed(
+                    item.payload,
+                    completed.failure,
+                    registry=registry,
+                )
+            return
+
+        completions = []
+        direct_items = []
+        results = []
+        completion_request_ns = time.monotonic_ns()
         for item, queue_ms, service_ms, deadline_missed in zip(
             batch, queue_times_ms, service_times_ms, deadline_misses
         ):
             payload = item.payload
-            try:
-                randomizer = _job_randomizer(
-                    self.settings.seed,
-                    _stable_job_key(payload.job),
-                )
-                category = randomizer.choices(
-                    self.settings.categories,
-                    weights=self.settings.weights,
-                    k=1,
-                )[0]
-                confidence = randomizer.uniform(
-                    self.settings.confidence_min,
-                    self.settings.confidence_max,
-                )
-                run_id = payload.job.bean_ref.run_id
-                session = sessions.get(run_id)
+            bean_randomizer = _job_randomizer(
+                self.settings.seed,
+                _stable_job_key(payload.job),
+            )
+            category = bean_randomizer.choices(
+                self.settings.categories,
+                weights=self.settings.weights,
+                k=1,
+            )[0]
+            sample_index = _job_sample_index(payload.job)
+            sample_randomizer = _job_randomizer(
+                self.settings.seed,
+                _stable_sample_job_key(payload.job, sample_index),
+            )
+            confidence = sample_randomizer.uniform(
+                self.settings.confidence_min,
+                self.settings.confidence_max,
+            )
+            probabilities = _mock_probability_vector(
+                self.settings.categories,
+                category,
+                confidence,
+                sample_randomizer,
+            )
+            confidence = probabilities[self.settings.categories.index(category)]
+            logits = tuple(math.log(max(value, 1e-12)) for value in probabilities)
+            run_id = payload.job.bean_ref.run_id
+            marks = payload.job.timing_marks_ns
+            expected_samples = int(marks.get("expected_inference_samples", 0))
+            session = self._sessions.get(run_id)
+            if expected_samples <= 0 or not _job_has_run_clock(payload.job):
                 if session is None:
                     session = registry.get_session(run_id)
-                    sessions[run_id] = session
-                result_timestamp = max(
-                    payload.job.capture_timestamp_ns,
-                    session.monotonic_to_source_ns(time.monotonic_ns()),
-                )
-                enrichment = Enrichment(
-                    source="mock-inferencer",
-                    kind="classification",
-                    value={
-                        "category": category,
-                        "job_id": payload.job.job_id,
-                        "inference": {
-                            "profile": "resnet18-stereo-fp16-conservative-v1",
-                            "input_mode": "logical_stereo",
-                            "transported_camera": payload.job.camera_id,
-                            "transported_views": 1,
-                            "stereo_pair_complete": False,
-                            "logical_views": self.settings.views_per_bean,
-                            "batch_id": batch_id,
-                            "batch_beans": len(batch),
-                            "batch_images": image_count,
-                            "batch_latency_ms": delay_ms,
-                            "queue_ms": queue_ms,
-                            "service_latency_ms": service_ms,
-                            "result_deadline_ms": self.settings.result_deadline_ms,
-                            "deadline_missed": deadline_missed,
-                            "tail_latency": tail,
-                        },
+                    self._sessions[run_id] = session
+                if expected_samples <= 0:
+                    expected_samples = int(
+                        getattr(session, "settings", {}).get("crops_per_bean")
+                        or 1
+                    )
+            expected_samples = max(1, min(5, expected_samples))
+            ensemble_id = (
+                f"{payload.job.bean_ref.run_id}:"
+                f"{payload.job.bean_ref.sequence}:mock-resnet18-stereo-v3"
+            )
+            result_timestamp = max(
+                payload.job.capture_timestamp_ns,
+                _job_monotonic_to_source_ns(
+                    payload.job,
+                    completion_request_ns,
+                    fallback_session=session,
+                ),
+            )
+            enrichment = Enrichment(
+                source="mock-inferencer",
+                kind=CLASSIFICATION_EVIDENCE,
+                value={
+                    "category": category,
+                    "class_order": list(self.settings.categories),
+                    "probabilities": list(probabilities),
+                    "logits": list(logits),
+                    "job_id": payload.job.job_id,
+                    "ensemble": {
+                        "id": ensemble_id,
+                        "sample_index": sample_index,
+                        "expected_samples": expected_samples,
                     },
-                    timestamp_ns=result_timestamp,
-                    version="mock-resnet18-stereo-v2",
-                    result_id=payload.job.job_id,
-                    confidence=confidence,
-                )
-                completion_request_ns = time.monotonic_ns()
-                registry.complete_inference_job(
+                    "inference": {
+                        "profile": "resnet18-stereo-fp16-conservative-v1",
+                        "input_mode": "logical_stereo",
+                        "transported_camera": payload.job.camera_id,
+                        "transported_views": 1,
+                        "stereo_pair_complete": False,
+                        "logical_views": self.settings.views_per_bean,
+                        "batch_id": batch_id,
+                        "batch_beans": len(batch),
+                        "batch_images": image_count,
+                        "batch_latency_ms": delay_ms,
+                        "queue_ms": queue_ms,
+                        "service_latency_ms": service_ms,
+                        "result_deadline_ms": self.settings.result_deadline_ms,
+                        "deadline_missed": deadline_missed,
+                        "tail_latency": tail,
+                    },
+                },
+                timestamp_ns=result_timestamp,
+                version="mock-resnet18-stereo-v3",
+                result_id=payload.job.job_id,
+                confidence=confidence,
+            )
+            timing_marks = {
+                **payload.job.timing_marks_ns,
+                "inference_received_monotonic_ns": item.accepted_monotonic_ns,
+                "inference_started_monotonic_ns": batch_started_ns,
+                "inference_completed_monotonic_ns": batch_ready_ns,
+                "registry_classification_request_monotonic_ns": (
+                    completion_request_ns
+                ),
+            }
+            completions.append(
+                (
                     payload.job.bean_ref,
                     payload.job.job_id,
                     enrichment,
-                    timing_marks_ns={
-                        **payload.job.timing_marks_ns,
-                        "inference_received_monotonic_ns": (
-                            item.accepted_monotonic_ns
-                        ),
-                        "inference_started_monotonic_ns": batch_started_ns,
-                        "inference_completed_monotonic_ns": batch_ready_ns,
-                        "registry_classification_request_monotonic_ns": (
-                            completion_request_ns
-                        ),
-                    },
-                    event_id=f"complete:{payload.job.job_id}",
+                    timing_marks,
+                    f"complete:{payload.job.job_id}",
                 )
-                with self._stats_lock:
-                    self.completed += 1
+            )
+            direct_items.append(DirectInferenceEvidence(payload.job, enrichment))
+            results.append(
+                (payload, category, confidence, queue_ms, service_ms, deadline_missed)
+            )
+        if direct is not None:
+            try:
+                sent, direct_sent_ns = direct.send_batch(
+                    batch_id, tuple(direct_items)
+                )
+            except Exception as exc:  # noqa: BLE001 - Registry remains recovery path
+                sent = False
+                direct_sent_ns = time.monotonic_ns()
+                self._emit("error", detail=f"direct evidence: {exc}")
+            with self._stats_lock:
+                if sent:
+                    self.direct_batches_sent += 1
+                    self.direct_evidence_sent += len(direct_items)
+                else:
+                    self.direct_batches_dropped += 1
+                    self.direct_evidence_dropped += len(direct_items)
+            if sent:
+                for _bean_ref, _job_id, _enrichment, marks, _event_id in completions:
+                    marks["direct_result_send_monotonic_ns"] = direct_sent_ns
+        try:
+            if self._registry_capabilities is None:
+                self._registry_capabilities = _registry_capabilities(registry)
+            retries = _complete_inference_batch_with_registration_retry(
+                registry,
+                tuple(completions),
+                self._registry_capabilities,
+            )
+            with self._stats_lock:
+                self.completed += len(results)
+                self.registry_completion_retries += retries
+            for (
+                payload,
+                category,
+                confidence,
+                queue_ms,
+                service_ms,
+                deadline_missed,
+            ) in results:
                 self._emit(
                     "completed",
                     payload,
@@ -506,9 +725,10 @@ class MockInferencerService:
                         + (" · SLA MISS" if deadline_missed else "")
                     ),
                 )
-            except Exception as exc:  # noqa: BLE001 - job failure is observable state
-                with self._stats_lock:
-                    self.dropped += 1
+        except Exception as exc:  # noqa: BLE001 - batch failure is observable state
+            with self._stats_lock:
+                self.dropped += len(results)
+            for payload, *_result in results:
                 self._mark_failed(payload, str(exc), registry=registry)
 
     def _mark_failed(
@@ -579,6 +799,113 @@ class MockInferencerService:
         )
 
 
+def _registry_capabilities(registry) -> frozenset[str]:
+    """Return advertised features; an older Registry advertises none."""
+
+    ping = getattr(registry, "ping", None)
+    if ping is None:
+        return frozenset()
+    response = ping()
+    raw = (response.get("capabilities") or ()) if isinstance(response, dict) else ()
+    return frozenset(str(item) for item in raw)
+
+
+def _job_has_run_clock(job: InferenceJob) -> bool:
+    marks = job.timing_marks_ns
+    return (
+        int(marks.get("run_clock_monotonic_ns", 0)) > 0
+        and int(marks.get("run_clock_scale_ppb", 0)) > 0
+        and "run_clock_source_ns" in marks
+    )
+
+
+def _job_monotonic_to_source_ns(
+    job: InferenceJob,
+    monotonic_ns: int,
+    *,
+    fallback_session=None,
+) -> int:
+    marks = job.timing_marks_ns
+    if _job_has_run_clock(job):
+        source_ns = int(marks["run_clock_source_ns"])
+        clock_ns = int(marks["run_clock_monotonic_ns"])
+        scale_ppb = int(marks["run_clock_scale_ppb"])
+        return source_ns + round(
+            (monotonic_ns - clock_ns) * scale_ppb / 1_000_000_000
+        )
+    if fallback_session is not None:
+        return fallback_session.monotonic_to_source_ns(monotonic_ns)
+    return job.capture_timestamp_ns
+
+
+def _complete_inference_batch_with_registration_retry(
+    registry,
+    completions,
+    capabilities,
+    *,
+    maximum_attempts: int = 8,
+) -> int:
+    """Allow a crop result to race its asynchronous job registration safely."""
+
+    retries = 0
+    while True:
+        try:
+            _complete_inference_batch(registry, completions, capabilities)
+            return retries
+        except Exception as exc:
+            if (
+                retries >= maximum_attempts
+                or "inference job does not exist" not in str(exc).lower()
+            ):
+                raise
+            # Registration normally trails crop delivery by only a few ms.  The
+            # direct evidence has already reached the sorter; this bounded retry
+            # is solely for durable audit completion and never delays actuation.
+            time.sleep(min(0.025, 0.001 * (2**retries)))
+            retries += 1
+
+
+def _complete_inference_batch(registry, completions, capabilities) -> None:
+    """Use the fastest remotely supported completion contract with safe fallback."""
+
+    complete_ack = getattr(registry, "complete_inference_jobs_ack", None)
+    if (
+        CAPABILITY_COMPLETE_INFERENCE_JOBS_ACK in capabilities
+        and complete_ack is not None
+    ):
+        try:
+            complete_ack(completions)
+            return
+        except RegistryRemoteError as exc:
+            if not _is_unknown_operation(exc, "complete_inference_jobs_ack"):
+                raise
+
+    complete_many = getattr(registry, "complete_inference_jobs", None)
+    if complete_many is not None:
+        try:
+            complete_many(completions)
+            return
+        except RegistryRemoteError as exc:
+            if not _is_unknown_operation(exc, "complete_inference_jobs"):
+                raise
+
+    for bean_ref, job_id, enrichment, timing_marks, event_id in completions:
+        registry.complete_inference_job(
+            bean_ref,
+            job_id,
+            enrichment,
+            timing_marks_ns=timing_marks,
+            event_id=event_id,
+        )
+
+
+def _is_unknown_operation(exc: RegistryRemoteError, operation: str) -> bool:
+    return (
+        exc.error_type == "ValueError"
+        and f"unknown registry operation: {operation}" in exc.remote_message
+    )
+
+
 def _job_randomizer(seed: int, job_id: str) -> random.Random:
     digest = hashlib.sha256(f"{seed}:{job_id}".encode()).digest()
     return random.Random(int.from_bytes(digest[:8], "big"))
@@ -597,6 +924,72 @@ def _stable_batch_job_key(job: InferenceJob) -> str:
 
 def _stable_job_key(job: InferenceJob) -> str:
     return f"{job.camera_id}:{job.bean_ref.sequence}"
+
+
+def _stable_sample_job_key(job: InferenceJob, sample_index: int) -> str:
+    return f"{_stable_job_key(job)}:sample:{sample_index}"
+
+
+def _job_sample_index(job: InferenceJob) -> int:
+    try:
+        return int(job.job_id.rsplit(":", 1)[1]) + 1
+    except (IndexError, ValueError):
+        return 1
+
+
+def _mock_probability_vector(
+    categories: tuple[str, ...],
+    category: str,
+    confidence: float,
+    randomizer: random.Random,
+) -> tuple[float, ...]:
+    """Return a complete, deterministic softmax-like mock output."""
+
+    if len(categories) == 1:
+        return (1.0,)
+    winner = categories.index(category)
+    remaining = max(0.0, 1.0 - confidence)
+    shares = [
+        0.05 + randomizer.random() if index != winner else 0.0
+        for index in range(len(categories))
+    ]
+    share_total = sum(shares)
+    probabilities = [remaining * share / share_total for share in shares]
+    probabilities[winner] = confidence
+    # Assign the floating point remainder to the winner so validation can use a
+    # strict probability-sum tolerance after JSON round trips.
+    probabilities[winner] += 1.0 - sum(probabilities)
+    return tuple(probabilities)
+
+
+def _batch_priority_deadline_ns(
+    payloads: tuple[CropPayload, ...],
+    accepted_monotonic_ns: int,
+    fallback_deadline_ms: float,
+) -> int:
+    """Map source-clock crossing estimates onto a comparable local deadline.
+
+    A batch remains one source-frame unit. This key only changes which waiting
+    frame batch runs next when the simulated GPU is already occupied.
+    """
+
+    deadlines = []
+    for payload in payloads:
+        marks = payload.job.timing_marks_ns
+        crossing_source_ns = marks.get(
+            "inference_priority_crossing_source_ns",
+            marks.get("predicted_crossing_source_ns"),
+        )
+        if crossing_source_ns is None:
+            continue
+        remaining_ns = max(
+            0,
+            int(crossing_source_ns) - payload.job.capture_timestamp_ns,
+        )
+        deadlines.append(accepted_monotonic_ns + remaining_ns)
+    if deadlines:
+        return min(deadlines)
+    return accepted_monotonic_ns + round(fallback_deadline_ms * 1_000_000)
 
 
 def _frame_batch_id(payloads: tuple[CropPayload, ...]) -> str:

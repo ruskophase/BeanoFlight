@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .app import BeanoFlightApp
+from .sorting_context_transport import DEFAULT_SORTING_CONTEXT_ENDPOINT
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
             "playback disabled"
         ),
     )
+    parser.add_argument(
+        "--sorting-contexts",
+        default=DEFAULT_SORTING_CONTEXT_ENDPOINT,
+        help="real-time track/prediction context endpoint for BeanoSorter",
+    )
     return parser
 
 
@@ -61,6 +67,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         hole_pitch_mm=args.hole_pitch_mm,
         sorting_offset_mm=args.sorting_offset_mm,
         performance_mode=args.performance_mode,
+        sorting_context_endpoint=args.sorting_contexts,
     )
     app.mainloop()
 
