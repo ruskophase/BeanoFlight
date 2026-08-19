@@ -69,6 +69,27 @@ class FakeRegistry:
         return stored
 
 
+class SlowStartingDispatcher:
+    submitted = 0
+    dropped = 0
+
+    def __init__(self):
+        self.ready_monotonic_ns = 0
+
+    def start(self):
+        time.sleep(0.01)
+        self.ready_monotonic_ns = time.monotonic_ns()
+
+    def enqueue_frame(self, _updates, _payloads):
+        return True
+
+    def close(self, *, drain=True):
+        return None
+
+    def performance_metrics(self):
+        return {}
+
+
 class ReplayBufferTests(unittest.TestCase):
     def test_dispatcher_coalesces_track_only_backlog_through_urgent_crop(self):
         dispatcher = CropDispatcher("inproc://registry", "inproc://crops")
@@ -170,6 +191,33 @@ class ReplayBufferTests(unittest.TestCase):
         self.assertGreater(performance["achieved_fps"], 0)
         self.assertEqual(performance["timings_ms"]["frame_work_ms"]["count"], 3)
         self.assertIn("system", performance)
+
+    def test_replay_clock_starts_after_downstream_workers_are_ready(self):
+        source = FakeSequentialSource(frame_count=1)
+        registry = FakeRegistry(source)
+        dispatcher = SlowStartingDispatcher()
+
+        ReplayRunner(
+            source,
+            FakeEngine(),
+            registry,
+            settings=ReplaySettings(
+                target_fps=0,
+                prebuffer_frames=0,
+                maximum_frames=1,
+            ),
+            crop_dispatcher=dispatcher,
+        ).run()
+
+        running = next(
+            session
+            for session in registry.sessions
+            if session.state == RunState.RUNNING
+        )
+        self.assertGreaterEqual(
+            running.clock_monotonic_ns,
+            dispatcher.ready_monotonic_ns,
+        )
 
     def test_runner_drops_stale_frames_and_reports_source_timeline(self):
         source = FakeSequentialSource(frame_count=6)

@@ -201,6 +201,16 @@ class _CompletedBatch:
     failure: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class _RegistryCompletedBatch:
+    completions: tuple
+    results: tuple
+    batch_id: str
+    delay_ms: float
+    image_count: int
+    tail: bool
+
+
 class MockInferencerService:
     """Model each explicit source-frame crop group as one stereo GPU batch."""
 
@@ -225,8 +235,13 @@ class MockInferencerService:
         self._results: queue.Queue[_CompletedBatch] = queue.Queue(
             maxsize=self.settings.queue_capacity
         )
+        self._registry_results: queue.Queue[_RegistryCompletedBatch] = queue.Queue(
+            maxsize=max(64, self.settings.queue_capacity * 4)
+        )
         self._arrival_order = 0
         self._stop = threading.Event()
+        self._worker_finished = threading.Event()
+        self._publisher_finished = threading.Event()
         self._threads: list[threading.Thread] = []
         self._stats_lock = threading.Lock()
         self._queued_beans = 0
@@ -255,6 +270,8 @@ class MockInferencerService:
     def start(self) -> None:
         if self._threads:
             return
+        self._worker_finished.clear()
+        self._publisher_finished.clear()
         receiver = threading.Thread(
             target=self._receive_loop,
             name="beano-mock-inferencer-receiver",
@@ -270,15 +287,22 @@ class MockInferencerService:
             name="beano-mock-inferencer-results",
             daemon=True,
         )
-        self._threads.extend((receiver, worker, publisher))
+        registry_audit = threading.Thread(
+            target=self._registry_result_loop,
+            name="beano-mock-inferencer-registry-audit",
+            daemon=True,
+        )
+        self._threads.extend((receiver, worker, publisher, registry_audit))
         receiver.start()
         worker.start()
         publisher.start()
+        registry_audit.start()
 
     def close(self, *, drain: bool = True) -> None:
         if drain:
             self._queue.join()
             self._results.join()
+            self._registry_results.join()
         self._stop.set()
         for thread in self._threads:
             thread.join(2.0)
@@ -294,6 +318,7 @@ class MockInferencerService:
                 "queued": self._queued_beans,
                 "queued_batches": self._queue.qsize(),
                 "results_pending": self._results.qsize(),
+                "registry_audits_pending": self._registry_results.qsize(),
                 "batches": batches,
                 "tail_batches": self.tail_batches,
                 "deadline_misses": self.deadline_misses,
@@ -380,18 +405,21 @@ class MockInferencerService:
         return True
 
     def _worker_loop(self) -> None:
-        while not self._stop.is_set() or not self._queue.empty():
-            try:
-                queued = self._queue.get(timeout=0.05)
-            except queue.Empty:
-                continue
-            with self._stats_lock:
-                self._queued_beans -= len(queued.items)
-            try:
-                completed = self._process_batch(queued.items, queued.batch_id)
-                self._results.put(completed)
-            finally:
-                self._queue.task_done()
+        try:
+            while not self._stop.is_set() or not self._queue.empty():
+                try:
+                    queued = self._queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                with self._stats_lock:
+                    self._queued_beans -= len(queued.items)
+                try:
+                    completed = self._process_batch(queued.items, queued.batch_id)
+                    self._results.put(completed)
+                finally:
+                    self._queue.task_done()
+        finally:
+            self._worker_finished.set()
 
     def _result_loop(self) -> None:
         registry = ZeroMQRegistryClient(self.registry_endpoint, timeout_ms=2_000)
@@ -401,11 +429,7 @@ class MockInferencerService:
             else None
         )
         try:
-            try:
-                self._registry_capabilities = _registry_capabilities(registry)
-            except Exception:  # noqa: BLE001 - retry on the first result batch
-                self._registry_capabilities = None
-            while not self._stop.is_set() or not self._results.empty():
+            while not self._worker_finished.is_set() or not self._results.empty():
                 try:
                     completed = self._results.get(timeout=0.05)
                 except queue.Empty:
@@ -415,8 +439,31 @@ class MockInferencerService:
                 finally:
                     self._results.task_done()
         finally:
+            self._publisher_finished.set()
             if direct is not None:
                 direct.close()
+            registry.close()
+
+    def _registry_result_loop(self) -> None:
+        registry = ZeroMQRegistryClient(self.registry_endpoint, timeout_ms=2_000)
+        try:
+            try:
+                self._registry_capabilities = _registry_capabilities(registry)
+            except Exception:  # noqa: BLE001 - retry on the first result batch
+                self._registry_capabilities = None
+            while (
+                not self._publisher_finished.is_set()
+                or not self._registry_results.empty()
+            ):
+                try:
+                    completed = self._registry_results.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                try:
+                    self._persist_completed_batch(completed, registry)
+                finally:
+                    self._registry_results.task_done()
+        finally:
             registry.close()
 
     def _process_batch(
@@ -665,8 +712,18 @@ class MockInferencerService:
                 )
             )
             direct_items.append(DirectInferenceEvidence(payload.job, enrichment))
+            # Durable completion does not retain the 224x224 image while it
+            # waits behind Registry work. The direct path has already consumed
+            # all inference output needed for an immediate decision.
             results.append(
-                (payload, category, confidence, queue_ms, service_ms, deadline_missed)
+                (
+                    CropPayload(payload.job, None),
+                    category,
+                    confidence,
+                    queue_ms,
+                    service_ms,
+                    deadline_missed,
+                )
             )
         if direct is not None:
             direct_attempt_ns = time.monotonic_ns()
@@ -700,16 +757,32 @@ class MockInferencerService:
             if sent:
                 for _bean_ref, _job_id, _enrichment, marks, _event_id in completions:
                     marks["direct_result_send_monotonic_ns"] = direct_sent_ns
+        self._registry_results.put(
+            _RegistryCompletedBatch(
+                tuple(completions),
+                tuple(results),
+                batch_id,
+                delay_ms,
+                image_count,
+                tail,
+            )
+        )
+
+    def _persist_completed_batch(
+        self,
+        completed: _RegistryCompletedBatch,
+        registry: ZeroMQRegistryClient,
+    ) -> None:
         try:
             if self._registry_capabilities is None:
                 self._registry_capabilities = _registry_capabilities(registry)
             retries = _complete_inference_batch_with_registration_retry(
                 registry,
-                tuple(completions),
+                completed.completions,
                 self._registry_capabilities,
             )
             with self._stats_lock:
-                self.completed += len(results)
+                self.completed += len(completed.results)
                 self.registry_completion_retries += retries
             for (
                 payload,
@@ -718,30 +791,30 @@ class MockInferencerService:
                 queue_ms,
                 service_ms,
                 deadline_missed,
-            ) in results:
+            ) in completed.results:
                 self._emit(
                     "completed",
                     payload,
                     category=category,
                     confidence=confidence,
-                    batch_id=batch_id,
-                    batch_beans=len(batch),
-                    batch_images=image_count,
-                    batch_latency_ms=delay_ms,
+                    batch_id=completed.batch_id,
+                    batch_beans=len(completed.results),
+                    batch_images=completed.image_count,
+                    batch_latency_ms=completed.delay_ms,
                     queue_ms=queue_ms,
                     service_latency_ms=service_ms,
-                    tail_latency=tail,
+                    tail_latency=completed.tail,
                     deadline_missed=deadline_missed,
                     detail=(
-                        f"{batch_id} · queue {queue_ms:.1f} ms · "
+                        f"{completed.batch_id} · queue {queue_ms:.1f} ms · "
                         f"service {service_ms:.1f} ms"
                         + (" · SLA MISS" if deadline_missed else "")
                     ),
                 )
         except Exception as exc:  # noqa: BLE001 - batch failure is observable state
             with self._stats_lock:
-                self.dropped += len(results)
-            for payload, *_result in results:
+                self.dropped += len(completed.results)
+            for payload, *_result in completed.results:
                 self._mark_failed(payload, str(exc), registry=registry)
 
     def _mark_failed(
@@ -856,7 +929,7 @@ def _complete_inference_batch_with_registration_retry(
     completions,
     capabilities,
     *,
-    maximum_attempts: int = 8,
+    maximum_attempts: int = 20,
 ) -> int:
     """Allow a crop result to race its asynchronous job registration safely."""
 

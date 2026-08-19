@@ -736,6 +736,18 @@ class ReplayRunner:
                 prebuffered_frames, prebuffer_seconds = frame_buffer.prebuffer(
                     cancellation, on_progress=on_prebuffer
                 )
+            if self.crop_dispatcher is not None:
+                self.crop_dispatcher.start()
+            if self.sorting_context_endpoint:
+                sorting_context_publisher = ZeroMQSortingContextPublisher(
+                    self.sorting_context_endpoint
+                )
+            system_telemetry.start()
+            # A live camera timestamp is anchored when its frame becomes
+            # available, not while downstream workers are still starting.
+            # Starting transports and telemetry before this mapping prevents a
+            # fixed startup delay from consuming every bean's inference and
+            # actuator notice budget during recorded replay.
             session = self.registry.put_session(
                 replace(
                     session,
@@ -745,13 +757,6 @@ class ReplayRunner:
                 ),
                 expected_revision=session.revision,
             )
-            if self.crop_dispatcher is not None:
-                self.crop_dispatcher.start()
-            if self.sorting_context_endpoint:
-                sorting_context_publisher = ZeroMQSortingContextPublisher(
-                    self.sorting_context_endpoint
-                )
-            system_telemetry.start()
             started = time.perf_counter()
             next_deadline = started
             index = 0

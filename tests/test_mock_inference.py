@@ -12,6 +12,7 @@ from beanoflight.mock_inference import (
     MockInferenceSettings,
     _batch_priority_deadline_ns,
     _complete_inference_batch,
+    _complete_inference_batch_with_registration_retry,
     _registry_capabilities,
     _stable_job_key,
 )
@@ -118,22 +119,34 @@ class MockInferenceBatchTests(unittest.TestCase):
         ):
             worker = threading.Thread(target=service._worker_loop, daemon=True)
             publisher = threading.Thread(target=service._result_loop, daemon=True)
+            registry_audit = threading.Thread(
+                target=service._registry_result_loop,
+                daemon=True,
+            )
             worker.start()
             publisher.start()
+            registry_audit.start()
             service._queue.join()
             service._results.join()
+            service._registry_results.join()
             service._stop.set()
             worker.join(1.0)
             publisher.join(1.0)
+            registry_audit.join(1.0)
 
         self.assertFalse(worker.is_alive())
         self.assertFalse(publisher.is_alive())
+        self.assertFalse(registry_audit.is_alive())
         stats = service.statistics()
         self.assertEqual(stats["batches"], 1)
         self.assertEqual(stats["completed"], 4)
         self.assertEqual(stats["max_batch_size"], 4)
-        self.assertEqual(len(_RegistryClient.instances), 1)
-        completions = _RegistryClient.instances[0].completions
+        self.assertEqual(len(_RegistryClient.instances), 2)
+        completions = [
+            completion
+            for instance in _RegistryClient.instances
+            for completion in instance.completions
+        ]
         self.assertEqual(len(completions), 4)
         enrichment = completions[0][2]
         self.assertEqual(enrichment.kind, "classification_evidence")
@@ -230,6 +243,28 @@ class MockInferenceBatchTests(unittest.TestCase):
         self.assertEqual(capabilities, frozenset())
         self.assertEqual(registry.ack_calls, 0)
         self.assertEqual(registry.batches, [completions])
+
+    def test_durable_completion_outlasts_a_delayed_job_registration(self):
+        class DelayedRegistry:
+            def __init__(self):
+                self.attempts = 0
+
+            def complete_inference_jobs(self, _completions):
+                self.attempts += 1
+                if self.attempts <= 9:
+                    raise RuntimeError("inference job does not exist")
+
+        registry = DelayedRegistry()
+
+        with patch("beanoflight.mock_inference.time.sleep"):
+            retries = _complete_inference_batch_with_registration_retry(
+                registry,
+                (("bean", "job", "result", {}, "event"),),
+                frozenset(),
+            )
+
+        self.assertEqual(retries, 9)
+        self.assertEqual(registry.attempts, 10)
 
 
 if __name__ == "__main__":
