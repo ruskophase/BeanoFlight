@@ -150,8 +150,8 @@ run, not a statistical timing qualification.
 The subsequent acknowledged-handoff acceptance used two 224 x 224 crops per
 bean and repeated the same 601-frame run three times. All runs passed at a
 minimum 59.999 FPS with no skipped frames or crop drops; mean frame analysis was
-5.30-5.40 ms. All 939 inference jobs settled, and all 471 selected direct
-evidence batches were admitted and positively acknowledged. The ESP32 completed
+5.30-5.40 ms. All 939 inference jobs settled, and all 471 bean-level selected
+evidence deliveries were carried in admitted, positively acknowledged batches. The ESP32 completed
 57, 55 and 55 requested cycles (167 total) with no failure. GPIO open-error p95
 was 0.090-0.096 ms and the maximum was 0.099 ms. This verifies the software
 handoff contract under this workload; it is still not a statistical or
