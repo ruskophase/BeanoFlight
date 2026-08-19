@@ -3,6 +3,8 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 try:
     import zmq
@@ -25,6 +27,36 @@ from beanoflight.registry_sqlite import SQLiteBeanRepository
 
 @unittest.skipIf(zmq is None, "pyzmq is not installed in this interpreter")
 class ZeroMQRegistryTests(unittest.TestCase):
+    def test_compact_actuation_ack_falls_back_to_legacy_operation(self):
+        from beanoflight.registry_zmq import (
+            RegistryRemoteError,
+            ZeroMQRegistryClient,
+        )
+
+        client = ZeroMQRegistryClient("inproc://actuation-compatibility")
+        bean_ref = BeanRef("compatibility-run", 1)
+        result = ActuationResult("decision-1", "actuator", 100, 120, True)
+        try:
+            with (
+                patch.object(
+                    client,
+                    "_request",
+                    side_effect=RegistryRemoteError(
+                        "ValueError",
+                        "unknown registry operation: record_actuation_ack",
+                    ),
+                ),
+                patch.object(
+                    client,
+                    "record_actuation",
+                    return_value=SimpleNamespace(revision=7),
+                ) as legacy,
+            ):
+                self.assertEqual(client.record_actuation_ack(bean_ref, result), 7)
+            legacy.assert_called_once()
+        finally:
+            client.close()
+
     def test_frame_events_share_one_transport_envelope(self):
         from beanoflight.registry_zmq import (
             ZeroMQRegistryClient,

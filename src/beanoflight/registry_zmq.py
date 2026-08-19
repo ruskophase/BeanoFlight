@@ -992,16 +992,28 @@ class ZeroMQRegistryClient:
     ) -> int:
         """Commit an actuation audit without echoing materialized bean state."""
 
-        return int(
-            self._request(
-                "record_actuation_ack",
-                {
-                    "bean_ref": bean_ref_to_dict(bean_ref),
-                    "actuation": actuation_to_dict(result),
-                    "event_id": event_id or f"actuation:{result.decision_id}",
-                },
-            )
-        )
+        payload = {
+            "bean_ref": bean_ref_to_dict(bean_ref),
+            "actuation": actuation_to_dict(result),
+            "event_id": event_id or f"actuation:{result.decision_id}",
+        }
+        try:
+            return int(self._request("record_actuation_ack", payload))
+        except RegistryRemoteError as exc:
+            if not (
+                exc.error_type == "ValueError"
+                and "unknown registry operation: record_actuation_ack"
+                in exc.remote_message
+            ):
+                raise
+            # Rolling upgrades may briefly pair a new actuator with the previous
+            # Registry service. Preserve the durable result while accepting the
+            # larger legacy response until Registry is restarted.
+            return self.record_actuation(
+                bean_ref,
+                result,
+                event_id=str(payload["event_id"]),
+            ).revision
 
     def close(self) -> None:
         if self._socket is not None:
