@@ -35,7 +35,51 @@ class RawReplayTests(unittest.TestCase):
             self.assertEqual(crop.dtype, np.uint8)
             self.assertGreater(float(crop.mean()), 0.0)
             self.assertEqual(source.undistort_point((3.0, 2.0)), (3.0, 2.0))
+            self.assertEqual(
+                source.undistort_points(((3.0, 2.0), (4.0, 5.0))),
+                ((3.0, 2.0), (4.0, 5.0)),
+            )
             source.close()
+
+    def test_ml_fast_crop_is_linear_and_calibrated_reference_remains_available(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_bundle(root)
+            fast = MMapRawVideoSource(root, crop_processing="ml-fast")
+            calibrated = MMapRawVideoSource(root, crop_processing="calibrated")
+            fast_frame = fast.frame(1)
+            calibrated_frame = calibrated.frame(1)
+
+            fast_crop, fast_padded = fast.extract_crop(
+                fast_frame, (4.0, 4.0), 4, allow_padding=False
+            )
+            calibrated_crop, calibrated_padded = calibrated.extract_crop(
+                calibrated_frame, (4.0, 4.0), 4, allow_padding=False
+            )
+
+            self.assertFalse(fast_padded)
+            self.assertFalse(calibrated_padded)
+            self.assertEqual(fast.crop_processing_profile, "ml-fast")
+            self.assertEqual(calibrated.crop_processing_profile, "calibrated")
+            self.assertLess(float(fast_crop.mean()), float(calibrated_crop.mean()))
+            self.assertGreater(
+                float(fast_crop[..., 2].mean()), float(fast_crop[..., 1].mean())
+            )
+            self.assertGreater(
+                float(fast_crop[..., 1].mean()), float(fast_crop[..., 0].mean())
+            )
+            fast.release_frame(fast_frame)
+            calibrated.release_frame(calibrated_frame)
+            fast.close()
+            calibrated.close()
+
+    def test_rejects_unknown_crop_processing_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_bundle(root)
+
+            with self.assertRaisesRegex(SourceError, "RAW crop processing"):
+                MMapRawVideoSource(root, crop_processing="unknown")
 
     def test_resolves_bundle_from_calibrated_derivative(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -121,7 +165,10 @@ class RawReplayTests(unittest.TestCase):
             for index, value in enumerate((100, 500)):
                 relative = Path(f"raw/CamL/frame-{index}.raw")
                 words = np.zeros((8, 10), dtype="<u2")
-                words[:, :8] = value << 4
+                words[0::2, 0:8:2] = value << 4
+                words[0::2, 1:8:2] = (value * 3 // 5) << 4
+                words[1::2, 0:8:2] = (value * 3 // 5) << 4
+                words[1::2, 1:8:2] = (value // 5) << 4
                 (root / relative).write_bytes(words.tobytes())
                 output.writerow(
                     {

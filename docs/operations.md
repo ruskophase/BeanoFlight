@@ -110,13 +110,20 @@ work only and do not stop the corresponding service.
 
 The headless `beano-system-test` requires exactly 3 explicit, visually
 confirmed empty-frame indices and prints a JSON performance summary on
-completion. Add `--optimized-raw` to use the same fast path as the GUI.
+completion. Add `--optimized-raw` to use the same fast path as the GUI. Add
+`--no-adaptive-edge-resize` for a controlled comparison in which inference is
+deferred until the full requested-size crop fits within the frame.
 
 Every completed session stores its achieved FPS, source-read and analysis
 stage distributions, Registry/SQLite operation timings, crop-dispatch queue
 timings, process resource samples, prebuffer time, missed deadlines and crop
 counts in the session `settings.performance` object. These values remain
 available after the BeanoFlight window closes.
+
+An isolated full-pipeline benchmark also reports `outcome.timing_ledger`.
+Inspect `late_by_ms`, `equivalent_line_extension_mm`,
+`shadow_recovered_with_extra_notice`, and the bounded `per_bean` entries before
+changing the physical sorting-line offset or valve timing assumptions.
 
 For a repeatable acceptance matrix which does not depend on manually launched
 GUIs, run:

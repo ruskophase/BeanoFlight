@@ -302,7 +302,7 @@ class MMapRawVideoSource:
 
     source_kind = "raw-mmap-green"
 
-    def __init__(self, bundle: Path) -> None:
+    def __init__(self, bundle: Path, *, crop_processing: str = "ml-fast") -> None:
         root = resolve_raw_bundle(bundle)
         metadata_path = root / "metadata/CamL.csv"
         profile_path = root / "calibration/CamL/profile.json"
@@ -362,12 +362,20 @@ class MMapRawVideoSource:
             1.055 * np.power(linear, 1.0 / 2.4) - 0.055,
         )
         self._detection_lut = np.clip(srgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
-        self._crop_processor = RawCropProcessor(profile_path, profile)
+        self._crop_processor = RawCropProcessor(
+            profile_path, profile, processing_profile=crop_processing
+        )
+        self.crop_processing_profile = self._crop_processor.processing_profile
         self.metadata = SourceMetadata(root, width, height, len(rows), fps, True)
         self.pipeline_metadata = {
             "input": "memory-mapped RG10",
             "detection": f"{width // 2}x{height // 2} sRGB green plane",
-            "colour": "calibrated inference crops only",
+            "colour": (
+                "linear sensor BGR inference crops"
+                if self.crop_processing_profile == "ml-fast"
+                else "calibrated sRGB inference crops"
+            ),
+            "crop_processing": self.crop_processing_profile,
             "pixel_coordinate_domain": "distorted RAW",
             "metric_coordinate_domain": "point-undistorted PinkPlane",
         }
@@ -470,14 +478,21 @@ class MMapRawVideoSource:
         )
 
     def undistort_point(self, point: tuple[float, float]) -> tuple[float, float]:
-        points = np.asarray(point, dtype=np.float64).reshape(1, 1, 2)
+        return self.undistort_points((point,))[0]
+
+    def undistort_points(
+        self, points: tuple[tuple[float, float], ...]
+    ) -> tuple[tuple[float, float], ...]:
+        if not points:
+            return ()
+        values = np.asarray(points, dtype=np.float64).reshape(-1, 1, 2)
         mapped = cv2.undistortPoints(
-            points,
+            values,
             self._camera_matrix,
             self._distortion,
             P=self._camera_matrix,
-        ).reshape(2)
-        return float(mapped[0]), float(mapped[1])
+        ).reshape(-1, 2)
+        return tuple((float(x), float(y)) for x, y in mapped)
 
     def preview_frame(self, frame: RawReplayFrame) -> np.ndarray:
         gray = cv2.resize(
@@ -510,7 +525,7 @@ class MMapRawVideoSource:
 
 
 class RawCropProcessor:
-    """Apply the frozen colour calibration to only a requested Bayer crop."""
+    """Produce either model-oriented or calibrated crops from a Bayer ROI."""
 
     _CFA_BY_OFFSET: ClassVar[dict[tuple[int, int], str]] = {
         (0, 0): "RGGB",
@@ -519,14 +534,30 @@ class RawCropProcessor:
         (1, 1): "BGGR",
     }
 
-    def __init__(self, profile_path: Path, profile: dict[str, object]) -> None:
+    def __init__(
+        self,
+        profile_path: Path,
+        profile: dict[str, object],
+        *,
+        processing_profile: str = "ml-fast",
+    ) -> None:
+        if processing_profile not in {"ml-fast", "calibrated"}:
+            raise SourceError(
+                "RAW crop processing must be 'ml-fast' or 'calibrated'"
+            )
         capture = profile["capture"]
         calibration = profile["calibration"]
-        artifacts = profile["artifacts"]
         processing = profile.get("processing", {})
+        self.processing_profile = processing_profile
         self._bit_shift = int(capture.get("bit_shift", 0))
         self._white_level = float(capture["decoded_white_level"])
         self._dark_level = float(calibration.get("dark_level_median", 0.0))
+        levels = np.arange(round(self._white_level) + 1, dtype=np.float32)
+        self._ml_lut = np.clip(
+            levels * (255.0 / max(self._white_level, 1.0)) + 0.5,
+            0,
+            255,
+        ).astype(np.uint8)
         self._wb = (
             np.asarray(calibration["wb_gains_rgb"], dtype=np.float32)
             if calibration.get("wb_enabled", False)
@@ -538,6 +569,13 @@ class RawCropProcessor:
             else None
         )
         self._algorithm = str(processing.get("demosaic", "edge_aware"))
+        self._dark = None
+        self._flat = None
+        self._defects = None
+        if processing_profile == "ml-fast":
+            return
+
+        artifacts = profile["artifacts"]
         expected_shape = (int(capture["height"]), int(capture["width"]))
         root = profile_path.parent
 
@@ -643,6 +681,34 @@ class RawCropProcessor:
     ) -> np.ndarray:
         roi_bottom = roi_top + raw.shape[0]
         roi_right = roi_left + raw.shape[1]
+        pattern = self._CFA_BY_OFFSET[(roi_top % 2, roi_left % 2)]
+        if self.processing_profile == "ml-fast":
+            decoded = (
+                np.right_shift(raw, self._bit_shift)
+                if self._bit_shift
+                else raw
+            )
+            decoded = np.minimum(decoded, len(self._ml_lut) - 1)
+            bayer8 = np.ascontiguousarray(self._ml_lut[decoded])
+            bgr = cv2.cvtColor(
+                bayer8, getattr(cv2, f"COLOR_Bayer{pattern}2BGR")
+            )
+            return _finish_raw_crop(
+                bgr,
+                roi_left=roi_left,
+                roi_top=roi_top,
+                source_left=source_left,
+                source_top=source_top,
+                source_right=source_right,
+                source_bottom=source_bottom,
+                crop_left=crop_left,
+                crop_top=crop_top,
+                crop_size=crop_size,
+                padded=padded,
+            )
+
+        if self._dark is None or self._flat is None or self._defects is None:
+            raise SourceError("calibrated RAW crop artifacts are unavailable")
         decoded = (
             np.right_shift(raw, self._bit_shift).astype(np.float32)
             if self._bit_shift
@@ -659,7 +725,6 @@ class RawCropProcessor:
                         median = cv2.medianBlur(plane, 3)
                         plane[plane_mask] = median[plane_mask]
         decoded *= self._flat[roi_top:roi_bottom, roi_left:roi_right]
-        pattern = self._CFA_BY_OFFSET[(roi_top % 2, roi_left % 2)]
         suffix = "_EA" if self._algorithm == "edge_aware" else ""
         code_name = f"COLOR_Bayer{pattern}2RGB{suffix}"
         code = getattr(cv2, code_name, getattr(cv2, f"COLOR_Bayer{pattern}2RGB"))
@@ -678,19 +743,47 @@ class RawCropProcessor:
             1.055 * np.power(rgb, 1.0 / 2.4) - 0.055,
         )
         rgb8 = np.clip(rgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
-        crop = rgb8[
-            source_top - roi_top : source_bottom - roi_top,
-            source_left - roi_left : source_right - roi_left,
-            ::-1,
-        ]
-        if not padded:
-            return np.ascontiguousarray(crop)
-        output = np.zeros((crop_size, crop_size, 3), dtype=np.uint8)
-        output[
-            source_top - crop_top : source_bottom - crop_top,
-            source_left - crop_left : source_right - crop_left,
-        ] = crop
-        return output
+        return _finish_raw_crop(
+            rgb8[..., ::-1],
+            roi_left=roi_left,
+            roi_top=roi_top,
+            source_left=source_left,
+            source_top=source_top,
+            source_right=source_right,
+            source_bottom=source_bottom,
+            crop_left=crop_left,
+            crop_top=crop_top,
+            crop_size=crop_size,
+            padded=padded,
+        )
+
+
+def _finish_raw_crop(
+    bgr: np.ndarray,
+    *,
+    roi_left: int,
+    roi_top: int,
+    source_left: int,
+    source_top: int,
+    source_right: int,
+    source_bottom: int,
+    crop_left: int,
+    crop_top: int,
+    crop_size: int,
+    padded: bool,
+) -> np.ndarray:
+    crop = bgr[
+        source_top - roi_top : source_bottom - roi_top,
+        source_left - roi_left : source_right - roi_left,
+    ]
+    if not padded:
+        return np.ascontiguousarray(crop)
+    output = np.zeros((crop_size, crop_size, 3), dtype=np.uint8)
+    output[
+        source_top - crop_top : source_bottom - crop_top,
+        source_left - crop_left : source_right - crop_left,
+    ] = crop
+    return output
 
 
 def resolve_raw_bundle(path: Path) -> Path:

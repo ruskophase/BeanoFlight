@@ -342,20 +342,38 @@ class ZeroMQRegistryServer:
             )
             return record.revision
         if operation == "update_inference_job":
+            timing_marks = {
+                str(key): int(value)
+                for key, value in _object(
+                    payload.get("timing_marks_ns", {})
+                ).items()
+            }
             record = self.registry.update_inference_job(
                 bean_ref_from_dict(_object(payload["bean_ref"])),
                 str(payload["job_id"]),
                 InferenceStatus(str(payload["status"])),
                 int(payload["timestamp_ns"]),
                 detail=str(payload.get("detail", "")),
+                timing_marks_ns=timing_marks,
                 event_id=str(payload.get("event_id") or request_id),
             )
             return record_to_dict(record, include_history=False)
         if operation == "complete_inference_job":
+            timing_marks = {
+                str(key): int(value)
+                for key, value in _object(
+                    payload.get("timing_marks_ns", {})
+                ).items()
+            }
+            timing_marks.setdefault(
+                "registry_classification_received_monotonic_ns",
+                time.monotonic_ns(),
+            )
             record = self.registry.complete_inference_job(
                 bean_ref_from_dict(_object(payload["bean_ref"])),
                 str(payload["job_id"]),
                 enrichment_from_dict(_object(payload["enrichment"])),
+                timing_marks_ns=timing_marks,
                 event_id=str(payload.get("event_id") or request_id),
             )
             return record_to_dict(record, include_history=False)
@@ -650,6 +668,7 @@ class ZeroMQRegistryClient:
         timestamp_ns: int,
         *,
         detail: str = "",
+        timing_marks_ns: Mapping[str, int] | None = None,
         event_id: str | None = None,
     ) -> BeanRecord:
         return record_from_dict(
@@ -662,6 +681,7 @@ class ZeroMQRegistryClient:
                         "status": status.value,
                         "timestamp_ns": timestamp_ns,
                         "detail": detail,
+                        "timing_marks_ns": dict(timing_marks_ns or {}),
                         "event_id": event_id or uuid.uuid4().hex,
                     },
                 )
@@ -674,6 +694,7 @@ class ZeroMQRegistryClient:
         job_id: str,
         enrichment: Enrichment,
         *,
+        timing_marks_ns: Mapping[str, int] | None = None,
         event_id: str | None = None,
     ) -> BeanRecord:
         return record_from_dict(
@@ -684,6 +705,7 @@ class ZeroMQRegistryClient:
                         "bean_ref": bean_ref_to_dict(bean_ref),
                         "job_id": job_id,
                         "enrichment": enrichment_to_dict(enrichment),
+                        "timing_marks_ns": dict(timing_marks_ns or {}),
                         "event_id": event_id or f"complete:{job_id}",
                     },
                 )

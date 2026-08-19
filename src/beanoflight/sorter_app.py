@@ -9,7 +9,7 @@ import tkinter as tk
 from collections.abc import Sequence
 from tkinter import messagebox, ttk
 
-from .registry_service import DEFAULT_COMMAND_ENDPOINT
+from .registry_service import DEFAULT_COMMAND_ENDPOINT, DEFAULT_EVENT_ENDPOINT
 from .sorter import SorterActivity, SorterService, SorterSettings
 
 
@@ -18,6 +18,7 @@ class SorterApp(tk.Tk):
         self,
         registry_endpoint: str,
         *,
+        event_endpoint: str = DEFAULT_EVENT_ENDPOINT,
         animate_gates: bool = True,
         show_activity: bool = True,
     ) -> None:
@@ -28,6 +29,7 @@ class SorterApp(tk.Tk):
         self.minsize(900, 600)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.registry_endpoint = registry_endpoint
+        self.event_endpoint = event_endpoint
         self.service: SorterService | None = None
         self._activities: queue.Queue[SorterActivity] = queue.Queue(maxsize=256)
         self._gate_items: dict[int, int] = {}
@@ -43,6 +45,9 @@ class SorterApp(tk.Tk):
         self.lead_var = tk.StringVar(value=str(defaults.open_lead_ms))
         self.lag_var = tk.StringVar(value=str(defaults.close_lag_ms))
         self.notice_var = tk.StringVar(value=str(defaults.minimum_notice_ms))
+        self.adjacent_pair_var = tk.BooleanVar(
+            value=defaults.allow_adjacent_gate_pair
+        )
         self.status_var = tk.StringVar(value="Stopped")
         self.counts_var = tk.StringVar(value="decisions 0 · actuations 0 · errors 0")
         self.animate_gates_var = tk.BooleanVar(value=animate_gates)
@@ -86,6 +91,11 @@ class SorterApp(tk.Tk):
             variable=self.show_activity_var,
             command=self._display_options_changed,
         ).grid(row=2, column=3, columnspan=3, sticky=tk.W, pady=(8, 0))
+        ttk.Checkbutton(
+            controls,
+            text="Allow adjacent gate pair when combined probability qualifies",
+            variable=self.adjacent_pair_var,
+        ).grid(row=2, column=6, columnspan=2, sticky=tk.W, pady=(8, 0))
 
         gates = ttk.LabelFrame(self, text="Virtual sorting line", padding=10)
         gates.pack(fill=tk.X, padx=10, pady=(0, 10))
@@ -118,6 +128,7 @@ class SorterApp(tk.Tk):
                 open_lead_ms=float(self.lead_var.get()),
                 close_lag_ms=float(self.lag_var.get()),
                 minimum_notice_ms=float(self.notice_var.get()),
+                allow_adjacent_gate_pair=self.adjacent_pair_var.get(),
             )
             settings.validate()
         except ValueError as exc:
@@ -126,6 +137,7 @@ class SorterApp(tk.Tk):
         self.stop_service()
         self.service = SorterService(
             registry_endpoint=self.registry_endpoint,
+            event_endpoint=self.event_endpoint,
             settings=settings,
             activity=self._post_activity,
         )
@@ -255,6 +267,7 @@ class SorterApp(tk.Tk):
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="BeanoFlight sorting simulation GUI")
     result.add_argument("--registry", default=DEFAULT_COMMAND_ENDPOINT)
+    result.add_argument("--events", default=DEFAULT_EVENT_ENDPOINT)
     result.add_argument(
         "--no-gate-animation",
         action="store_true",
@@ -272,6 +285,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     arguments = parser().parse_args(argv)
     SorterApp(
         arguments.registry,
+        event_endpoint=arguments.events,
         animate_gates=not arguments.no_gate_animation,
         show_activity=not arguments.no_activity_log,
     ).mainloop()

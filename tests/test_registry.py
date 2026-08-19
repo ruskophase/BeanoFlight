@@ -430,7 +430,7 @@ class SQLiteRegistryTests(unittest.TestCase):
                 self.assertEqual(session.created_timestamp_ns, 42)
                 with sqlite3.connect(path) as connection:
                     self.assertEqual(
-                        connection.execute("PRAGMA user_version").fetchone()[0], 2
+                        connection.execute("PRAGMA user_version").fetchone()[0], 3
                     )
 
     def test_session_and_async_state_survive_restart(self):
@@ -471,6 +471,10 @@ class SQLiteRegistryTests(unittest.TestCase):
                     False,
                     100,
                     100,
+                    source_crop_width_px=224,
+                    source_crop_height_px=224,
+                    resized=True,
+                    timing_marks_ns={"crop_selected_monotonic_ns": 1_000},
                 )
                 registry.submit_inference_job(job)
                 registry.complete_inference_job(
@@ -479,9 +483,16 @@ class SQLiteRegistryTests(unittest.TestCase):
                     Enrichment(
                         "mock", "classification", "broken", 120, result_id="job"
                     ),
+                    timing_marks_ns={"inference_completed_monotonic_ns": 2_000},
                 )
                 decision = SortingDecision(
-                    "decision", "sorter", 125, 180, (0,), close_timestamp_ns=190
+                    "decision",
+                    "sorter",
+                    125,
+                    180,
+                    (0,),
+                    close_timestamp_ns=190,
+                    timing_marks_ns={"sorter_event_received_monotonic_ns": 3_000},
                 )
                 registry.set_sorting_decision(bean_ref, decision)
                 expected_record = registry.record_actuation(

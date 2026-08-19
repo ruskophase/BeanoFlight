@@ -264,6 +264,8 @@ class SimulationLauncherApp(tk.Tk):
             "beanoflight.sorter_app",
             "--registry",
             DEFAULT_COMMAND_ENDPOINT,
+            "--events",
+            DEFAULT_EVENT_ENDPOINT,
             *performance_mode_arguments("sorter", performance_mode),
         )
 

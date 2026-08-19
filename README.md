@@ -21,11 +21,18 @@ arrival time.
 60 FPS or unlimited. Preview can be disabled, the display queue is latest-only,
 and full-frame history is never retained. For a complete FastCap bundle, the
 default fast path memory-maps native CamL RG10, detects on a 728 x 544 green
-plane, point-undistorts centroids for metric tracking, and colour-processes only
-selected bean crops. Every eligible bean is sent as a configurable 300 x 300
-BGR8 crop over a bounded ZeroMQ path. Source preparation and detector/tracker
-latency are reported separately. This is the recorded-source stand-in for a
-future live CamL frame source.
+plane, point-undistorts centroids for metric tracking, and processes only
+selected bean crops. IDs and trajectories begin on the first detection, while
+inference waits only while the segmented bean itself touches an image edge. If
+the bean is complete but a centred 224 x 224 sensor crop would cross the frame
+edge, the largest complete centred source crop is resized to 224 x 224 without
+inventing pixels; the crop size and resize flag are retained for audit. The default
+`ml-fast` crop path performs linear sensor-level conversion and bilinear Bayer
+demosaic without brightness or colour calibration; the former calibrated sRGB
+path remains selectable as a reference. All newly eligible crops from one
+source frame are transported as one explicit batch. Source preparation and
+detector/tracker latency are reported separately. This is the recorded-source
+stand-in for a future live CamL frame source.
 
 ## BeanRegistry
 
@@ -43,6 +50,11 @@ The service also publishes bounded state notifications for monitoring. Every
 event has a persistent stream sequence; critical consumers recover through the
 `events_since` query rather than assuming publish/subscribe delivery. Frame
 images are never written to the registry or its database.
+
+BeanoSorter normally reacts directly to the live state carried by each Registry
+notification. It consults the durable event journal only after a sequence gap or
+during periodic recovery, so a 25 ms polling interval is no longer present in
+the valve-decision path.
 
 BeanRegistry holds exclusive OS locks for its SQLite database and both IPC
 endpoints. A second instance exits with a clear ownership error instead of
@@ -72,9 +84,17 @@ beano-flight /recordings/example
 In BeanoFlight, select 3 empty background frames, choose **Simulation**, set
 the replay rate, replay prebuffer and crop count, then press **Run**. Leave
 **Use memory-mapped RAW fast path** selected for the supplied complete bundle.
-Live playback defaults off for throughput. The mock inferencer delays each crop
-and adds a deterministic random category/confidence. The sorter applies its
-configurable policy and shows virtual 5 mm gates in black or red while active.
+Live playback defaults off for throughput. The mock inferencer treats all bean
+crops first detected in the same frame as one simulated GPU batch, charges for
+a future CamL/CamR pair and feature-fusion head, and adds a deterministic
+random category/confidence. Only CamL is transported today, so Registry
+telemetry explicitly distinguishes the physical input from the logical
+two-view compute model. The sorter waits for a confirmed trajectory before it
+makes an immutable decision, then applies its configurable policy and shows
+virtual 5 mm gates in black or red while active.
+When no individual gate reaches the configured probability threshold, the
+sorter may select the strongest adjacent pair if their combined, disjoint
+crossing probability qualifies.
 Crop previews, activity logs, monitor polling and gate animation can be turned
 off independently without stopping their worker services.
 
@@ -96,6 +116,8 @@ against already-running services, use:
 beano-system-test /recordings/example \
   --background-frames 43,222,347 \
   --optimized-raw \
+  --crop-processing ml-fast \
+  --crop-size 224 \
   --prebuffer-frames 60 \
   --maximum-frames 1000 \
   --crops-per-bean 1 \
@@ -106,7 +128,9 @@ For an isolated multi-run performance test, `beano-performance-benchmark`
 starts a private Registry, Mock Inferencer and Sorter, keeps them alive across
 all repetitions, and writes one JSON report containing stage timings and
 outcomes. See [simulation.md](docs/simulation.md#repeatable-performance-matrix)
-for the reference command and current results.
+for the reference command and current results. Pass
+`--no-adaptive-edge-resize` to reproduce the BeanoFlight simulation
+checkbox-off crop policy while holding the other benchmark settings fixed.
 
 See [simulation.md](docs/simulation.md) for the data flow, crop policy, clock
 contract and operating sequence.
@@ -220,7 +244,7 @@ beano-flight recording/ --hole-pitch-mm 9.16 --sorting-offset-mm 30
   existing track is not renamed if it later enters a margin.
 - Twenty-one virtual 5 mm gates, with `G0` centred on image `x = 0`.
 - Gaussian crossing probabilities and a default 35% virtual actuation
-  threshold.
+  threshold, including an optional adjacent-gate combined-probability policy.
 
 See [architecture.md](docs/architecture.md),
 [bean-registry.md](docs/bean-registry.md),
@@ -241,5 +265,7 @@ assignment, ID lifecycle, registry revision/idempotency rules, SQLite recovery,
 byte-exact crop IPC, bounded frame prefetch, mmap RAW lifecycle, deferred crop
 calibration, async mock inference,
 sorting decisions and virtual gate actuation.
+It also covers the persisted per-bean timing ledger, live event-driven sorter,
+adaptive edge crop and shadow notice calculations.
 Representative real recordings will be added as regression fixtures after the
 first detector-tuning session.

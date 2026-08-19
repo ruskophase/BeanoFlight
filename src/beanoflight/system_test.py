@@ -73,8 +73,25 @@ def parser() -> argparse.ArgumentParser:
         default=60.0,
         help="replay rate; zero runs as fast as decoding and analysis allow",
     )
-    result.add_argument("--crop-size", type=int, default=300)
+    result.add_argument("--crop-size", type=int, default=224)
+    result.add_argument(
+        "--crop-processing",
+        choices=("ml-fast", "calibrated"),
+        default="ml-fast",
+        help=(
+            "RAW crop preparation: linear sensor BGR for model training/inference "
+            "or the calibrated sRGB reference path"
+        ),
+    )
     result.add_argument("--crops-per-bean", type=int, default=1)
+    result.add_argument(
+        "--no-adaptive-edge-resize",
+        action="store_true",
+        help=(
+            "defer inference until a complete crop of the requested size fits, "
+            "instead of resizing a smaller complete crop near the frame edge"
+        ),
+    )
     result.add_argument(
         "--prebuffer-frames",
         type=int,
@@ -109,7 +126,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     registry = None
     try:
         source = (
-            MMapRawVideoSource(arguments.recording)
+            MMapRawVideoSource(
+                arguments.recording,
+                crop_processing=arguments.crop_processing,
+            )
             if arguments.optimized_raw
             else open_replay_source(
                 arguments.recording,
@@ -147,8 +167,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         registry = ZeroMQRegistryClient(arguments.registry, timeout_ms=2_000)
         registry.ping()
 
-        def position_mapper(point):
-            return calibration.pixel_to_mm(source.undistort_point(point))
+        def positions_mapper(points):
+            return calibration.pixels_to_mm(source.undistort_points(points))
 
         engine = AnalysisEngine(
             calibration,
@@ -159,7 +179,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 calibration.sorting_line_y(arguments.sorting_offset_mm)
             ),
             registry=registry,
-            position_mapper=position_mapper if arguments.optimized_raw else None,
+            positions_mapper=positions_mapper if arguments.optimized_raw else None,
         )
         selector = None
         dispatcher = None
@@ -168,6 +188,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 CropSettings(
                     size_px=arguments.crop_size,
                     max_crops_per_bean=arguments.crops_per_bean,
+                    adaptive_edge_resize=not arguments.no_adaptive_edge_resize,
                 ),
                 deferred_extractor=deferred_crop_extractor,
             )
@@ -188,6 +209,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "name": "headless-system-test",
                 "optimized_raw": arguments.optimized_raw,
                 "crops_enabled": not arguments.no_crops,
+                "adaptive_edge_resize": not arguments.no_adaptive_edge_resize,
+                "crop_processing": (
+                    arguments.crop_processing
+                    if arguments.optimized_raw
+                    else "calibrated-video"
+                ),
                 "background": {
                     "method": "explicit human-confirmed frames",
                     "frame_indices": list(arguments.background_frames),

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -98,6 +98,10 @@ class InferenceJob:
     submitted_timestamp_ns: int
     updated_timestamp_ns: int
     detail: str = ""
+    source_crop_width_px: int = 0
+    source_crop_height_px: int = 0
+    resized: bool = False
+    timing_marks_ns: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +132,7 @@ class SortingDecision:
     close_timestamp_ns: int | None = None
     crossing_timestamp_ns: int | None = None
     based_on_revision: int = 0
+    timing_marks_ns: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,6 +343,7 @@ def decision_to_dict(decision: SortingDecision) -> dict[str, object]:
         "close_timestamp_ns": decision.close_timestamp_ns,
         "crossing_timestamp_ns": decision.crossing_timestamp_ns,
         "based_on_revision": decision.based_on_revision,
+        "timing_marks_ns": dict(decision.timing_marks_ns),
     }
 
 
@@ -361,6 +367,7 @@ def decision_from_dict(value: Mapping[str, object]) -> SortingDecision:
             None if crossing_timestamp is None else int(crossing_timestamp)
         ),
         based_on_revision=int(value.get("based_on_revision", 0)),
+        timing_marks_ns=_timing_marks(value.get("timing_marks_ns", {})),
     )
 
 
@@ -419,6 +426,10 @@ def inference_job_to_dict(job: InferenceJob) -> dict[str, object]:
         "submitted_timestamp_ns": job.submitted_timestamp_ns,
         "updated_timestamp_ns": job.updated_timestamp_ns,
         "detail": job.detail,
+        "source_crop_width_px": job.source_crop_width_px,
+        "source_crop_height_px": job.source_crop_height_px,
+        "resized": job.resized,
+        "timing_marks_ns": dict(job.timing_marks_ns),
     }
 
 
@@ -437,6 +448,10 @@ def inference_job_from_dict(value: Mapping[str, object]) -> InferenceJob:
         submitted_timestamp_ns=int(value["submitted_timestamp_ns"]),
         updated_timestamp_ns=int(value["updated_timestamp_ns"]),
         detail=str(value.get("detail", "")),
+        source_crop_width_px=int(value.get("source_crop_width_px", 0)),
+        source_crop_height_px=int(value.get("source_crop_height_px", 0)),
+        resized=bool(value.get("resized", False)),
+        timing_marks_ns=_timing_marks(value.get("timing_marks_ns", {})),
     )
 
 
@@ -561,6 +576,10 @@ def _mapping(value: object) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise TypeError("registry value must be an object")
     return value
+
+
+def _timing_marks(value: object) -> dict[str, int]:
+    return {str(key): int(mark) for key, mark in _mapping(value).items()}
 
 
 def _sequence(value: object) -> list[object] | tuple[object, ...]:

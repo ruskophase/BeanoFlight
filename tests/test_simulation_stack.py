@@ -63,6 +63,7 @@ class SimulationStackTests(unittest.TestCase):
             self.assertTrue(inferencer.ready.wait(2.0))
             sorter = SorterService(
                 registry_endpoint=commands,
+                event_endpoint=events,
                 settings=SorterSettings(
                     reject_categories=("mould",),
                     minimum_confidence=0.9,
@@ -83,7 +84,7 @@ class SimulationStackTests(unittest.TestCase):
                     "mkv",
                     3,
                     60,
-                    0,
+                    60,
                     100,
                     100,
                     time.monotonic_ns(),
@@ -128,9 +129,18 @@ class SimulationStackTests(unittest.TestCase):
                     break
                 time.sleep(0.02)
             self.assertIsNotNone(result.actuation)
-            self.assertTrue(result.actuation.success)
+            self.assertTrue(result.actuation.success, result.actuation.detail)
             self.assertEqual(result.enrichments[-1].value["category"], "mould")
             self.assertTrue(result.decision.gate_indices)
+            self.assertGreater(sorter.event_notifications, 0)
+            self.assertIn(
+                "registry_classification_received_monotonic_ns",
+                result.inference_jobs[0].timing_marks_ns,
+            )
+            self.assertIn(
+                "sorter_event_received_monotonic_ns",
+                result.decision.timing_marks_ns,
+            )
 
             dispatcher.close()
             inferencer.close()

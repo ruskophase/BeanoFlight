@@ -35,6 +35,7 @@ Optimized RAW detections retain distorted sensor pixels for bounding boxes and
 crop extraction. Each centroid alone is undistorted with the frozen CamL lens
 model before the undistorted PinkPlane homography converts it to millimetres;
 no full-frame geometric remap is required on the tracking path.
+All centroids from one frame are transformed in one vectorized OpenCV call.
 
 FastCap's CamL kernel timestamp is authoritative. Only differences within that
 timestamp domain are used. Plain videos without `pairs.csv` are supported for
@@ -113,11 +114,17 @@ replaceable notifications. Each notification carries a persistent global
 stream sequence, so a critical consumer uses `events_since(cursor)` to recover
 any gap before proceeding.
 
+The sorter reads the compact materialized record already embedded in a normal
+live notification, rather than rereading SQLite. The journal remains the
+durable restart/gap path. Inference jobs and sorting decisions persist their
+source-clock and host-monotonic timing marks alongside crop provenance; no
+image data enters that ledger.
+
 The 60 FPS frame transaction records undo information only for bean IDs and
 bounded journal/idempotency entries changed by that frame; it never copies the
 whole Registry cache. Track-update acknowledgements contain only bean ID and
-revision, and routine consumers read compact event headers before requesting a
-record they actually need. The durable hot-record cache is capped, bulk SQLite
+revision, and recovery consumers read compact journal headers before requesting
+a record they actually need. The durable hot-record cache is capped, bulk SQLite
 queries bypass it, and no persisted bean data is discarded by cache eviction.
 
 Recorded simulation uses a bounded sequential producer ahead of the analysis

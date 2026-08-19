@@ -318,12 +318,14 @@ class BeanoFlightApp(tk.Tk):
         )
         self.target_fps_var = tk.StringVar(value="60")
         self.fast_raw_var = tk.BooleanVar(value=True)
+        self.crop_processing_var = tk.StringVar(value="ml-fast")
         self.preview_enabled_var = tk.BooleanVar(value=False)
         self.prebuffer_enabled_var = tk.BooleanVar(value=True)
         self.prebuffer_frames_var = tk.StringVar(value="60")
         self.maximum_frames_var = tk.StringVar(value="1000")
-        self.crop_size_var = tk.StringVar(value="300")
+        self.crop_size_var = tk.StringVar(value="224")
         self.crops_per_bean_var = tk.StringVar(value="1")
+        self.adaptive_edge_resize_var = tk.BooleanVar(value=True)
         self.registry_endpoint_var = tk.StringVar(value=DEFAULT_COMMAND_ENDPOINT)
         self.inference_endpoint_var = tk.StringVar(value=DEFAULT_CROP_ENDPOINT)
 
@@ -756,7 +758,7 @@ class BeanoFlightApp(tk.Tk):
                 ),
                 wraplength=370,
                 style="Muted.TLabel",
-            ).grid(row=13, column=0, columnspan=2, sticky=tk.W, pady=(12, 0))
+            ).grid(row=15, column=0, columnspan=2, sticky=tk.W, pady=(12, 0))
         ttk.Label(parent, text="Target processing FPS").grid(
             row=1, column=0, sticky=tk.W, pady=3
         )
@@ -771,18 +773,28 @@ class BeanoFlightApp(tk.Tk):
             text="Use memory-mapped RAW fast path",
             variable=self.fast_raw_var,
         ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=5)
+        ttk.Label(parent, text="RAW crop processing").grid(
+            row=3, column=0, sticky=tk.W, pady=3
+        )
+        ttk.Combobox(
+            parent,
+            textvariable=self.crop_processing_var,
+            values=("ml-fast", "calibrated"),
+            state="readonly",
+            width=18,
+        ).grid(row=3, column=1, sticky=tk.EW, pady=3)
         ttk.Checkbutton(
             parent,
             text="Show live playback (uses extra CPU)",
             variable=self.preview_enabled_var,
-        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=5)
+        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=5)
         ttk.Checkbutton(
             parent,
             text="Prebuffer mapped/decoded frames before playback",
             variable=self.prebuffer_enabled_var,
-        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=5)
+        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=5)
         ttk.Label(parent, text="Replay prebuffer (frames)").grid(
-            row=5, column=0, sticky=tk.W, pady=3
+            row=6, column=0, sticky=tk.W, pady=3
         )
         ttk.Spinbox(
             parent,
@@ -790,9 +802,9 @@ class BeanoFlightApp(tk.Tk):
             from_=10,
             to=120,
             width=18,
-        ).grid(row=5, column=1, sticky=tk.EW, pady=3)
+        ).grid(row=6, column=1, sticky=tk.EW, pady=3)
         ttk.Label(parent, text="Maximum replay frames").grid(
-            row=6, column=0, sticky=tk.W, pady=3
+            row=7, column=0, sticky=tk.W, pady=3
         )
         ttk.Spinbox(
             parent,
@@ -800,9 +812,9 @@ class BeanoFlightApp(tk.Tk):
             from_=1,
             to=1000,
             width=18,
-        ).grid(row=6, column=1, sticky=tk.EW, pady=3)
+        ).grid(row=7, column=1, sticky=tk.EW, pady=3)
         ttk.Label(parent, text="Square crop size (px)").grid(
-            row=7, column=0, sticky=tk.W, pady=3
+            row=8, column=0, sticky=tk.W, pady=3
         )
         ttk.Spinbox(
             parent,
@@ -811,9 +823,9 @@ class BeanoFlightApp(tk.Tk):
             to=1024,
             increment=2,
             width=18,
-        ).grid(row=7, column=1, sticky=tk.EW, pady=3)
+        ).grid(row=8, column=1, sticky=tk.EW, pady=3)
         ttk.Label(parent, text="Crops per bean").grid(
-            row=8, column=0, sticky=tk.W, pady=3
+            row=9, column=0, sticky=tk.W, pady=3
         )
         ttk.Spinbox(
             parent,
@@ -821,21 +833,26 @@ class BeanoFlightApp(tk.Tk):
             from_=1,
             to=5,
             width=18,
-        ).grid(row=8, column=1, sticky=tk.EW, pady=3)
+        ).grid(row=9, column=1, sticky=tk.EW, pady=3)
+        ttk.Checkbutton(
+            parent,
+            text="Resize smaller complete crops near frame edge",
+            variable=self.adaptive_edge_resize_var,
+        ).grid(row=10, column=0, columnspan=2, sticky=tk.W, pady=5)
         ttk.Label(parent, text="Registry command endpoint").grid(
-            row=9, column=0, sticky=tk.W, pady=3
+            row=11, column=0, sticky=tk.W, pady=3
         )
         ttk.Entry(parent, textvariable=self.registry_endpoint_var).grid(
-            row=9, column=1, sticky=tk.EW, pady=3
+            row=11, column=1, sticky=tk.EW, pady=3
         )
         ttk.Label(parent, text="Inference crop endpoint").grid(
-            row=10, column=0, sticky=tk.W, pady=3
+            row=12, column=0, sticky=tk.W, pady=3
         )
         ttk.Entry(parent, textvariable=self.inference_endpoint_var).grid(
-            row=10, column=1, sticky=tk.EW, pady=3
+            row=12, column=1, sticky=tk.EW, pady=3
         )
         ttk.Separator(parent).grid(
-            row=11, column=0, columnspan=2, sticky=tk.EW, pady=12
+            row=13, column=0, columnspan=2, sticky=tk.EW, pady=12
         )
         ttk.Label(
             parent,
@@ -847,7 +864,7 @@ class BeanoFlightApp(tk.Tk):
             ),
             wraplength=390,
             style="Muted.TLabel",
-        ).grid(row=12, column=0, columnspan=2, sticky=tk.W)
+        ).grid(row=14, column=0, columnspan=2, sticky=tk.W)
         parent.columnconfigure(1, weight=1)
 
     def open_video(self) -> None:
@@ -1160,8 +1177,12 @@ class BeanoFlightApp(tk.Tk):
             crop_settings = CropSettings(
                 size_px=int(self.crop_size_var.get()),
                 max_crops_per_bean=int(self.crops_per_bean_var.get()),
+                adaptive_edge_resize=self.adaptive_edge_resize_var.get(),
             )
             crop_settings.validate()
+            crop_processing = self.crop_processing_var.get()
+            if crop_processing not in {"ml-fast", "calibrated"}:
+                raise ValueError("RAW crop processing must be ml-fast or calibrated")
             replay_settings = ReplaySettings(
                 target_fps=target_fps,
                 preview_enabled=self.preview_enabled_var.get(),
@@ -1206,12 +1227,17 @@ class BeanoFlightApp(tk.Tk):
             registry = None
             try:
                 if raw_bundle is not None:
-                    source = MMapRawVideoSource(raw_bundle)
+                    source = MMapRawVideoSource(
+                        raw_bundle,
+                        crop_processing=crop_processing,
+                    )
                     simulation_background = source.build_background(background_indices)
                     detector = RawGreenDetector(settings)
 
-                    def position_mapper(point):
-                        return calibration.pixel_to_mm(source.undistort_point(point))
+                    def positions_mapper(points):
+                        return calibration.pixels_to_mm(
+                            source.undistort_points(points)
+                        )
 
                     deferred_crop_extractor = source.prepare_crop
                 else:
@@ -1220,7 +1246,7 @@ class BeanoFlightApp(tk.Tk):
                     )
                     simulation_background = background
                     detector = BeanDetector(settings)
-                    position_mapper = None
+                    positions_mapper = None
                     deferred_crop_extractor = None
                 registry = ZeroMQRegistryClient(registry_endpoint, timeout_ms=2_000)
                 registry.ping()
@@ -1232,7 +1258,7 @@ class BeanoFlightApp(tk.Tk):
                     tracker_settings=tracker_settings,
                     gate_layout=layout,
                     registry=registry,
-                    position_mapper=position_mapper,
+                    positions_mapper=positions_mapper,
                 )
                 selector = BeanCropSelector(
                     crop_settings,
@@ -1258,6 +1284,11 @@ class BeanoFlightApp(tk.Tk):
                         ),
                         "launcher_performance_mode": self.performance_mode,
                         "live_playback": replay_settings.preview_enabled,
+                        "crop_processing": (
+                            source.crop_processing_profile
+                            if isinstance(source, MMapRawVideoSource)
+                            else "calibrated-video"
+                        ),
                         "background": {
                             "method": self.background_provenance.method,
                             "frame_indices": list(

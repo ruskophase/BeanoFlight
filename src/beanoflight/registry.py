@@ -8,7 +8,7 @@ import math
 import threading
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from typing import Protocol
@@ -421,8 +421,10 @@ class BeanRegistry:
         timestamp_ns: int,
         *,
         detail: str = "",
+        timing_marks_ns: Mapping[str, int] | None = None,
         event_id: str | None = None,
     ) -> BeanRecord:
+        _validate_timing_marks(timing_marks_ns or {})
         identifier = event_id or uuid.uuid4().hex
         fingerprint = _fingerprint(
             "update_inference_job",
@@ -456,6 +458,10 @@ class BeanRegistry:
                 status=status,
                 updated_timestamp_ns=int(timestamp_ns),
                 detail=detail,
+                timing_marks_ns={
+                    **job.timing_marks_ns,
+                    **dict(timing_marks_ns or {}),
+                },
             )
             if updated == job:
                 return previous
@@ -483,17 +489,22 @@ class BeanRegistry:
         job_id: str,
         enrichment: Enrichment,
         *,
+        timing_marks_ns: Mapping[str, int] | None = None,
         event_id: str | None = None,
     ) -> BeanRecord:
         """Atomically complete one job and append its classification result."""
 
         _validate_enrichment(enrichment)
+        _validate_timing_marks(timing_marks_ns or {})
         if not enrichment.result_id:
             enrichment = replace(enrichment, result_id=job_id)
         identifier = event_id or f"complete:{job_id}"
         fingerprint = _fingerprint(
             "complete_inference_job",
-            {"job_id": job_id, "enrichment": enrichment_to_dict(enrichment)},
+            {
+                "job_id": job_id,
+                "enrichment": enrichment_to_dict(enrichment),
+            },
         )
         with self._lock:
             duplicate = self._duplicate(identifier, bean_ref, fingerprint)
@@ -526,6 +537,10 @@ class BeanRegistry:
                 job,
                 status=InferenceStatus.COMPLETED,
                 updated_timestamp_ns=enrichment.timestamp_ns,
+                timing_marks_ns={
+                    **job.timing_marks_ns,
+                    **dict(timing_marks_ns or {}),
+                },
             )
             enrichments = (
                 previous.enrichments
@@ -1076,6 +1091,11 @@ def _validate_inference_job(job: InferenceJob) -> None:
         )
     if job.crop_width_px <= 0 or job.crop_height_px <= 0:
         raise RegistryConflictError("inference crop dimensions must be positive")
+    source_width = job.source_crop_width_px or job.crop_width_px
+    source_height = job.source_crop_height_px or job.crop_height_px
+    if source_width <= 0 or source_height <= 0:
+        raise RegistryConflictError("inference source crop dimensions must be positive")
+    _validate_timing_marks(job.timing_marks_ns)
     if (
         min(
             job.capture_timestamp_ns,
@@ -1156,6 +1176,16 @@ def _validate_decision(decision: SortingDecision) -> None:
         raise RegistryConflictError("decision bean revision cannot be negative")
     if len(set(decision.gate_indices)) != len(decision.gate_indices):
         raise RegistryConflictError("sorting decision gate indices must be unique")
+    _validate_timing_marks(decision.timing_marks_ns)
+
+
+def _validate_timing_marks(marks: Mapping[str, int]) -> None:
+    if any(not str(key).strip() for key in marks):
+        raise RegistryConflictError("timing ledger marks require names")
+    try:
+        tuple(int(value) for value in marks.values())
+    except (TypeError, ValueError) as exc:
+        raise RegistryConflictError("timing ledger marks must be integer nanoseconds") from exc
 
 
 def _validate_actuation(result: ActuationResult) -> None:

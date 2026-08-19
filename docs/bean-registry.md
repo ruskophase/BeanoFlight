@@ -123,7 +123,9 @@ state snapshot, and finally consumes events after that cursor. An update racing
 with the snapshot can be seen twice, so effects remain idempotent, but no update
 is missed. BeanoSorter applies this pattern to live sessions and the most
 recent session, and coalesces each event page to one current-state lookup per
-bean.
+bean. During normal live operation BeanoSorter uses the compact materialized
+record already embedded in each notification and performs no record query.
+Compact journal pages remain the recovery path after a sequence gap.
 
 For frame-rate traffic, use `update_track_revisions()` when the caller only
 needs acknowledged revisions and `events_since_compact()` when a consumer only
@@ -132,6 +134,11 @@ queries remain available for diagnostics. Crop submission similarly uses a
 revision-only acknowledgement while preserving the durable-before-enqueue
 contract. `service_metrics()` exposes bounded operation, SQLite transaction and
 hot-cache measurements used by the replay benchmark.
+
+Inference-job rows retain crop source/output dimensions, resize provenance and
+critical-path timing marks. Sorting-decision rows retain sorter receipt, notice
+margin and required-open timing marks. These fields form the durable per-bean
+timing ledger without storing crop images.
 
 ## Memory and image copying
 

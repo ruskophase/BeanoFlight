@@ -6,7 +6,7 @@ from test_registry import track
 
 from beanoflight.models import BeanEvent, BeanRef
 from beanoflight.registry import BeanRegistry
-from beanoflight.registry_models import RunSession, RunState
+from beanoflight.registry_models import RunSession, RunState, record_to_dict
 from beanoflight.registry_monitor import RegistryMonitorWorker
 from beanoflight.sorter import SorterService, _recovery_run_ids
 
@@ -165,6 +165,24 @@ class RegistryConsumerTests(unittest.TestCase):
         SorterService()._process_events((event,), client)
 
         self.assertEqual(client.get_calls, [(self.bean_ref, False)])
+
+    def test_sorter_uses_embedded_live_state_without_registry_read(self):
+        event = BeanEvent(
+            "inference.completed",
+            self.bean_ref,
+            103,
+            payload={"record": record_to_dict(self.record, include_history=False)},
+            revision=self.record.revision,
+            event_id="event-live",
+            stream_sequence=103,
+        )
+        client = FakeConsumerClient((), self.record, ())
+
+        SorterService()._process_events(
+            (event,), client, use_embedded_state=True
+        )
+
+        self.assertEqual(client.get_calls, [])
 
 
 if __name__ == "__main__":

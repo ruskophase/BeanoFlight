@@ -35,7 +35,7 @@ from .registry_models import (
 )
 from .telemetry import TimingAccumulator
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 TRACK_EVENT_KINDS = {
     "bean.created",
     "bean.confirmed",
@@ -188,11 +188,13 @@ class SQLiteBeanRepository:
                     decision_id, run_id, sequence, registry_revision, source,
                     timestamp_ns, actuation_timestamp_ns, gate_indices_json,
                     policy_version, reason, acknowledged_timestamp_ns,
-                    close_timestamp_ns, crossing_timestamp_ns, based_on_revision
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    close_timestamp_ns, crossing_timestamp_ns, based_on_revision,
+                    timing_marks_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(decision_id) DO UPDATE SET
                     registry_revision=excluded.registry_revision,
-                    acknowledged_timestamp_ns=excluded.acknowledged_timestamp_ns
+                    acknowledged_timestamp_ns=excluded.acknowledged_timestamp_ns,
+                    timing_marks_json=excluded.timing_marks_json
                 """,
                 (
                     decision.decision_id,
@@ -209,6 +211,7 @@ class SQLiteBeanRepository:
                     decision.close_timestamp_ns,
                     decision.crossing_timestamp_ns,
                     decision.based_on_revision,
+                    _json(decision.timing_marks_ns),
                 ),
             )
         for job in record.inference_jobs:
@@ -218,13 +221,18 @@ class SQLiteBeanRepository:
                     job_id, run_id, sequence, registry_revision, status, camera_id,
                     frame_index, capture_timestamp_ns, source_registry_revision,
                     crop_width_px, crop_height_px, padded, submitted_timestamp_ns,
-                    updated_timestamp_ns, detail
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    updated_timestamp_ns, detail, source_crop_width_px,
+                    source_crop_height_px, resized, timing_marks_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     registry_revision=excluded.registry_revision,
                     status=excluded.status,
                     updated_timestamp_ns=excluded.updated_timestamp_ns,
-                    detail=excluded.detail
+                    detail=excluded.detail,
+                    source_crop_width_px=excluded.source_crop_width_px,
+                    source_crop_height_px=excluded.source_crop_height_px,
+                    resized=excluded.resized,
+                    timing_marks_json=excluded.timing_marks_json
                 """,
                 (
                     job.job_id,
@@ -242,6 +250,10 @@ class SQLiteBeanRepository:
                     job.submitted_timestamp_ns,
                     job.updated_timestamp_ns,
                     job.detail,
+                    job.source_crop_width_px,
+                    job.source_crop_height_px,
+                    int(job.resized),
+                    _json(job.timing_marks_ns),
                 ),
             )
         if record.actuation is not None:
@@ -371,6 +383,9 @@ class SQLiteBeanRepository:
                         "close_timestamp_ns": decision_row["close_timestamp_ns"],
                         "crossing_timestamp_ns": decision_row["crossing_timestamp_ns"],
                         "based_on_revision": decision_row["based_on_revision"],
+                        "timing_marks_ns": json.loads(
+                            decision_row["timing_marks_json"]
+                        ),
                     }
                 )
             )
@@ -389,6 +404,15 @@ class SQLiteBeanRepository:
                     submitted_timestamp_ns=int(row["submitted_timestamp_ns"]),
                     updated_timestamp_ns=int(row["updated_timestamp_ns"]),
                     detail=str(row["detail"]),
+                    source_crop_width_px=int(row["source_crop_width_px"]),
+                    source_crop_height_px=int(row["source_crop_height_px"]),
+                    resized=bool(row["resized"]),
+                    timing_marks_ns={
+                        str(key): int(value)
+                        for key, value in json.loads(
+                            row["timing_marks_json"]
+                        ).items()
+                    },
                 )
                 for row in self._connection.execute(
                     """
@@ -859,6 +883,7 @@ class SQLiteBeanRepository:
                 close_timestamp_ns INTEGER,
                 crossing_timestamp_ns INTEGER,
                 based_on_revision INTEGER NOT NULL DEFAULT 0,
+                timing_marks_json TEXT NOT NULL DEFAULT '{}',
                 FOREIGN KEY(run_id, sequence) REFERENCES beans(run_id, sequence)
             );
             CREATE TABLE IF NOT EXISTS inference_jobs(
@@ -877,6 +902,10 @@ class SQLiteBeanRepository:
                 submitted_timestamp_ns INTEGER NOT NULL,
                 updated_timestamp_ns INTEGER NOT NULL,
                 detail TEXT NOT NULL,
+                source_crop_width_px INTEGER NOT NULL DEFAULT 0,
+                source_crop_height_px INTEGER NOT NULL DEFAULT 0,
+                resized INTEGER NOT NULL DEFAULT 0,
+                timing_marks_json TEXT NOT NULL DEFAULT '{}',
                 FOREIGN KEY(run_id, sequence) REFERENCES beans(run_id, sequence)
             );
             CREATE INDEX IF NOT EXISTS inference_jobs_bean_index
@@ -932,9 +961,18 @@ class SQLiteBeanRepository:
             "close_timestamp_ns": "INTEGER",
             "crossing_timestamp_ns": "INTEGER",
             "based_on_revision": "INTEGER NOT NULL DEFAULT 0",
+            "timing_marks_json": "TEXT NOT NULL DEFAULT '{}'",
         }
         for name, declaration in decision_columns.items():
             self._ensure_column("sorting_decisions", name, declaration)
+        inference_columns = {
+            "source_crop_width_px": "INTEGER NOT NULL DEFAULT 0",
+            "source_crop_height_px": "INTEGER NOT NULL DEFAULT 0",
+            "resized": "INTEGER NOT NULL DEFAULT 0",
+            "timing_marks_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for name, declaration in inference_columns.items():
+            self._ensure_column("inference_jobs", name, declaration)
         self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._connection.commit()
 

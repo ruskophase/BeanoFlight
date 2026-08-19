@@ -15,6 +15,7 @@ from PIL import Image, ImageTk
 
 from .inference_transport import DEFAULT_CROP_ENDPOINT
 from .mock_inference import (
+    DEFAULT_STEREO_LATENCY_CURVE,
     MockInferenceActivity,
     MockInferencerService,
     MockInferenceSettings,
@@ -43,8 +44,8 @@ class MockInferencerApp(tk.Tk):
         super().__init__(className="Mock Inferencer")
         self.title("Mock Inferencer")
         self.iconname("Mock Inferencer")
-        self.geometry("1050x700")
-        self.minsize(850, 580)
+        self.geometry("1180x720")
+        self.minsize(980, 600)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.registry_endpoint = registry_endpoint
         self.crop_endpoint = crop_endpoint
@@ -55,16 +56,32 @@ class MockInferencerApp(tk.Tk):
         self._activity_display_enabled = threading.Event()
 
         defaults = MockInferenceSettings()
-        self.latency_var = tk.StringVar(value=str(defaults.latency_ms))
-        self.jitter_var = tk.StringVar(value=str(defaults.jitter_ms))
-        self.workers_var = tk.StringVar(value=str(defaults.worker_count))
+        self.views_var = tk.StringVar(value=str(defaults.views_per_bean))
+        self.max_batch_var = tk.StringVar(value=str(defaults.max_batch_beans))
+        self.result_deadline_var = tk.StringVar(value=str(defaults.result_deadline_ms))
+        self.latency_curve_var = tk.StringVar(
+            value=_format_latency_curve(defaults.latency_curve)
+        )
+        self.jitter_percent_var = tk.StringVar(
+            value=str(defaults.jitter_fraction * 100)
+        )
+        self.tail_probability_percent_var = tk.StringVar(
+            value=str(defaults.tail_probability * 100)
+        )
+        self.tail_min_var = tk.StringVar(value=str(defaults.tail_latency_min_ms))
+        self.tail_max_var = tk.StringVar(value=str(defaults.tail_latency_max_ms))
         self.seed_var = tk.StringVar(value=str(defaults.seed))
         self.categories_var = tk.StringVar(value=",".join(defaults.categories))
         self.weights_var = tk.StringVar(
             value=",".join(str(value) for value in defaults.weights)
         )
         self.status_var = tk.StringVar(value="Stopped")
-        self.counts_var = tk.StringVar(value="received 0 · completed 0 · dropped 0")
+        self.counts_var = tk.StringVar(
+            value="received 0 · completed 0 · batches 0 · dropped 0"
+        )
+        self.batch_stats_var = tk.StringVar(
+            value="mean batch 0.0 · mean queue 0.0 ms · mean service 0.0 ms"
+        )
         self.show_crop_var = tk.BooleanVar(value=show_crop)
         self.show_activity_var = tk.BooleanVar(value=show_activity)
         self._build()
@@ -73,43 +90,78 @@ class MockInferencerApp(tk.Tk):
         self.after(100, self.start_service)
 
     def _build(self) -> None:
-        controls = ttk.LabelFrame(self, text="Simulation settings", padding=10)
+        controls = ttk.LabelFrame(
+            self, text="Conservative stereo ResNet18 simulation", padding=10
+        )
         controls.pack(fill=tk.X, padx=10, pady=10)
         fields = (
-            ("Latency ms", self.latency_var, 8),
-            ("Jitter ms", self.jitter_var, 8),
-            ("Workers", self.workers_var, 6),
-            ("Seed", self.seed_var, 8),
-            ("Categories", self.categories_var, 32),
-            ("Weights", self.weights_var, 24),
+            ("Max pairs/frame batch", self.max_batch_var, 10),
+            ("Result SLA ms", self.result_deadline_var, 10),
+            ("Views/bean", self.views_var, 8),
+            ("Jitter %", self.jitter_percent_var, 8),
+            ("Tail chance %", self.tail_probability_percent_var, 10),
+            ("Tail min ms", self.tail_min_var, 9),
+            ("Tail max ms", self.tail_max_var, 9),
         )
         for column, (label, variable, width) in enumerate(fields):
             ttk.Label(controls, text=label).grid(row=0, column=column, sticky=tk.W)
             ttk.Entry(controls, textvariable=variable, width=width).grid(
                 row=1, column=column, padx=(0, 8), sticky=tk.EW
             )
-        ttk.Button(controls, text="Start / apply", command=self.start_service).grid(
-            row=1, column=len(fields), padx=(8, 4)
+        ttk.Label(controls, text="Latency curve (images:ms)").grid(
+            row=2, column=0, columnspan=3, sticky=tk.W, pady=(8, 0)
         )
-        ttk.Button(controls, text="Stop", command=self.stop_service).grid(
-            row=1, column=len(fields) + 1
+        ttk.Label(controls, text="Seed").grid(
+            row=2, column=3, sticky=tk.W, pady=(8, 0)
+        )
+        ttk.Label(controls, text="Categories").grid(
+            row=2, column=4, columnspan=2, sticky=tk.W, pady=(8, 0)
+        )
+        ttk.Label(controls, text="Weights").grid(
+            row=2, column=6, columnspan=2, sticky=tk.W, pady=(8, 0)
+        )
+        ttk.Entry(controls, textvariable=self.latency_curve_var).grid(
+            row=3, column=0, columnspan=3, padx=(0, 8), sticky=tk.EW
+        )
+        ttk.Entry(controls, textvariable=self.seed_var, width=8).grid(
+            row=3, column=3, padx=(0, 8), sticky=tk.EW
+        )
+        ttk.Entry(controls, textvariable=self.categories_var).grid(
+            row=3, column=4, columnspan=2, padx=(0, 8), sticky=tk.EW
+        )
+        ttk.Entry(controls, textvariable=self.weights_var).grid(
+            row=3, column=6, columnspan=2, padx=(0, 8), sticky=tk.EW
         )
         ttk.Checkbutton(
             controls,
             text="Show latest crop (uses extra CPU)",
             variable=self.show_crop_var,
             command=self._display_options_changed,
-        ).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
         ttk.Checkbutton(
             controls,
             text="Show activity log",
             variable=self.show_activity_var,
             command=self._display_options_changed,
-        ).grid(row=2, column=3, columnspan=3, sticky=tk.W, pady=(8, 0))
+        ).grid(row=4, column=2, columnspan=2, sticky=tk.W, pady=(10, 0))
+        ttk.Label(
+            controls,
+            text="CamL is transported today; CamR compute and fusion cost are simulated.",
+        ).grid(row=4, column=4, columnspan=2, sticky=tk.W, pady=(10, 0))
+        ttk.Button(controls, text="Start / apply", command=self.start_service).grid(
+            row=4, column=6, padx=(8, 4), pady=(8, 0), sticky=tk.E
+        )
+        ttk.Button(controls, text="Stop", command=self.stop_service).grid(
+            row=4, column=7, pady=(8, 0), sticky=tk.W
+        )
+        for column in range(8):
+            controls.columnconfigure(column, weight=1)
 
         body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-        image_frame = ttk.LabelFrame(body, text="Latest lossless crop", padding=8)
+        image_frame = ttk.LabelFrame(
+            body, text="Latest transported crop (CamL)", padding=8
+        )
         event_frame = ttk.LabelFrame(body, text="Activity", padding=8)
         body.add(image_frame, weight=2)
         body.add(event_frame, weight=3)
@@ -120,8 +172,11 @@ class MockInferencerApp(tk.Tk):
 
         footer = ttk.Frame(self, padding=(10, 0, 10, 10))
         footer.pack(fill=tk.X)
-        ttk.Label(footer, textvariable=self.status_var).pack(side=tk.LEFT)
-        ttk.Label(footer, textvariable=self.counts_var).pack(side=tk.RIGHT)
+        ttk.Label(footer, textvariable=self.status_var).pack(fill=tk.X, anchor=tk.W)
+        ttk.Label(footer, textvariable=self.counts_var).pack(fill=tk.X, anchor=tk.W)
+        ttk.Label(footer, textvariable=self.batch_stats_var).pack(
+            fill=tk.X, anchor=tk.W
+        )
 
     def start_service(self) -> None:
         try:
@@ -132,9 +187,16 @@ class MockInferencerApp(tk.Tk):
             )
             weights = tuple(float(item) for item in self.weights_var.get().split(","))
             settings = MockInferenceSettings(
-                latency_ms=float(self.latency_var.get()),
-                jitter_ms=float(self.jitter_var.get()),
-                worker_count=int(self.workers_var.get()),
+                views_per_bean=int(self.views_var.get()),
+                max_batch_beans=int(self.max_batch_var.get()),
+                result_deadline_ms=float(self.result_deadline_var.get()),
+                latency_curve=_parse_latency_curve(self.latency_curve_var.get()),
+                jitter_fraction=float(self.jitter_percent_var.get()) / 100.0,
+                tail_probability=(
+                    float(self.tail_probability_percent_var.get()) / 100.0
+                ),
+                tail_latency_min_ms=float(self.tail_min_var.get()),
+                tail_latency_max_ms=float(self.tail_max_var.get()),
                 seed=int(self.seed_var.get()),
                 categories=categories,
                 weights=weights,
@@ -185,7 +247,10 @@ class MockInferencerApp(tk.Tk):
                 item = self._activities.get_nowait()
             except queue.Empty:
                 break
-            message = f"{item.kind:10} {item.bean_id} {item.category}"
+            if item.kind == "batch":
+                message = f"{item.kind:10} {item.batch_id}"
+            else:
+                message = f"{item.kind:10} {item.bean_id} {item.category}"
             if item.confidence is not None:
                 message += f" {item.confidence:.1%}"
             if item.detail:
@@ -203,15 +268,26 @@ class MockInferencerApp(tk.Tk):
                 self.activity.configure(state=tk.DISABLED)
         service = self.service
         if service is not None:
+            stats = service.statistics()
             self.counts_var.set(
-                f"received {service.received} · completed {service.completed} · "
-                f"dropped {service.dropped} · queued {service._queue.qsize()}"
+                f"received {stats['received']} · completed {stats['completed']} · "
+                f"batches {stats['batches']} · queued {stats['queued']} · "
+                f"dropped {stats['dropped']}"
+            )
+            self.batch_stats_var.set(
+                f"mean batch {stats['mean_batch_size']:.1f} · "
+                f"max batch {stats['max_batch_size']} · "
+                f"mean queue {stats['mean_queue_ms']:.1f} ms · "
+                f"service {stats['mean_service_ms']:.1f} ms · "
+                f"SLA misses {stats['deadline_misses']} · "
+                f"tails {stats['tail_batches']}"
             )
             if service.startup_error:
                 self.status_var.set(f"Error · {service.startup_error}")
             elif service.ready.is_set():
                 self.status_var.set(
-                    f"Running · crops {service.crop_endpoint} · registry {self.registry_endpoint}"
+                    "Running · source-frame logical stereo batching · "
+                    f"crops {service.crop_endpoint} · registry {self.registry_endpoint}"
                 )
         delay_ms = (
             50
@@ -259,6 +335,27 @@ def parser() -> argparse.ArgumentParser:
         help="start with inference activity rendering disabled",
     )
     return result
+
+
+def _format_latency_curve(curve: tuple[tuple[int, float], ...]) -> str:
+    return ",".join(f"{images}:{latency:g}" for images, latency in curve)
+
+
+def _parse_latency_curve(value: str) -> tuple[tuple[int, float], ...]:
+    try:
+        curve = tuple(
+            (int(images.strip()), float(latency.strip()))
+            for item in value.split(",")
+            if item.strip()
+            for images, latency in (item.split(":", maxsplit=1),)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "latency curve must use comma-separated image:milliseconds pairs"
+        ) from exc
+    if not curve:
+        return DEFAULT_STEREO_LATENCY_CURVE
+    return curve
 
 
 def main(argv: Sequence[str] | None = None) -> None:

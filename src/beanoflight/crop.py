@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import math
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+import cv2
 import numpy as np
 
 from .models import BeanRef, FrameAnalysis, TrackStatus
@@ -14,9 +17,10 @@ from .registry_models import InferenceJob, InferenceStatus
 
 @dataclass(frozen=True, slots=True)
 class CropSettings:
-    size_px: int = 300
+    size_px: int = 224
     camera_id: str = "CamL"
     allow_padding: bool = False
+    adaptive_edge_resize: bool = True
     max_crops_per_bean: int = 1
 
     def validate(self) -> None:
@@ -48,7 +52,7 @@ class CropPayload:
 
 
 class BeanCropSelector:
-    """Choose the first fully visible confirmed observation for each bean."""
+    """Choose the earliest valid observation for each public bean ID."""
 
     def __init__(
         self,
@@ -74,7 +78,9 @@ class BeanCropSelector:
     ) -> tuple[CropPayload, ...]:
         selected: list[CropPayload] = []
         for track in analysis.tracks:
-            if track.status != TrackStatus.CONFIRMED or not track.history:
+            if track.status not in {TrackStatus.TENTATIVE, TrackStatus.CONFIRMED}:
+                continue
+            if not track.history:
                 continue
             observation = track.history[-1]
             if observation.frame_index != analysis.frame_index:
@@ -82,27 +88,54 @@ class BeanCropSelector:
             count = self._counts.get(track.bean_ref, 0)
             if count >= self.settings.max_crops_per_bean:
                 continue
+            frame_size = _frame_size_px(frame_bgr)
+            if _bbox_touches_frame_edge(
+                observation.detection.bbox_px,
+                frame_size,
+            ):
+                # The classifier must never see an actually truncated bean.
+                continue
+            source_size = self.settings.size_px
+            resized = False
             materializer = None
-            if self._deferred_extractor is not None:
-                prepared = self._deferred_extractor(
-                    frame_bgr,
+            prepared = self._prepare(
+                frame_bgr,
+                observation.detection.centroid_px,
+                source_size,
+            )
+            if prepared is None and self.settings.adaptive_edge_resize:
+                source_size = _largest_complete_centred_crop(
                     observation.detection.centroid_px,
+                    observation.detection.bbox_px,
+                    frame_size,
                     self.settings.size_px,
-                    allow_padding=self.settings.allow_padding,
                 )
-                if prepared is None:
-                    continue
-                materializer, crop_width, crop_height, padded = prepared
+                if source_size is not None:
+                    prepared = self._prepare(
+                        frame_bgr,
+                        observation.detection.centroid_px,
+                        source_size,
+                    )
+                    resized = prepared is not None and source_size != self.settings.size_px
+            if prepared is None:
+                continue
+            if self._deferred_extractor is not None:
+                materializer, _crop_width, _crop_height, padded = prepared
+                if resized:
+                    materializer = _resized_materializer(
+                        materializer,
+                        self.settings.size_px,
+                    )
+                crop_width = crop_height = self.settings.size_px
                 crop = None
             else:
-                crop, padded = self._extractor(
-                    frame_bgr,
-                    observation.detection.centroid_px,
-                    self.settings.size_px,
-                    allow_padding=self.settings.allow_padding,
-                )
-                if crop is None:
-                    continue
+                crop, padded = prepared
+                if resized:
+                    crop = cv2.resize(
+                        crop,
+                        (self.settings.size_px, self.settings.size_px),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
                 crop_width, crop_height = crop.shape[1], crop.shape[0]
             revision = revisions.get(track.bean_ref)
             if revision is None:
@@ -130,10 +163,100 @@ class BeanCropSelector:
                 padded=padded,
                 submitted_timestamp_ns=observation.timestamp_ns,
                 updated_timestamp_ns=observation.timestamp_ns,
+                source_crop_width_px=source_size,
+                source_crop_height_px=source_size,
+                resized=resized,
+                timing_marks_ns={
+                    "first_detection_source_ns": track.history[0].timestamp_ns,
+                    "first_fully_visible_source_ns": observation.timestamp_ns,
+                    "crop_capture_source_ns": observation.timestamp_ns,
+                    "crop_selected_monotonic_ns": time.monotonic_ns(),
+                },
             )
             self._counts[track.bean_ref] = count + 1
             selected.append(CropPayload(job, crop, materializer))
         return tuple(selected)
+
+    def _prepare(
+        self,
+        frame_bgr: Any,
+        centroid_px: tuple[float, float],
+        source_size: int,
+    ):
+        if self._deferred_extractor is not None:
+            return self._deferred_extractor(
+                frame_bgr,
+                centroid_px,
+                source_size,
+                allow_padding=self.settings.allow_padding,
+            )
+        crop, padded = self._extractor(
+            frame_bgr,
+            centroid_px,
+            source_size,
+            allow_padding=self.settings.allow_padding,
+        )
+        return None if crop is None else (crop, padded)
+
+
+def _frame_size_px(frame: Any) -> tuple[int, int]:
+    native = getattr(frame, "native_size_px", None)
+    if native is not None:
+        return int(native[0]), int(native[1])
+    if not hasattr(frame, "shape") or len(frame.shape) < 2:
+        raise ValueError("inference crop source has no image dimensions")
+    return int(frame.shape[1]), int(frame.shape[0])
+
+
+def _bbox_touches_frame_edge(
+    bbox_px: tuple[int, int, int, int], frame_size_px: tuple[int, int]
+) -> bool:
+    x, y, width, height = bbox_px
+    frame_width, frame_height = frame_size_px
+    return (
+        x <= 0
+        or y <= 0
+        or x + width >= frame_width
+        or y + height >= frame_height
+    )
+
+
+def _largest_complete_centred_crop(
+    centroid_px: tuple[float, float],
+    bbox_px: tuple[int, int, int, int],
+    frame_size_px: tuple[int, int],
+    target_size_px: int,
+) -> int | None:
+    centre_x, centre_y = centroid_px
+    frame_width, frame_height = frame_size_px
+    radius = math.floor(
+        min(centre_x, centre_y, frame_width - centre_x, frame_height - centre_y)
+    )
+    available = min(target_size_px, max(0, radius * 2))
+    if available % 2:
+        available -= 1
+    x, y, width, height = bbox_px
+    required_radius = max(
+        centre_x - x,
+        x + width - centre_x,
+        centre_y - y,
+        y + height - centre_y,
+    )
+    required = math.ceil(required_radius * 2)
+    return available if available >= max(2, required) else None
+
+
+def _resized_materializer(
+    materializer: Callable[[], np.ndarray], target_size_px: int
+) -> Callable[[], np.ndarray]:
+    def resized() -> np.ndarray:
+        return cv2.resize(
+            materializer(),
+            (target_size_px, target_size_px),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+    return resized
 
 
 def extract_square_crop(

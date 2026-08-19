@@ -36,6 +36,11 @@ class PredictionTests(unittest.TestCase):
         )
         self.assertIsNotNone(exited_prediction)
         self.assertEqual(exited_prediction.bean_ref, track.bean_ref)
+        self.assertIsNone(
+            TrajectoryPredictor(GateLayout(67.0)).predict(
+                replace(track, status=TrackStatus.TENTATIVE, hits=1)
+            )
+        )
 
     def test_gate_layout_requires_central_odd_gate(self):
         with self.assertRaises(ValueError):

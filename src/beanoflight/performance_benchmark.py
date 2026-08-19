@@ -18,6 +18,7 @@ from .registry_models import InferenceStatus
 from .registry_zmq import ZeroMQRegistryClient
 from .sorter import SorterService
 from .telemetry import summarize_samples
+from .timing_ledger import summarize_timing_ledgers
 
 
 def _scenarios(value: str) -> tuple[str, ...]:
@@ -44,6 +45,17 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--maximum-frames", type=int, default=1_000)
     result.add_argument("--prebuffer-frames", type=int, default=60)
     result.add_argument("--crops-per-bean", type=int, default=1)
+    result.add_argument("--crop-size", type=int, default=224)
+    result.add_argument(
+        "--no-adaptive-edge-resize",
+        action="store_true",
+        help="disable resizing smaller complete crops near the frame edge",
+    )
+    result.add_argument(
+        "--crop-processing",
+        choices=("ml-fast", "calibrated"),
+        default="ml-fast",
+    )
     result.add_argument("--database", type=Path)
     result.add_argument("--output", type=Path)
     return result
@@ -74,7 +86,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     sorter = context.Process(
         target=_run_sorter,
-        args=(commands, service_stop, sorter_ready),
+        args=(commands, events, service_stop, sorter_ready),
         name="beano-benchmark-sorter",
     )
     try:
@@ -131,6 +143,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "database": str(database.resolve()),
             "target_fps": arguments.target_fps,
             "repeats": arguments.repeats,
+            "adaptive_edge_resize": not arguments.no_adaptive_edge_resize,
             "summaries": _scenario_summaries(runs, arguments.target_fps),
             "runs": runs,
         }
@@ -172,8 +185,12 @@ def _run_inferencer(commands, crops, stop, ready) -> None:
     service.close(drain=False)
 
 
-def _run_sorter(commands, stop, ready) -> None:
-    service = SorterService(registry_endpoint=commands, activity=None)
+def _run_sorter(commands, events, stop, ready) -> None:
+    service = SorterService(
+        registry_endpoint=commands,
+        event_endpoint=events,
+        activity=None,
+    )
     service.start()
     ready.set()
     stop.wait()
@@ -214,6 +231,10 @@ def _run_replay(arguments, commands: str, crops: str, scenario: str) -> dict:
         str(arguments.maximum_frames),
         "--crops-per-bean",
         str(arguments.crops_per_bean),
+        "--crop-size",
+        str(arguments.crop_size),
+        "--crop-processing",
+        arguments.crop_processing,
         "--registry",
         commands,
         "--crops",
@@ -223,6 +244,8 @@ def _run_replay(arguments, commands: str, crops: str, scenario: str) -> dict:
     ]
     if scenario == "core":
         command.append("--no-crops")
+    if arguments.no_adaptive_edge_resize:
+        command.append("--no-adaptive-edge-resize")
     completed = subprocess.run(
         command,
         check=False,
@@ -262,10 +285,19 @@ def _wait_for_outcome(
                 }
                 for job in jobs
             )
+            finalized_decisions = sum(
+                record.decision is not None
+                and (
+                    record.decision.acknowledged_timestamp_ns is not None
+                    or record.actuation is not None
+                )
+                for record in records
+            )
             if (
                 len(jobs) >= expected_jobs
                 and terminal >= expected_jobs
                 and decisions >= expected_decisions
+                and finalized_decisions >= decisions
             ):
                 settled = True
                 break
@@ -288,8 +320,26 @@ def _wait_for_outcome(
         "jobs_failed": sum(job.status == InferenceStatus.FAILED for job in jobs),
         "decisions": sum(record.decision is not None for record in records),
         "actuations": sum(record.actuation is not None for record in records),
+        "actuations_succeeded": sum(
+            record.actuation is not None and record.actuation.success
+            for record in records
+        ),
+        "actuations_failed": sum(
+            record.actuation is not None and not record.actuation.success
+            for record in records
+        ),
+        "two_gate_decisions": sum(
+            record.decision is not None and len(record.decision.gate_indices) == 2
+            for record in records
+        ),
+        "combined_probability_decisions": sum(
+            record.decision is not None
+            and "adjacent gates combined probability" in record.decision.reason
+            for record in records
+        ),
         "hot_records_evicted": evicted,
         "settled": settled,
+        "timing_ledger": summarize_timing_ledgers(records),
     }
 
 

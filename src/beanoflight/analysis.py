@@ -21,6 +21,9 @@ from .tracking import TrackerSettings, TrackManager
 
 ProgressCallback = Callable[[int, int, FrameAnalysis], None]
 PositionMapper = Callable[[tuple[float, float]], tuple[float, float]]
+PositionsMapper = Callable[
+    [tuple[tuple[float, float], ...]], tuple[tuple[float, float], ...]
+]
 
 
 class RegistryWriter(Protocol):
@@ -63,6 +66,7 @@ class AnalysisEngine:
         events: EventBus | None = None,
         registry: RegistryWriter | None = None,
         position_mapper: PositionMapper | None = None,
+        positions_mapper: PositionsMapper | None = None,
     ) -> None:
         self.calibration = calibration
         self.detector = detector
@@ -72,6 +76,7 @@ class AnalysisEngine:
         self.events = events
         self.registry = registry
         self.position_mapper = position_mapper or calibration.pixel_to_mm
+        self.positions_mapper = positions_mapper
         self.last_registry_revisions: dict[BeanRef, int] = {}
         self.tracker = TrackManager(
             top_y_mm=calibration.top_y_mm,
@@ -92,14 +97,24 @@ class AnalysisEngine:
         started = time.perf_counter_ns()
         detection_result = self.detector.detect(frame_bgr, self.background_bgr)
         detection_finished = time.perf_counter_ns()
+        centroids = tuple(
+            detection.centroid_px for detection in detection_result.detections
+        )
+        positions = (
+            self.positions_mapper(centroids)
+            if self.positions_mapper is not None
+            else tuple(self.position_mapper(point) for point in centroids)
+        )
+        if len(positions) != len(detection_result.detections):
+            raise ValueError("batch coordinate mapper returned the wrong point count")
         observations = tuple(
             Observation(
                 frame_index=frame_index,
                 timestamp_ns=timestamp_ns,
                 detection=detection,
-                position_mm=self.position_mapper(detection.centroid_px),
+                position_mm=position_mm,
             )
-            for detection in detection_result.detections
+            for detection, position_mm in zip(detection_result.detections, positions)
         )
         mapping_finished = time.perf_counter_ns()
         tracks = self.tracker.update(observations, timestamp_ns)

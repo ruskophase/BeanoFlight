@@ -5,12 +5,20 @@ from types import SimpleNamespace
 import numpy as np
 
 from beanoflight.app import background_key_action
-from beanoflight.mock_inferencer_app import crop_preview_image
+from beanoflight.mock_inferencer_app import (
+    _format_latency_curve,
+    _parse_latency_curve,
+    crop_preview_image,
+)
 from beanoflight.registry_monitor_app import actuation_display
 from beanoflight.system_test import _background_indices
 
 
 class GuiHelperTests(unittest.TestCase):
+    def test_mock_latency_curve_round_trip(self):
+        curve = ((2, 15.0), (4, 18.0), (20, 38.0))
+        self.assertEqual(_parse_latency_curve(_format_latency_curve(curve)), curve)
+
     def test_registry_actuation_states_are_explicit(self):
         waiting = SimpleNamespace(decision=None, actuation=None)
         no_action = SimpleNamespace(

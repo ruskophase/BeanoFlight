@@ -207,7 +207,7 @@ class CropDispatcher:
         self.registry_endpoint = registry_endpoint
         self.inference_endpoint = inference_endpoint
         self.timeout_ms = timeout_ms
-        self._queue: queue.Queue[tuple[CropPayload, int]] = queue.Queue(
+        self._queue: queue.Queue[tuple[tuple[CropPayload, ...], int]] = queue.Queue(
             maxsize=max(1, capacity)
         )
         self._stop = threading.Event()
@@ -235,29 +235,57 @@ class CropDispatcher:
     def register_and_enqueue(
         self, payload: CropPayload, registry: ZeroMQRegistryClient
     ) -> bool:
-        stage_started = time.perf_counter_ns()
+        return self.register_and_enqueue_many((payload,), registry)
+
+    def register_and_enqueue_many(
+        self,
+        payloads: tuple[CropPayload, ...],
+        registry: ZeroMQRegistryClient,
+    ) -> bool:
+        if not payloads:
+            return True
         compact_submit = getattr(registry, "submit_inference_job_revision", None)
-        if compact_submit is None:
-            registry.submit_inference_job(payload.job, event_id=payload.job.job_id)
-        else:
-            compact_submit(payload.job, event_id=payload.job.job_id)
-        self._timings["registry_submit_ms"].add(
-            (time.perf_counter_ns() - stage_started) / 1_000_000.0
+        for payload in payloads:
+            stage_started = time.perf_counter_ns()
+            if compact_submit is None:
+                registry.submit_inference_job(
+                    payload.job, event_id=payload.job.job_id
+                )
+            else:
+                compact_submit(payload.job, event_id=payload.job.job_id)
+            self._timings["registry_submit_ms"].add(
+                (time.perf_counter_ns() - stage_started) / 1_000_000.0
+            )
+        queued_monotonic_ns = time.monotonic_ns()
+        payloads = tuple(
+            CropPayload(
+                replace(
+                    payload.job,
+                    timing_marks_ns={
+                        **payload.job.timing_marks_ns,
+                        "crop_queued_monotonic_ns": queued_monotonic_ns,
+                    },
+                ),
+                payload.image_bgr,
+                payload.materializer,
+            )
+            for payload in payloads
         )
         try:
-            self._queue.put_nowait((payload, time.perf_counter_ns()))
+            self._queue.put_nowait((payloads, time.perf_counter_ns()))
         except queue.Full:
-            self.dropped += 1
-            registry.update_inference_job(
-                payload.job.bean_ref,
-                payload.job.job_id,
-                InferenceStatus.DROPPED,
-                payload.job.capture_timestamp_ns,
-                detail="crop dispatch queue full",
-                event_id=f"drop:{payload.job.job_id}",
-            )
+            self.dropped += len(payloads)
+            for payload in payloads:
+                registry.update_inference_job(
+                    payload.job.bean_ref,
+                    payload.job.job_id,
+                    InferenceStatus.DROPPED,
+                    payload.job.capture_timestamp_ns,
+                    detail="crop dispatch queue full",
+                    event_id=f"drop:{payload.job.job_id}",
+                )
             return False
-        self.submitted += 1
+        self.submitted += len(payloads)
         return True
 
     def performance_metrics(self) -> dict[str, dict[str, float | int]]:
@@ -280,57 +308,106 @@ class CropDispatcher:
         try:
             while not self._stop.is_set() or not self._queue.empty():
                 try:
-                    payload, enqueued_ns = self._queue.get(timeout=0.05)
+                    payloads, enqueued_ns = self._queue.get(timeout=0.05)
                 except queue.Empty:
                     continue
                 try:
-                    self._timings["queue_delay_ms"].add(
-                        (time.perf_counter_ns() - enqueued_ns) / 1_000_000.0
-                    )
+                    queue_delay_ms = (
+                        time.perf_counter_ns() - enqueued_ns
+                    ) / 1_000_000.0
+                    for _payload in payloads:
+                        self._timings["queue_delay_ms"].add(queue_delay_ms)
+                    dispatch_dequeued_ns = time.monotonic_ns()
                     stage_started = time.perf_counter_ns()
-                    sender.submit(payload.materialized())
-                    self._timings["materialize_send_ms"].add(
-                        (time.perf_counter_ns() - stage_started) / 1_000_000.0
+                    materialized_items = []
+                    for payload in payloads:
+                        ready = payload.materialized()
+                        crop_materialized_ns = time.monotonic_ns()
+                        materialized_items.append(
+                            CropPayload(
+                                replace(
+                                    ready.job,
+                                    timing_marks_ns={
+                                        **ready.job.timing_marks_ns,
+                                        "dispatch_dequeued_monotonic_ns": (
+                                            dispatch_dequeued_ns
+                                        ),
+                                        "crop_materialized_monotonic_ns": (
+                                            crop_materialized_ns
+                                        ),
+                                    },
+                                ),
+                                ready.image_bgr,
+                            )
+                        )
+                    inference_send_ns = time.monotonic_ns()
+                    materialized = tuple(
+                        CropPayload(
+                            replace(
+                                payload.job,
+                                timing_marks_ns={
+                                    **payload.job.timing_marks_ns,
+                                    "inference_send_monotonic_ns": inference_send_ns,
+                                },
+                            ),
+                            payload.image_bgr,
+                        )
+                        for payload in materialized_items
                     )
-                    try:
+                    sender.submit_batch(materialized)
+                    inference_ack_ns = time.monotonic_ns()
+                    materialize_send_ms = (
+                        time.perf_counter_ns() - stage_started
+                    ) / 1_000_000.0
+                    for _payload in payloads:
+                        self._timings["materialize_send_ms"].add(
+                            materialize_send_ms / len(payloads)
+                        )
+                    for payload in materialized:
                         stage_started = time.perf_counter_ns()
-                        registry.update_inference_job(
-                            payload.job.bean_ref,
-                            payload.job.job_id,
-                            InferenceStatus.ACCEPTED,
-                            payload.job.capture_timestamp_ns,
-                            event_id=f"accept:{payload.job.job_id}",
-                        )
-                        self._timings["registry_accept_ms"].add(
-                            (time.perf_counter_ns() - stage_started) / 1_000_000.0
-                        )
-                    except RegistryRemoteError:
-                        # A zero-latency worker can complete the job between the
-                        # crop ACK and this bookkeeping call. Completion is a
-                        # successful terminal state, not a dispatch failure.
-                        record = registry.get(
-                            payload.job.bean_ref, include_history=False
-                        )
-                        current = next(
-                            item
-                            for item in record.inference_jobs
-                            if item.job_id == payload.job.job_id
-                        )
-                        if current.status != InferenceStatus.COMPLETED:
-                            raise
+                        try:
+                            registry.update_inference_job(
+                                payload.job.bean_ref,
+                                payload.job.job_id,
+                                InferenceStatus.ACCEPTED,
+                                payload.job.capture_timestamp_ns,
+                                timing_marks_ns={
+                                    **payload.job.timing_marks_ns,
+                                    "inference_ack_monotonic_ns": inference_ack_ns,
+                                },
+                                event_id=f"accept:{payload.job.job_id}",
+                            )
+                            self._timings["registry_accept_ms"].add(
+                                (time.perf_counter_ns() - stage_started)
+                                / 1_000_000.0
+                            )
+                        except RegistryRemoteError:
+                            # A fast worker can complete a whole frame batch
+                            # before its per-job acceptance bookkeeping finishes.
+                            record = registry.get(
+                                payload.job.bean_ref, include_history=False
+                            )
+                            current = next(
+                                item
+                                for item in record.inference_jobs
+                                if item.job_id == payload.job.job_id
+                            )
+                            if current.status != InferenceStatus.COMPLETED:
+                                raise
                 except Exception as exc:  # noqa: BLE001 - failure is registry state
-                    self.dropped += 1
-                    try:
-                        registry.update_inference_job(
-                            payload.job.bean_ref,
-                            payload.job.job_id,
-                            InferenceStatus.DROPPED,
-                            payload.job.capture_timestamp_ns,
-                            detail=str(exc),
-                            event_id=f"drop:{payload.job.job_id}",
-                        )
-                    except Exception:  # noqa: BLE001, S110 - both services may be down
-                        pass
+                    self.dropped += len(payloads)
+                    for payload in payloads:
+                        try:
+                            registry.update_inference_job(
+                                payload.job.bean_ref,
+                                payload.job.job_id,
+                                InferenceStatus.DROPPED,
+                                payload.job.capture_timestamp_ns,
+                                detail=str(exc),
+                                event_id=f"drop:{payload.job.job_id}",
+                            )
+                        except Exception:  # noqa: BLE001, S110 - services may be down
+                            pass
                 finally:
                     self._queue.task_done()
         finally:
@@ -403,6 +480,17 @@ class ReplayRunner:
                     None
                     if self.crop_selector is None
                     else self.crop_selector.settings.max_crops_per_bean
+                ),
+                "crop_policy": (
+                    None
+                    if self.crop_selector is None
+                    else {
+                        "require_complete_bean_bbox": True,
+                        "allow_padding": self.crop_selector.settings.allow_padding,
+                        "adaptive_edge_resize": (
+                            self.crop_selector.settings.adaptive_edge_resize
+                        ),
+                    }
                 ),
                 "source_pipeline": getattr(self.source, "pipeline_metadata", {}),
                 "execution_profile": self.profile_metadata,
@@ -521,12 +609,12 @@ class ReplayRunner:
                         self.crop_selector is not None
                         and self.crop_dispatcher is not None
                     ):
-                        for crop in self.crop_selector.select(
+                        crops = self.crop_selector.select(
                             frame, analysis, self.engine.last_registry_revisions
-                        ):
-                            self.crop_dispatcher.register_and_enqueue(
-                                crop, self.registry
-                            )
+                        )
+                        self.crop_dispatcher.register_and_enqueue_many(
+                            crops, self.registry
+                        )
                     crop_ms = (time.perf_counter_ns() - crop_started) / 1_000_000.0
                     timing_samples["crop_select_register_ms"].append(crop_ms)
                     if self.settings.preview_enabled and on_preview is not None:

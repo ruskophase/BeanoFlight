@@ -2,6 +2,8 @@ import argparse
 import unittest
 
 from beanoflight.performance_benchmark import _scenario_summaries, _scenarios
+from beanoflight.performance_benchmark import parser as benchmark_parser
+from beanoflight.system_test import parser as system_test_parser
 
 
 class PerformanceBenchmarkTests(unittest.TestCase):
@@ -9,6 +11,35 @@ class PerformanceBenchmarkTests(unittest.TestCase):
         self.assertEqual(_scenarios("core,full,core"), ("core", "full"))
         with self.assertRaises(argparse.ArgumentTypeError):
             _scenarios("visual")
+
+    def test_adaptive_edge_resize_is_enabled_unless_explicitly_disabled(self):
+        benchmark = benchmark_parser().parse_args(
+            ["recording", "--background-frames", "1,2,3"]
+        )
+        system_test = system_test_parser().parse_args(
+            ["recording", "--background-frames", "1,2,3"]
+        )
+        self.assertFalse(benchmark.no_adaptive_edge_resize)
+        self.assertFalse(system_test.no_adaptive_edge_resize)
+
+        benchmark = benchmark_parser().parse_args(
+            [
+                "recording",
+                "--background-frames",
+                "1,2,3",
+                "--no-adaptive-edge-resize",
+            ]
+        )
+        system_test = system_test_parser().parse_args(
+            [
+                "recording",
+                "--background-frames",
+                "1,2,3",
+                "--no-adaptive-edge-resize",
+            ]
+        )
+        self.assertTrue(benchmark.no_adaptive_edge_resize)
+        self.assertTrue(system_test.no_adaptive_edge_resize)
 
     def test_scenario_summary_reports_repeat_stability(self):
         runs = [
