@@ -16,6 +16,7 @@ from .esp32_actuator import (
     ESP32ActuatorService,
 )
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
+from .runtime_priority import apply_latency_thread_profile
 
 
 class ActuatorApp(tk.Tk):
@@ -180,6 +181,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     arguments = parser().parse_args(argv)
+    apply_latency_thread_profile()
     ActuatorApp(
         registry_endpoint=arguments.registry,
         actuation_endpoint=arguments.plans,

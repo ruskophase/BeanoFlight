@@ -14,6 +14,7 @@ from test_registry import track
 from beanoflight.models import BeanRef
 from beanoflight.registry import BeanRegistry
 from beanoflight.registry_models import (
+    ActuationResult,
     Enrichment,
     InferenceJob,
     InferenceStatus,
@@ -109,6 +110,7 @@ class ZeroMQRegistryTests(unittest.TestCase):
             self.assertEqual(ping["service"], "BeanRegistry")
             self.assertGreaterEqual(ping["api_version"], 2)
             self.assertIn("complete_inference_jobs_ack", ping["capabilities"])
+            self.assertIn("record_actuation_ack", ping["capabilities"])
             self.assertEqual(ping["database"], str(repository.path.resolve()))
             # PUB/SUB subscriptions are asynchronous; allow the local handshake.
             time.sleep(0.1)
@@ -195,6 +197,19 @@ class ZeroMQRegistryTests(unittest.TestCase):
                 [event.stream_sequence for event in journal], [1, 2, 3, 4, 5, 6]
             )
             self.assertEqual(client.event_cursor(), 6)
+            actuation_revision = client.record_actuation_ack(
+                bean_ref,
+                ActuationResult(
+                    decision.decision_id,
+                    "esp32-s2-gptimer",
+                    179_000_000,
+                    191_000_000,
+                    True,
+                ),
+            )
+            self.assertEqual(actuation_revision, 7)
+            self.assertTrue(client.get(bean_ref).actuation.success)
+            self.assertEqual(client.event_cursor(), 7)
             metrics = client.service_metrics()
             self.assertGreater(
                 metrics["operations_ms"]["update_track_revisions"]["count"], 0

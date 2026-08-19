@@ -53,9 +53,11 @@ MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 REGISTRY_API_VERSION = 2
 CAPABILITY_COMPLETE_INFERENCE_JOBS_ACK = "complete_inference_jobs_ack"
 CAPABILITY_ADD_ENRICHMENTS = "add_enrichments"
+CAPABILITY_RECORD_ACTUATION_ACK = "record_actuation_ack"
 REGISTRY_CAPABILITIES = (
     CAPABILITY_COMPLETE_INFERENCE_JOBS_ACK,
     CAPABILITY_ADD_ENRICHMENTS,
+    CAPABILITY_RECORD_ACTUATION_ACK,
     "event_batches",
     "events_since_compact",
 )
@@ -484,12 +486,14 @@ class ZeroMQRegistryServer:
                 event_id=str(payload.get("event_id") or request_id),
             )
             return record_to_dict(record, include_history=False)
-        if operation == "record_actuation":
+        if operation in {"record_actuation", "record_actuation_ack"}:
             record = self.registry.record_actuation(
                 bean_ref_from_dict(_object(payload["bean_ref"])),
                 actuation_from_dict(_object(payload["actuation"])),
                 event_id=str(payload.get("event_id") or request_id),
             )
+            if operation == "record_actuation_ack":
+                return record.revision
             return record_to_dict(record, include_history=False)
         raise ValueError(f"unknown registry operation: {operation}")
 
@@ -976,6 +980,26 @@ class ZeroMQRegistryClient:
                         "event_id": event_id or f"actuation:{result.decision_id}",
                     },
                 )
+            )
+        )
+
+    def record_actuation_ack(
+        self,
+        bean_ref: BeanRef,
+        result: ActuationResult,
+        *,
+        event_id: str | None = None,
+    ) -> int:
+        """Commit an actuation audit without echoing materialized bean state."""
+
+        return int(
+            self._request(
+                "record_actuation_ack",
+                {
+                    "bean_ref": bean_ref_to_dict(bean_ref),
+                    "actuation": actuation_to_dict(result),
+                    "event_id": event_id or f"actuation:{result.decision_id}",
+                },
             )
         )
 

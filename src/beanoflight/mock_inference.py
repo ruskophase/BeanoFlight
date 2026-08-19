@@ -669,6 +669,7 @@ class MockInferencerService:
                 (payload, category, confidence, queue_ms, service_ms, deadline_missed)
             )
         if direct is not None:
+            direct_attempt_ns = time.monotonic_ns()
             try:
                 sent, direct_sent_ns = direct.send_batch(
                     batch_id, tuple(direct_items)
@@ -677,6 +678,18 @@ class MockInferencerService:
                 sent = False
                 direct_sent_ns = time.monotonic_ns()
                 self._emit("error", detail=f"direct evidence: {exc}")
+            direct_completed_ns = time.monotonic_ns()
+            for _bean_ref, _job_id, _enrichment, marks, _event_id in completions:
+                marks.update(
+                    {
+                        "direct_delivery_attempted": 1,
+                        "direct_delivery_acknowledged": int(sent),
+                        "direct_delivery_attempt_monotonic_ns": direct_attempt_ns,
+                        "direct_delivery_completed_monotonic_ns": (
+                            direct_completed_ns
+                        ),
+                    }
+                )
             with self._stats_lock:
                 if sent:
                     self.direct_batches_sent += 1

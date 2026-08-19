@@ -47,6 +47,7 @@ from .registry_zmq import (
     ZeroMQRegistryClient,
     ZeroMQRegistrySubscriber,
 )
+from .runtime_priority import lower_current_thread_priority
 from .sorting_context_transport import (
     DEFAULT_SORTING_CONTEXT_ENDPOINT,
     SortingContextBatch,
@@ -157,6 +158,12 @@ class _RecoveredRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class _ReceivedDirectBatch:
+    batch: DirectEvidenceBatch
+    received_monotonic_ns: int
+
+
+@dataclass(frozen=True, slots=True)
 class _ExternalActuation:
     record: BeanRecord
     session: RunSession
@@ -165,6 +172,8 @@ class _ExternalActuation:
 
 class SorterService:
     """Recoverable decision service with an isolated actuation-plan output."""
+
+    EXTERNAL_ACTUATION_WORKERS = 4
 
     def __init__(
         self,
@@ -201,6 +210,12 @@ class SorterService:
         self._sessions: dict[str, RunSession] = {}
         self._direct_evidence: dict[BeanRef, dict[str, Enrichment]] = {}
         self._direct_timing: dict[str, tuple[int, int]] = {}
+        self._direct_ingress: queue.Queue[_ReceivedDirectBatch] = queue.Queue(
+            maxsize=1_024
+        )
+        self._direct_ingress_ready = threading.Event()
+        if not self.classification_endpoint:
+            self._direct_ingress_ready.set()
         self._sorting_contexts: dict[BeanRef, _CachedSortingContext] = {}
         self._recovery_queue: queue.Queue[RunSession | _RecoveredRecord] = (
             queue.Queue(maxsize=2_048)
@@ -223,6 +238,7 @@ class SorterService:
         self.deadline_fallbacks = 0
         self.direct_batches_received = 0
         self.direct_evidence_received = 0
+        self.direct_batches_rejected = 0
         self.direct_registry_reads = 0
         self.registry_recovery_decisions = 0
         self.context_batches_received = 0
@@ -242,20 +258,30 @@ class SorterService:
     def start(self) -> None:
         if self._threads:
             return
-        workers = [
+        workers = []
+        if self.classification_endpoint:
+            workers.append(
+                (
+                    "beano-sorter-evidence-ingress",
+                    self._direct_evidence_ingress_loop,
+                )
+            )
+        workers.extend([
             ("beano-sorter-decisions", self._decision_loop),
             ("beano-sorter-recovery", self._recovery_loop),
             ("beano-sorter-audit", self._audit_loop),
             ("beano-actuation-audit", self._actuation_audit_loop),
-        ]
-        workers.append(
-            (
-                "beano-external-actuator-plans",
-                self._external_actuator_loop,
+        ])
+        if self.actuation_endpoint:
+            workers.extend(
+                (
+                    f"beano-external-actuator-plans-{index + 1}",
+                    self._external_actuator_loop,
+                )
+                for index in range(self.EXTERNAL_ACTUATION_WORKERS)
             )
-            if self.actuation_endpoint
-            else ("beano-virtual-actuator", self._actuator_loop)
-        )
+        else:
+            workers.append(("beano-virtual-actuator", self._actuator_loop))
         for name, target in workers:
             thread = threading.Thread(target=target, name=name, daemon=True)
             self._threads.append(thread)
@@ -270,14 +296,8 @@ class SorterService:
         self._threads.clear()
 
     def _decision_loop(self) -> None:
-        direct = None
         contexts = None
         try:
-            if self.classification_endpoint:
-                direct = ZeroMQDirectEvidenceReceiver(
-                    self.classification_endpoint
-                )
-                self.classification_endpoint = direct.endpoint
             if self.sorting_context_endpoint:
                 contexts = ZeroMQSortingContextReceiver(
                     self.sorting_context_endpoint
@@ -287,18 +307,32 @@ class SorterService:
             self.startup_error = str(exc)
             self._emit("error", detail=self.startup_error)
             self.ready.set()
-            if direct is not None:
-                direct.close()
             if contexts is not None:
                 contexts.close()
             return
-        poller = _control_poller(direct, contexts)
+        if not self._direct_ingress_ready.wait(2.0):
+            self.startup_error = "direct evidence ingress did not become ready"
+            self._emit("error", detail=self.startup_error)
+            self.ready.set()
+            if contexts is not None:
+                contexts.close()
+            return
+        if self.startup_error:
+            self.ready.set()
+            if contexts is not None:
+                contexts.close()
+            return
+        poller = _control_poller(None, contexts)
         self.ready.set()
         try:
             while not self._stop.is_set():
                 try:
                     readable = dict(
-                        poller.poll(min(2, self._ensemble_receive_timeout_ms()))
+                        poller.poll(
+                            0
+                            if not self._direct_ingress.empty()
+                            else min(1, self._ensemble_receive_timeout_ms())
+                        )
                     )
                     if contexts is not None and (
                         contexts.socket in readable
@@ -314,33 +348,15 @@ class SorterService:
                                 None,
                                 received_monotonic_ns=time.monotonic_ns(),
                             )
-                    if direct is not None and (
-                        direct.socket in readable
-                        or direct.socket.poll(0, zmq.POLLIN)
-                    ):
-                        # Drain evidence which is already queued before expiring
-                        # an ensemble deadline. This never extends the deadline.
-                        for _index in range(256):
-                            if not direct.socket.poll(0, zmq.POLLIN):
-                                break
-                            self._process_direct_evidence(
-                                direct.receive_batch(),
-                                None,
-                                received_monotonic_ns=time.monotonic_ns(),
-                            )
+                    # The ingress worker has already decoded, admitted and ACKed
+                    # these batches. Context wins when both become ready together,
+                    # then evidence is drained without more socket work.
+                    self._drain_direct_ingress(limit=256)
                     self._drain_recovery_queue(limit=256)
                     # A result may have arrived while a context or Registry
                     # recovery item was handled. Poll once more at zero wait so
                     # queued evidence wins over an expiring fallback.
-                    if direct is not None:
-                        for _index in range(256):
-                            if not direct.socket.poll(0, zmq.POLLIN):
-                                break
-                            self._process_direct_evidence(
-                                direct.receive_batch(),
-                                None,
-                                received_monotonic_ns=time.monotonic_ns(),
-                            )
+                    self._drain_direct_ingress(limit=256)
                     # Only expire after every evidence message which was already
                     # readable at the deadline has had a chance to complete a pool.
                     self._release_due_ensemble_fallbacks(None)
@@ -350,10 +366,64 @@ class SorterService:
                     self._emit("error", detail=str(exc))
                     self._stop.wait(0.005)
         finally:
-            if direct is not None:
-                direct.close()
             if contexts is not None:
                 contexts.close()
+
+    def _direct_evidence_ingress_loop(self) -> None:
+        try:
+            receiver = ZeroMQDirectEvidenceReceiver(self.classification_endpoint)
+        except Exception as exc:  # noqa: BLE001 - surfaced to GUI/controller
+            self.startup_error = str(exc)
+            self._emit("error", detail=self.startup_error)
+            self._direct_ingress_ready.set()
+            return
+        self.classification_endpoint = receiver.endpoint
+        self._direct_ingress_ready.set()
+        try:
+            while not self._stop.is_set():
+                try:
+                    receiver.receive_batch(
+                        timeout_ms=100,
+                        accept=self._admit_direct_evidence,
+                    )
+                except Exception as exc:  # noqa: BLE001 - recovery remains live
+                    self.errors += 1
+                    self._emit("error", detail=f"direct evidence ingress: {exc}")
+                    self._stop.wait(0.001)
+        finally:
+            receiver.close()
+
+    def _admit_direct_evidence(
+        self,
+        batch: DirectEvidenceBatch,
+        received_monotonic_ns: int,
+    ) -> bool:
+        try:
+            self._direct_ingress.put_nowait(
+                _ReceivedDirectBatch(batch, received_monotonic_ns)
+            )
+        except queue.Full:
+            self.direct_batches_rejected += 1
+            return False
+        return True
+
+    def _drain_direct_ingress(self, *, limit: int) -> int:
+        drained = 0
+        for _index in range(limit):
+            try:
+                received = self._direct_ingress.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self._process_direct_evidence(
+                    received.batch,
+                    None,
+                    received_monotonic_ns=received.received_monotonic_ns,
+                )
+                drained += 1
+            finally:
+                self._direct_ingress.task_done()
+        return drained
 
     def _recovery_loop(self) -> None:
         """Own all Registry reads and notifications away from control timing."""
@@ -1319,6 +1389,7 @@ class SorterService:
             self._persist_audit(audit, registry)
 
     def _audit_loop(self) -> None:
+        lower_current_thread_priority()
         registry = ZeroMQRegistryClient(self.registry_endpoint, timeout_ms=2_000)
         try:
             while not self._stop.is_set() or not self._audit_queue.empty():
@@ -1415,6 +1486,7 @@ class SorterService:
         )
 
     def _actuation_audit_loop(self) -> None:
+        lower_current_thread_priority()
         registry = ZeroMQRegistryClient(self.registry_endpoint, timeout_ms=2_000)
         try:
             while not self._stop.is_set() or not self._actuation_audit_queue.empty():
@@ -1423,7 +1495,7 @@ class SorterService:
                 except queue.Empty:
                     continue
                 try:
-                    registry.record_actuation(
+                    registry.record_actuation_ack(
                         audit.bean_ref,
                         audit.result,
                         event_id=f"actuation:{audit.result.decision_id}",

@@ -98,6 +98,31 @@ class DirectClassificationTransportTests(unittest.TestCase):
                 publisher.send_batch("batch-1", (invalid,))
             publisher.close()
 
+    def test_admission_rejection_is_negatively_acknowledged(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            endpoint = f"ipc://{Path(temporary) / 'evidence.sock'}"
+            receiver = ZeroMQDirectEvidenceReceiver(endpoint)
+            publisher = ZeroMQDirectEvidencePublisher(
+                endpoint,
+                acknowledgement_timeout_ms=100,
+                maximum_attempts=1,
+            )
+            receive_thread = threading.Thread(
+                target=lambda: receiver.receive_batch(
+                    accept=lambda _batch, _received_ns: False
+                ),
+                daemon=True,
+            )
+            receive_thread.start()
+
+            sent, _sent_ns = publisher.send_batch("batch-rejected", (direct_item(),))
+
+            receive_thread.join(1.0)
+            self.assertFalse(receive_thread.is_alive())
+            self.assertFalse(sent)
+            publisher.close()
+            receiver.close()
+
 
 if __name__ == "__main__":
     unittest.main()

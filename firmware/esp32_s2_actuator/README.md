@@ -9,8 +9,13 @@ cannot close a shared gate prematurely.
 Safety behaviour:
 
 - CRC32 protects every newline-delimited command and event.
-- Schedules less than 500 us ahead, longer than 100 ms, malformed, or outside
-  the 21-bit gate mask are rejected.
+- Schedules less than 200 us ahead, longer than 100 ms, malformed, or outside
+  the 21-bit gate mask are rejected. The 200 us admission floor spans two
+  100 us scheduler scans; mechanical valve lead time remains a separate,
+  longer host policy.
+- BeanoActuator applies a 300 us host-admission floor before the board's
+  200 us firmware floor, leaving approximately one scheduler scan for native
+  USB transfer and table insertion.
 - A 500 ms communication watchdog cancels pending work and forces every output
   low.
 - ALL_OFF, CANCEL, duplicate plan acknowledgements, a bounded 64-plan table,

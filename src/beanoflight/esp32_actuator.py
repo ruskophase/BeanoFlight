@@ -14,8 +14,10 @@ import tty
 import zlib
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+
+import zmq
 
 from .actuation_transport import (
     DEFAULT_ACTUATION_ENDPOINT,
@@ -25,6 +27,7 @@ from .actuation_transport import (
 from .registry_models import ActuationResult
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
 from .registry_zmq import ZeroMQRegistryClient
+from .runtime_priority import lower_current_thread_priority
 
 FIRMWARE_PROTOCOL = "beano-actuator-v1"
 DEFAULT_ESP32_PORT = (
@@ -74,11 +77,21 @@ class _PendingHardwarePlan:
     plan: ActuationPlan
     sequence: int
     clock_offset_ns: int
+    admitted_monotonic_ns: int
     sent_monotonic_ns: int
     open_board_us: int
     close_board_us: int
     opened_board_us: int | None = None
+    acknowledged_board_us: int | None = None
     acknowledged: bool = False
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class _QueuedHardwarePlan:
+    open_monotonic_ns: int
+    arrival_order: int
+    plan: ActuationPlan = field(compare=False)
+    admitted_monotonic_ns: int = field(compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,7 +179,7 @@ class ESP32ActuatorService:
         registry_endpoint: str = DEFAULT_COMMAND_ENDPOINT,
         actuation_endpoint: str = DEFAULT_ACTUATION_ENDPOINT,
         serial_port: str = DEFAULT_ESP32_PORT,
-        minimum_board_notice_ms: float = 1.0,
+        minimum_board_notice_ms: float = 0.3,
         activity: Callable[[ActuatorActivity], None] | None = None,
     ) -> None:
         self.registry_endpoint = registry_endpoint
@@ -176,7 +189,9 @@ class ESP32ActuatorService:
         self.activity = activity
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
-        self._plans: queue.Queue[ActuationPlan] = queue.Queue(maxsize=256)
+        self._plans: queue.PriorityQueue[_QueuedHardwarePlan] = (
+            queue.PriorityQueue(maxsize=256)
+        )
         self._tests: queue.Queue[int] = queue.Queue(maxsize=4)
         self._results: queue.Queue[_ResultAudit] = queue.Queue(maxsize=256)
         self._accepted_decisions: set[str] = set()
@@ -190,6 +205,7 @@ class ESP32ActuatorService:
         self._state_lock = threading.Lock()
         self._next_request = 1
         self._next_plan = 1
+        self._plan_arrival_order = 0
         self.connected = False
         self.synchronized = False
         self.ready = threading.Event()
@@ -219,8 +235,7 @@ class ESP32ActuatorService:
         if self._threads:
             return
         for name, target in (
-            ("beano-actuator-plan-receiver", self._receive_loop),
-            ("beano-actuator-esp32-io", self._io_loop),
+            ("beano-actuator-plan-and-esp32-io", self._io_loop),
             ("beano-actuator-registry-audit", self._audit_loop),
         ):
             thread = threading.Thread(target=target, name=name, daemon=True)
@@ -249,22 +264,6 @@ class ESP32ActuatorService:
             thread.join(2.0)
         self._threads.clear()
 
-    def _receive_loop(self) -> None:
-        try:
-            receiver = ZeroMQActuationPlanReceiver(self.actuation_endpoint)
-        except Exception as exc:  # noqa: BLE001 - surfaced to GUI
-            self.startup_error = str(exc)
-            self._emit("error", detail=self.startup_error)
-            self.ready.set()
-            return
-        self.actuation_endpoint = receiver.endpoint
-        self.ready.set()
-        try:
-            while not self._stop.is_set():
-                receiver.receive(timeout_ms=100, accept=self._accept_plan)
-        finally:
-            receiver.close()
-
     def _accept_plan(self, plan: ActuationPlan) -> tuple[bool, str]:
         self.plans_received += 1
         with self._accepted_lock:
@@ -277,7 +276,16 @@ class ESP32ActuatorService:
                 self.plans_rejected += 1
                 return False, "plan reached actuator below its minimum notice"
             try:
-                self._plans.put_nowait(plan)
+                admitted_ns = time.monotonic_ns()
+                self._plan_arrival_order += 1
+                self._plans.put_nowait(
+                    _QueuedHardwarePlan(
+                        plan.open_monotonic_ns,
+                        self._plan_arrival_order,
+                        plan,
+                        admitted_ns,
+                    )
+                )
             except queue.Full:
                 self.plans_rejected += 1
                 return False, "ESP32 actuator queue is full"
@@ -285,13 +293,27 @@ class ESP32ActuatorService:
         return True, "queued for ESP32 hardware timer"
 
     def _io_loop(self) -> None:
+        try:
+            receiver = ZeroMQActuationPlanReceiver(self.actuation_endpoint)
+        except Exception as exc:  # noqa: BLE001 - surfaced to GUI
+            self.startup_error = str(exc)
+            self._emit("error", detail=self.startup_error)
+            self.ready.set()
+            return
+        self.actuation_endpoint = receiver.endpoint
+        self.ready.set()
         serial = _SerialCDC(self.serial_port)
+        poller = zmq.Poller()
+        poller.register(receiver.socket, zmq.POLLIN)
         last_ping_ns = 0
+        next_serial_open_ns = 0
         try:
             while not self._stop.is_set():
-                if serial.fd is None:
+                now_ns = time.monotonic_ns()
+                if serial.fd is None and now_ns >= next_serial_open_ns:
                     try:
                         serial.open()
+                        poller.register(serial.fd, zmq.POLLIN)
                         self.connected = True
                         self.synchronized = False
                         self._clock_samples.clear()
@@ -304,10 +326,23 @@ class ESP32ActuatorService:
                         else:
                             detail = str(exc)
                         self._emit("waiting", detail=detail)
-                        self._stop.wait(0.25)
-                        continue
+                        next_serial_open_ns = now_ns + 250_000_000
+                readable = dict(poller.poll(10))
+                # The same thread owns plan admission and USB. This removes an
+                # operating-system scheduling hop between an IPC ACK and the
+                # actual SCHEDULE write while retaining a bounded priority queue.
+                if receiver.socket in readable:
+                    for _index in range(32):
+                        if not receiver.socket.poll(0, zmq.POLLIN):
+                            break
+                        receiver.receive(timeout_ms=0, accept=self._accept_plan)
+                if serial.fd is None:
+                    continue
                 try:
-                    for line in serial.read_lines(0.002):
+                    # A ZeroMQ arrival wakes the kernel poll and the admitted
+                    # plan enters USB before routine serial input is handled.
+                    plans_sent = self._send_queued_plans(serial)
+                    for line in serial.read_lines(0.0):
                         try:
                             self._handle_line(line, time.monotonic_ns())
                         except ESP32ProtocolError as exc:
@@ -317,7 +352,6 @@ class ESP32ActuatorService:
                                 self.protocol_errors += 1
                             self._emit("ignored", detail=str(exc))
                     self._send_test_requests(serial)
-                    plans_sent = self._send_queued_plans(serial)
                     now_ns = time.monotonic_ns()
                     # A SCHEDULE command also feeds the board watchdog. Avoid
                     # putting routine clock traffic immediately ahead of urgent
@@ -339,10 +373,15 @@ class ESP32ActuatorService:
                     self.protocol_errors += 1
                     self._emit("error", detail=str(exc))
                     self._fail_pending(f"ESP32 link lost: {exc}")
+                    if serial.fd is not None:
+                        try:
+                            poller.unregister(serial.fd)
+                        except KeyError:
+                            pass
                     serial.close()
                     self.connected = False
                     self.synchronized = False
-                    self._stop.wait(0.1)
+                    next_serial_open_ns = time.monotonic_ns() + 100_000_000
         finally:
             if serial.fd is not None:
                 try:
@@ -371,6 +410,7 @@ class ESP32ActuatorService:
             serial.close()
             self.connected = False
             self.synchronized = False
+            receiver.close()
 
     def _send_test_requests(self, serial: _SerialCDC) -> None:
         for _index in range(4):
@@ -396,10 +436,11 @@ class ESP32ActuatorService:
         sent = 0
         for _index in range(32):
             try:
-                plan = self._plans.get_nowait()
+                queued = self._plans.get_nowait()
             except queue.Empty:
                 return sent
             try:
+                plan = queued.plan
                 sequence = self._allocate_plan()
                 request = self._allocate_request()
                 offset = self._clock_offset_ns
@@ -410,6 +451,7 @@ class ESP32ActuatorService:
                     plan,
                     sequence,
                     offset,
+                    queued.admitted_monotonic_ns,
                     time.monotonic_ns(),
                     open_us,
                     close_us,
@@ -474,7 +516,9 @@ class ESP32ActuatorService:
             plan_sequence = self._request_plans.pop(request, None)
             if plan_sequence is not None and plan_sequence in self._pending:
                 self._pending[plan_sequence] = replace(
-                    self._pending[plan_sequence], acknowledged=True
+                    self._pending[plan_sequence],
+                    acknowledged=True,
+                    acknowledged_board_us=int(fields[4]),
                 )
             return
         if command == "ERR":
@@ -483,7 +527,17 @@ class ESP32ActuatorService:
             request = int(fields[1])
             plan_sequence = self._request_plans.pop(request, None)
             if plan_sequence is not None:
-                self._fail_plan(plan_sequence, f"ESP32 rejected plan: {fields[2]}")
+                pending = self._pending.get(plan_sequence)
+                board_us = int(fields[3])
+                notice = (
+                    ""
+                    if pending is None
+                    else f"; board admission notice {(pending.open_board_us - board_us) / 1_000:.3f} ms"
+                )
+                self._fail_plan(
+                    plan_sequence,
+                    f"ESP32 rejected plan: {fields[2]}{notice}",
+                )
             return
         if command in {"OPEN", "CLOSE"}:
             if len(fields) != 4:
@@ -535,6 +589,11 @@ class ESP32ActuatorService:
             <= pending.plan.crossing_monotonic_ns
             <= actual_close_host_ns
         )
+        board_notice_ms = (
+            0.0
+            if pending.acknowledged_board_us is None
+            else (pending.open_board_us - pending.acknowledged_board_us) / 1_000
+        )
         result = ActuationResult(
             decision_id=pending.plan.decision_id,
             source="esp32-s2-gptimer",
@@ -548,6 +607,9 @@ class ESP32ActuatorService:
             )
             + (
                 f"; host clock-sync RTT {(self.clock_rtt_ms or 0.0):.3f} ms; "
+                f"actuator admission notice {(pending.plan.open_monotonic_ns - pending.admitted_monotonic_ns) / 1_000_000:.3f} ms; "
+                f"USB queue {(pending.sent_monotonic_ns - pending.admitted_monotonic_ns) / 1_000_000:.3f} ms; "
+                f"board admission notice {board_notice_ms:.3f} ms; "
                 f"open error {(actual_open_host_ns - pending.plan.open_monotonic_ns) / 1_000_000:.3f} ms; "
                 f"close error {(actual_close_host_ns - pending.plan.close_monotonic_ns) / 1_000_000:.3f} ms"
             ),
@@ -598,6 +660,7 @@ class ESP32ActuatorService:
         self._emit("failed", plan, detail=detail)
 
     def _audit_loop(self) -> None:
+        lower_current_thread_priority()
         registry = ZeroMQRegistryClient(self.registry_endpoint, timeout_ms=2_000)
         try:
             while not self._stop.is_set() or not self._results.empty():
@@ -606,7 +669,7 @@ class ESP32ActuatorService:
                 except queue.Empty:
                     continue
                 try:
-                    registry.record_actuation(
+                    registry.record_actuation_ack(
                         audit.plan.bean_ref,
                         audit.result,
                         event_id=f"actuation:{audit.result.decision_id}",

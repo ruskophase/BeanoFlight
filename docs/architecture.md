@@ -128,20 +128,33 @@ frame rate. Inference jobs and sorting decisions persist their source-clock and
 host-monotonic timing marks alongside crop provenance; no image data enters
 either transport or ledger.
 
-The direct evidence message uses a 3 ms acknowledgement deadline and bounded
-retry. The sorter acknowledges validated evidence before doing classification
-policy work. A Registry classification notification is held for a short
+The direct evidence message uses one bounded 15 ms acknowledgement window. A
+dedicated ingress worker acknowledges only after validating the batch and
+admitting it to a bounded in-process queue, before classification policy work.
+A negative or missing acknowledgement is retained in timing telemetry. A
+Registry classification notification is held for a short
 preference interval and then used as recovery if all direct attempts fail; the
 durable journal remains the restart and sequence-gap path.
 
 The sorter control worker performs no Registry or SQLite work. Registry
-snapshots, event recovery and audits have separate workers. Approved plans cross
-a second acknowledged IPC channel to BeanoActuator. That process synchronizes
+snapshots, event recovery and audits have separate workers. Four persistent
+handoff workers prevent one acknowledged plan from head-of-line blocking other
+beans in the same frame. Approved plans cross a second acknowledged IPC channel
+to BeanoActuator, where acknowledgement means that a validated plan is in its
+bounded deadline-ordered queue. That process synchronizes
 the host monotonic clock with the ESP32-S2 and transfers absolute gate-open and
 gate-close timestamps. A 1 MHz board GPTimer checks the bounded plan table every
 100 us, so host scheduling jitter and SQLite latency are no longer in the final
-edge-timing loop. The actuator's audit worker persists the observed hardware
-result after the cycle.
+edge-timing loop. Plan admission and native-USB I/O share one kernel-woken event
+loop, avoiding an extra host scheduling hop. The actuator's lower-priority audit
+worker persists the observed hardware result after the cycle through a compact
+Registry acknowledgement.
+
+The Performance launcher assigns general processes to the lower-numbered CPUs
+and reserves the highest two available CPUs for Sorter and Actuator. It also
+uses a shorter Python thread-switch interval in those latency-sensitive
+processes. These are host jitter controls, not a hard real-time guarantee; the
+firmware remains the sole owner of final output-edge timing.
 
 Each inference is stored as immutable `classification_evidence` containing its
 class order, complete probability vector, logits, ensemble ID and sample index.

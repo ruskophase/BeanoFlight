@@ -63,8 +63,10 @@ decision are then persisted by its audit worker. Each selected frame contributes
 only one logical CamL/CamR inference per bean; the second requested sample
 remains a later frame, not a duplicate inference of the same frame pair.
 
-The direct inference notification uses a short acknowledgement deadline and
-bounded retry. BeanRegistry still atomically stores every completed job and can
+The direct inference notification uses one bounded 15 ms acknowledgement
+window. The sorter acknowledges only after validating the batch and admitting
+it to its bounded ingress queue; a negative or missing acknowledgement leaves
+BeanRegistry as the recovery path. BeanRegistry still atomically stores every completed job and can
 materialize the same immutable
 `classification_pooled` result. Registry notifications and the durable event
 journal recover a lost direct message. If the later temporal sample would
@@ -129,6 +131,12 @@ BeanRegistry. The board uses a fixed schedule table and GPTimer tick, supports
 overlapping plans through per-gate reference counts, validates CRC32 on every
 line, rejects late or excessive pulses, and forces every output low after a
 500 ms communications watchdog timeout.
+
+In Performance mode the launcher reserves one CPU for BeanoActuator and one for
+BeanoSorter when at least four CPUs are available. Actuator plan admission and
+native-USB I/O share one kernel-woken event loop; Registry audit workers run at
+lower scheduling priority and use compact acknowledgements so audit work cannot
+normally displace a gate deadline.
 
 The 21 active-high indicator outputs are:
 

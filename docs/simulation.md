@@ -43,9 +43,10 @@ CamL mmap RG10 (fast) or calibrated MKV (fallback)
   write, so SQLite latency cannot postpone the gate deadline. If no individual gate
   qualifies, an optional adjacent pair can qualify on combined probability.
 - `beano-actuator` owns the ESP32-S2 USB connection. It clock-synchronizes the
-  board, admits acknowledged plans, converts host timestamps to the board clock,
-  and persists observed hardware cycles. The board's fixed GPTimer schedule and
-  watchdog own the final LED edge timing.
+  board, acknowledges only validated plans admitted to its bounded priority
+  queue, converts host timestamps to the board clock, and persists observed
+  hardware cycles. One kernel-woken worker owns both plan ingress and native USB;
+  the board's fixed GPTimer schedule and watchdog own the final LED edge timing.
 - `beano-flight` owns detection, identity, tracking, prediction and crop
   selection. Its Simulation tab controls input path, rate, preview, prebuffer,
   replay limit, crops per bean, crop size and sockets.
@@ -54,7 +55,9 @@ CamL mmap RG10 (fast) or calibrated MKV (fallback)
   only processes that launcher started. Its selected-by-default **Performance
   mode** suppresses registry event printing, pauses Registry Monitor polling,
   disables crop/activity rendering and gate animation, and opens BeanoFlight
-  in Simulation mode with the existing fast replay defaults. These are initial
+  in Simulation mode with the existing fast replay defaults. It also isolates
+  Sorter and Actuator onto their own CPUs when the machine has at least four.
+  These are initial
   GUI states, so a diagnostic display can be re-enabled when needed without
   restarting its worker service.
 - `beano-system-test` is the non-GUI replay driver for repeatable acceptance
@@ -143,6 +146,16 @@ actuations. The board acknowledged and completed all 52 cycles with no failed
 or late sorting decisions. Observed GPIO open/close error was 0.052 ms at p50,
 0.091 ms at p95 and below 0.10 ms maximum. This is a single hardware acceptance
 run, not a statistical timing qualification.
+
+The subsequent acknowledged-handoff acceptance used two 224 x 224 crops per
+bean and repeated the same 601-frame run three times. All runs passed at a
+minimum 59.999 FPS with no skipped frames or crop drops; mean frame analysis was
+5.30-5.40 ms. All 939 inference jobs settled, and all 471 selected direct
+evidence batches were admitted and positively acknowledged. The ESP32 completed
+57, 55 and 55 requested cycles (167 total) with no failure. GPIO open-error p95
+was 0.090-0.096 ms and the maximum was 0.099 ms. This verifies the software
+handoff contract under this workload; it is still not a statistical or
+electromechanical valve qualification.
 
 A separate startup check used an 81.7 MiB registry copy containing 1,143 beans
 and 14,208 events. The current-run snapshot took 53 ms once; subsequent idle

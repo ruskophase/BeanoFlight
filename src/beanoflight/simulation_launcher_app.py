@@ -24,6 +24,7 @@ from .registry_zmq import (
     CAPABILITY_COMPLETE_INFERENCE_JOBS_ACK,
     ZeroMQRegistryClient,
 )
+from .runtime_priority import apply_performance_affinity
 from .sorting_context_transport import DEFAULT_SORTING_CONTEXT_ENDPOINT
 
 REGISTRY_ABSENT = "absent"
@@ -187,6 +188,11 @@ class SimulationLauncherApp(tk.Tk):
             [sys.executable, "-m", module, *arguments],
             start_new_session=True,
         )
+        if self.performance_mode_var.get():
+            role = "actuator" if key == "actuator" else (
+                "sorter" if key == "sorter" else "general"
+            )
+            apply_performance_affinity(role, pid=self._processes[key].pid)
         return True
 
     def _start_registry(self, *, performance_mode: bool | None = None) -> bool:

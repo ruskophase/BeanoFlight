@@ -1,9 +1,10 @@
-"""Best-effort low-latency inference evidence transport to BeanoSorter."""
+"""Acknowledged low-latency inference evidence transport to BeanoSorter."""
 
 from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import zmq
@@ -53,8 +54,8 @@ class ZeroMQDirectEvidencePublisher:
         *,
         context: zmq.Context | None = None,
         capacity: int = 256,
-        acknowledgement_timeout_ms: int = 3,
-        maximum_attempts: int = 3,
+        acknowledgement_timeout_ms: int = 15,
+        maximum_attempts: int = 1,
     ) -> None:
         self.endpoint = endpoint
         self.context = context or zmq.Context.instance()
@@ -162,9 +163,19 @@ class ZeroMQDirectEvidenceReceiver:
         self.socket.bind(endpoint)
         self.endpoint = self.socket.getsockopt_string(zmq.LAST_ENDPOINT)
 
-    def receive_batch(self) -> DirectEvidenceBatch:
+    def receive_batch(
+        self,
+        *,
+        timeout_ms: int | None = None,
+        accept: Callable[[DirectEvidenceBatch, int], bool] | None = None,
+    ) -> DirectEvidenceBatch | None:
+        if timeout_ms is not None and not self.socket.poll(
+            max(0, int(timeout_ms)), zmq.POLLIN
+        ):
+            return None
         encoded = self.socket.recv()
         batch_id = ""
+        received_ns = time.monotonic_ns()
         try:
             if len(encoded) > MAX_DIRECT_EVIDENCE_BYTES:
                 raise DirectEvidenceTransportError(
@@ -197,6 +208,7 @@ class ZeroMQDirectEvidenceReceiver:
                     raise DirectEvidenceTransportError(
                         "invalid classification evidence item"
                     )
+            batch = DirectEvidenceBatch(batch_id, sent_ns, items)
         except Exception:
             self.socket.send(
                 _encode(
@@ -208,17 +220,41 @@ class ZeroMQDirectEvidenceReceiver:
                 )
             )
             raise
+        try:
+            admitted = accept is None or bool(accept(batch, received_ns))
+        except Exception:
+            self.socket.send(
+                _encode(
+                    {
+                        "schema": DIRECT_EVIDENCE_ACK_SCHEMA,
+                        "batch_id": batch_id,
+                        "ok": False,
+                    }
+                )
+            )
+            raise
+        if not admitted:
+            self.socket.send(
+                _encode(
+                    {
+                        "schema": DIRECT_EVIDENCE_ACK_SCHEMA,
+                        "batch_id": batch_id,
+                        "ok": False,
+                    }
+                )
+            )
+            return None
         self.socket.send(
             _encode(
                 {
                     "schema": DIRECT_EVIDENCE_ACK_SCHEMA,
                     "batch_id": batch_id,
                     "ok": True,
-                    "received_monotonic_ns": time.monotonic_ns(),
+                    "received_monotonic_ns": received_ns,
                 }
             )
         )
-        return DirectEvidenceBatch(batch_id, sent_ns, items)
+        return batch
 
     def close(self) -> None:
         self.socket.close(0)

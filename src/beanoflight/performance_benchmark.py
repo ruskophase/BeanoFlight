@@ -22,6 +22,10 @@ from .esp32_actuator import DEFAULT_ESP32_PORT, ESP32ActuatorService
 from .mock_inference import MockInferencerService
 from .registry_models import InferenceStatus
 from .registry_zmq import ZeroMQRegistryClient
+from .runtime_priority import (
+    apply_latency_thread_profile,
+    apply_performance_affinity,
+)
 from .sorter import SorterService
 from .telemetry import summarize_samples
 from .timing_ledger import summarize_timing_ledgers
@@ -146,6 +150,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             stderr=subprocess.PIPE,
             text=True,
         )
+        apply_performance_affinity("general", pid=registry_process.pid)
         _wait_for_registry(commands, registry_process)
         if actuator is not None:
             actuator.start()
@@ -200,7 +205,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "adaptive_edge_resize": not arguments.no_adaptive_edge_resize,
             "esp32_actuator": bool(arguments.esp32_actuator),
             "esp32_port": arguments.esp32_port,
-            "summaries": _scenario_summaries(runs, arguments.target_fps),
+            "summaries": _scenario_summaries(
+                runs,
+                arguments.target_fps,
+                require_successful_actuations=arguments.esp32_actuator,
+            ),
             "runs": runs,
         }
         encoded = json.dumps(report, indent=2, allow_nan=False) + "\n"
@@ -231,6 +240,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _run_inferencer(commands, crops, classifications, stop, ready) -> None:
+    apply_performance_affinity("general")
     service = MockInferencerService(
         registry_endpoint=commands,
         crop_endpoint=crops,
@@ -253,6 +263,8 @@ def _run_sorter(
     stop,
     ready,
 ) -> None:
+    apply_performance_affinity("sorter")
+    apply_latency_thread_profile()
     service = SorterService(
         registry_endpoint=commands,
         event_endpoint=events,
@@ -269,6 +281,8 @@ def _run_sorter(
 
 
 def _run_actuator(commands, plans, serial_port, stop, ready) -> None:
+    apply_performance_affinity("actuator")
+    apply_latency_thread_profile()
     service = ESP32ActuatorService(
         registry_endpoint=commands,
         actuation_endpoint=plans,
@@ -348,21 +362,23 @@ def _run_replay(
         command.append("--no-crops")
     if arguments.no_adaptive_edge_resize:
         command.append("--no-adaptive-edge-resize")
-    completed = subprocess.run(
+    replay = subprocess.Popen(
         command,
-        check=False,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         env=dict(os.environ),
     )
-    if completed.returncode:
+    apply_performance_affinity("general", pid=replay.pid)
+    stdout, stderr = replay.communicate()
+    if replay.returncode:
         raise RuntimeError(
-            f"{scenario} replay failed ({completed.returncode}): {completed.stderr}"
+            f"{scenario} replay failed ({replay.returncode}): {stderr}"
         )
-    marker = completed.stdout.rfind("\n{")
+    marker = stdout.rfind("\n{")
     if marker < 0:
         raise RuntimeError(f"{scenario} replay did not return a JSON summary")
-    return json.loads(completed.stdout[marker + 1 :])
+    return json.loads(stdout[marker + 1 :])
 
 
 def _wait_for_outcome(
@@ -494,7 +510,10 @@ def _wait_for_outcome(
 
 
 def _scenario_summaries(
-    runs: list[dict[str, object]], target_fps: float
+    runs: list[dict[str, object]],
+    target_fps: float,
+    *,
+    require_successful_actuations: bool = False,
 ) -> dict[str, object]:
     minimum_acceptable_fps = max(0.0, target_fps - 1.0)
     scenarios: dict[str, object] = {}
@@ -524,6 +543,10 @@ def _scenario_summaries(
             and int(run["outcome"]["jobs_failed"]) == 0
             and int(run["outcome"]["decisions"])
             == int(run["outcome"]["beans_with_jobs"])
+            and (
+                not require_successful_actuations
+                or int(run["outcome"].get("actuations_failed", 0)) == 0
+            )
             for run in selected
         )
         scenarios[scenario] = {

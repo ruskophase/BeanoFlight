@@ -127,6 +127,13 @@ def bean_timing_ledger(record: BeanRecord) -> dict[str, object]:
     )
     _duration(
         durations,
+        "direct_acknowledgement_ms",
+        marks,
+        "direct_delivery_attempt_monotonic_ns",
+        "direct_delivery_completed_monotonic_ns",
+    )
+    _duration(
+        durations,
         "inference_complete_to_sorter_ms",
         marks,
         "inference_completed_monotonic_ns",
@@ -304,6 +311,17 @@ def summarize_timing_ledgers(
             ),
             "registry_recovery_decisions": sum(
                 item["classification_delivery"] == "registry"
+                for item in ledgers
+            ),
+            "direct_delivery_acknowledged": sum(
+                bool(item["marks_ns"].get("direct_delivery_acknowledged", 0))
+                for item in ledgers
+            ),
+            "direct_delivery_unacknowledged": sum(
+                bool(item["marks_ns"].get("direct_delivery_attempted", 0))
+                and not bool(
+                    item["marks_ns"].get("direct_delivery_acknowledged", 0)
+                )
                 for item in ledgers
             ),
         },

@@ -98,6 +98,11 @@ virtual-gate animation disabled. The processing services continue to run; only
 their optional displays are paused. An already-running registry adopted by the
 launcher keeps its original logging setting.
 
+On machines with at least four available CPUs, Performance mode also reserves
+the highest-numbered CPU for BeanoActuator and the next for BeanoSorter; replay,
+Registry and inference use the remaining CPUs. On the six-core development
+Jetson this is CPUs 0-3 for general work, CPU4 for Sorter and CPU5 for Actuator.
+
 Disable preview for throughput checks. BeanoFlight reports source-read and
 analysis time separately. For a complete recording bundle, keep the
 memory-mapped RAW fast path enabled: it detects on the native green plane and
@@ -170,7 +175,9 @@ uses the stable USB path, and requires every reported cycle to complete. Use
 
 The benchmark owns isolated endpoints and keeps its Registry alive for every
 repetition. Confirm `passed` for both scenarios; this includes the FPS
-tolerance, zero dropped/failed jobs and complete expected decision counts.
+tolerance, zero dropped/failed jobs and complete expected decision counts. With
+`--esp32-actuator`, any recorded failed hardware cycle also makes the scenario
+fail.
 Then compare individual stage timings.
 
 After upgrading code that changes the registry command contract, stop all

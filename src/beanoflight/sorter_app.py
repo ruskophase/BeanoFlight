@@ -11,6 +11,7 @@ from tkinter import messagebox, ttk
 
 from .classification_transport import DEFAULT_DIRECT_EVIDENCE_ENDPOINT
 from .registry_service import DEFAULT_COMMAND_ENDPOINT, DEFAULT_EVENT_ENDPOINT
+from .runtime_priority import apply_latency_thread_profile
 from .sorter import SorterActivity, SorterService, SorterSettings
 from .sorting_context_transport import DEFAULT_SORTING_CONTEXT_ENDPOINT
 
@@ -252,6 +253,7 @@ class SorterApp(tk.Tk):
                 f"pools {service.pooled_classifications} · "
                 f"fallbacks {service.deadline_fallbacks} · "
                 f"direct evidence {service.direct_evidence_received} · "
+                f"direct queue rejects {service.direct_batches_rejected} · "
                 f"context hits {service.context_cache_hits} · "
                 f"context misses {service.context_cache_misses} · "
                 f"Registry recoveries {service.registry_recovery_decisions} · "
@@ -344,6 +346,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     arguments = parser().parse_args(argv)
+    apply_latency_thread_profile()
     SorterApp(
         arguments.registry,
         event_endpoint=arguments.events,

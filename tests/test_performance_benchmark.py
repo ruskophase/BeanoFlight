@@ -88,6 +88,37 @@ class PerformanceBenchmarkTests(unittest.TestCase):
         self.assertTrue(summary["passed"])
         self.assertEqual(summary["fps"]["count"], 3)
 
+    def test_hardware_summary_fails_if_an_actuation_fails(self):
+        runs = [
+            {
+                "scenario": "full",
+                "summary": {
+                    "achieved_fps": 60.0,
+                    "mean_processing_ms": 5.0,
+                    "crops_submitted": 1,
+                },
+                "outcome": {
+                    "settled": True,
+                    "jobs": 1,
+                    "jobs_completed": 1,
+                    "jobs_dropped": 0,
+                    "jobs_failed": 0,
+                    "decisions": 1,
+                    "beans_with_jobs": 1,
+                    "actuations_failed": 1,
+                },
+            }
+        ]
+
+        simulated = _scenario_summaries(runs, 60.0)["full"]
+        hardware = _scenario_summaries(
+            runs, 60.0, require_successful_actuations=True
+        )["full"]
+
+        self.assertTrue(simulated["passed"])
+        self.assertFalse(hardware["all_outcomes_complete"])
+        self.assertFalse(hardware["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()
