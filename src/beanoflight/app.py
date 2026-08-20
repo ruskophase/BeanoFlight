@@ -1735,7 +1735,11 @@ class BeanoFlightApp(tk.Tk):
                     f"{y_mm:.1f}",
                     "—",
                     "—",
-                    "EDGE" if "margin" in rejection.reason else "BIRTH",
+                    "TOP-PENDING"
+                    if rejection.reason.startswith("top entry pending")
+                    else "EDGE"
+                    if "margin" in rejection.reason
+                    else "BIRTH",
                     "—",
                     "—",
                 ),

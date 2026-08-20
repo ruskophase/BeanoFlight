@@ -64,6 +64,26 @@ class ClassificationPoolingTests(unittest.TestCase):
         self.assertEqual(pooled.value["category"], "mould")
         self.assertEqual(pooled.value["ensemble"]["sample_count"], 1)
         self.assertTrue(pooled.value["ensemble"]["deadline_fallback"])
+
+    def test_deadline_fallback_pools_two_of_three_available_samples(self):
+        first = evidence(1, (0.8, 0.2, 0.0, 0.0), expected=3)
+        second = evidence(2, (0.4, 0.6, 0.0, 0.0), expected=3)
+
+        pooled = pool_classification_evidence(
+            (first, second), deadline_fallback=True, timestamp_ns=500
+        )
+
+        ensemble = pooled.value["ensemble"]
+        self.assertEqual(ensemble["sample_count"], 2)
+        self.assertEqual(ensemble["expected_samples"], 3)
+        self.assertEqual(
+            ensemble["pooling_method"], "deadline-mean-probability-v1"
+        )
+        for actual, expected in zip(
+            pooled.value["probabilities"], (0.6, 0.4, 0.0, 0.0)
+        ):
+            self.assertAlmostEqual(actual, expected)
+        self.assertTrue(ensemble["deadline_fallback"])
         validate_classification_enrichment(pooled)
 
     def test_incomplete_non_fallback_pool_is_rejected(self):

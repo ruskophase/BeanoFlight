@@ -121,11 +121,12 @@ def pool_classification_evidence(
     result_timestamp = max(item.timestamp_ns for item in evidence)
     if timestamp_ns is not None:
         result_timestamp = max(result_timestamp, int(timestamp_ns))
-    method = (
-        "deadline-single-evidence"
-        if deadline_fallback
-        else MEAN_PROBABILITY_POOLING_VERSION
-    )
+    if not deadline_fallback:
+        method = MEAN_PROBABILITY_POOLING_VERSION
+    elif len(vectors) == 1:
+        method = "deadline-single-evidence"
+    else:
+        method = "deadline-mean-probability-v1"
     return Enrichment(
         source=(
             "beano-sorter-deadline"

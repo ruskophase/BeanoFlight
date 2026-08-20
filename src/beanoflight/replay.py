@@ -708,6 +708,7 @@ class ReplayRunner:
                     if self.crop_selector is None
                     else {
                         "require_complete_bean_bbox": True,
+                        "defer_track_birth_until_complete_bean_crop": True,
                         "allow_padding": self.crop_selector.settings.allow_padding,
                         "adaptive_edge_resize": (
                             self.crop_selector.settings.adaptive_edge_resize
