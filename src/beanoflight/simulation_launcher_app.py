@@ -360,16 +360,34 @@ class SimulationLauncherApp(tk.Tk):
         self.after(1100, lambda: self._start_flight(performance_mode=performance_mode))
 
     def stop_all(self) -> None:
-        processes = tuple(self._processes.values())
-        for process in processes:
+        # Keep a launcher-owned Registry alive while every other component
+        # drains its accepted work. In particular, Mock Inferencer handles
+        # SIGTERM by completing its queued inference audits.
+        registry = self._processes.get("registry")
+        workers = tuple(
+            process
+            for name, process in self._processes.items()
+            if name != "registry"
+        )
+        for process in workers:
             if process.poll() is None:
                 process.terminate()
-        for process in processes:
+        for process in workers:
             try:
-                process.wait(timeout=2.0)
+                # GUI services handle SIGTERM as an orderly shutdown. Give the
+                # inferencer time to drain its already-acknowledged Registry
+                # audit queue before escalating to a hard kill.
+                process.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2.0)
+        if registry is not None and registry.poll() is None:
+            registry.terminate()
+            try:
+                registry.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                registry.kill()
+                registry.wait(timeout=2.0)
         self._processes.clear()
         self.status_var.set(
             "All launcher-owned components stopped; existing registry left running"

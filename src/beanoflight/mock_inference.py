@@ -24,6 +24,7 @@ from .registry_service import DEFAULT_COMMAND_ENDPOINT
 from .registry_zmq import (
     CAPABILITY_COMPLETE_INFERENCE_JOBS_ACK,
     RegistryRemoteError,
+    RegistryTransportError,
     ZeroMQRegistryClient,
 )
 
@@ -929,9 +930,9 @@ def _complete_inference_batch_with_registration_retry(
     completions,
     capabilities,
     *,
-    maximum_attempts: int = 20,
+    maximum_attempts: int = 60,
 ) -> int:
-    """Allow a crop result to race its asynchronous job registration safely."""
+    """Persist an accepted result through registration and transport races."""
 
     retries = 0
     while True:
@@ -939,16 +940,22 @@ def _complete_inference_batch_with_registration_retry(
             _complete_inference_batch(registry, completions, capabilities)
             return retries
         except Exception as exc:
-            if (
-                retries >= maximum_attempts
-                or "inference job does not exist" not in str(exc).lower()
-            ):
+            if retries >= maximum_attempts or not _retryable_audit_error(exc):
                 raise
-            # Registration normally trails crop delivery by only a few ms.  The
-            # direct evidence has already reached the sorter; this bounded retry
-            # is solely for durable audit completion and never delays actuation.
-            time.sleep(min(0.025, 0.001 * (2**retries)))
+            # Direct evidence has already reached the sorter. This retry is
+            # isolated from actuation and exists solely to make its Registry
+            # audit durable. A few seconds of tolerance also covers a busy WAL
+            # checkpoint or a Registry socket reconnect during shutdown.
+            time.sleep(min(0.05, 0.001 * (2**retries)))
             retries += 1
+
+
+def _retryable_audit_error(exc: Exception) -> bool:
+    if isinstance(exc, RegistryRemoteError):
+        return "inference job does not exist" in exc.remote_message.lower()
+    return isinstance(exc, RegistryTransportError) or (
+        "inference job does not exist" in str(exc).lower()
+    )
 
 
 def _complete_inference_batch(registry, completions, capabilities) -> None:

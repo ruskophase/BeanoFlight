@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import queue
+import signal
 import threading
 import tkinter as tk
 from collections.abc import Sequence
@@ -53,6 +54,7 @@ class MockInferencerApp(tk.Tk):
         self.crop_endpoint = crop_endpoint
         self.classification_endpoint = classification_endpoint
         self.service: MockInferencerService | None = None
+        self._closing = False
         self._activities: queue.Queue[MockInferenceActivity] = queue.Queue(maxsize=128)
         self._photo = None
         self._crop_display_enabled = threading.Event()
@@ -226,7 +228,8 @@ class MockInferencerApp(tk.Tk):
         service = self.service
         self.service = None
         if service is not None:
-            service.close(drain=False)
+            self.status_var.set("Stopping · draining Registry audits…")
+            service.close(drain=True)
         self.status_var.set("Stopped")
 
     def _post_activity(self, activity: MockInferenceActivity) -> None:
@@ -277,6 +280,8 @@ class MockInferencerApp(tk.Tk):
             self.counts_var.set(
                 f"received {stats['received']} · completed {stats['completed']} · "
                 f"batches {stats['batches']} · queued {stats['queued']} · "
+                f"audits pending {stats['registry_audits_pending']} · "
+                f"audit retries {stats['registry_completion_retries']} · "
                 f"dropped {stats['dropped']} · direct {stats['direct_evidence_sent']} · "
                 f"direct dropped {stats['direct_evidence_dropped']}"
             )
@@ -323,8 +328,17 @@ class MockInferencerApp(tk.Tk):
             self._activity_display_enabled.clear()
 
     def _close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
         self.stop_service()
         self.destroy()
+
+    def request_close(self) -> None:
+        """Schedule a graceful close from a POSIX signal handler."""
+
+        if not self._closing:
+            self.after_idle(self._close)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -370,13 +384,20 @@ def _parse_latency_curve(value: str) -> tuple[tuple[int, float], ...]:
 
 def main(argv: Sequence[str] | None = None) -> None:
     arguments = parser().parse_args(argv)
-    MockInferencerApp(
+    app = MockInferencerApp(
         arguments.registry,
         arguments.crops,
         arguments.classifications,
         show_crop=not arguments.no_crop_preview,
         show_activity=not arguments.no_activity_log,
-    ).mainloop()
+    )
+
+    def request_stop(_signum, _frame) -> None:
+        app.request_close()
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    app.mainloop()
 
 
 if __name__ == "__main__":

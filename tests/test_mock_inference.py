@@ -18,6 +18,7 @@ from beanoflight.mock_inference import (
 )
 from beanoflight.models import BeanRef
 from beanoflight.registry_models import InferenceJob, InferenceStatus
+from beanoflight.registry_zmq import RegistryRemoteError, RegistryTransportError
 
 
 class _Session:
@@ -171,6 +172,54 @@ class MockInferenceBatchTests(unittest.TestCase):
         self.assertEqual(batch_activities[0].batch_images, 8)
         self.assertEqual(stats["deadline_misses"], 0)
 
+    def test_draining_close_waits_for_a_retried_registry_audit(self):
+        class InterruptedRegistry(_RegistryClient):
+            attempts = 0
+
+            def complete_inference_job(self, bean_ref, job_id, enrichment, **kwargs):
+                self.__class__.attempts += 1
+                if self.__class__.attempts <= 3:
+                    raise RegistryTransportError("temporary Registry timeout")
+                super().complete_inference_job(
+                    bean_ref,
+                    job_id,
+                    enrichment,
+                    **kwargs,
+                )
+
+        InterruptedRegistry.attempts = 0
+        service = MockInferencerService(
+            classification_endpoint="",
+            settings=MockInferenceSettings(
+                latency_ms=0,
+                jitter_ms=0,
+                result_deadline_ms=1_000,
+                tail_probability=0,
+                categories=("mould",),
+                weights=(1.0,),
+            ),
+        )
+        self.assertTrue(service._accept_batch((_payload(1),)))
+        threads = [
+            threading.Thread(target=service._worker_loop, daemon=True),
+            threading.Thread(target=service._result_loop, daemon=True),
+            threading.Thread(target=service._registry_result_loop, daemon=True),
+        ]
+        service._threads.extend(threads)
+
+        with patch(
+            "beanoflight.mock_inference.ZeroMQRegistryClient",
+            InterruptedRegistry,
+        ):
+            for thread in threads:
+                thread.start()
+            service.close(drain=True)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(service.statistics()["completed"], 1)
+        self.assertEqual(service.statistics()["registry_audits_pending"], 0)
+        self.assertEqual(service.statistics()["registry_completion_retries"], 3)
+
     def test_oversized_source_frame_batch_is_rejected_atomically(self):
         service = MockInferencerService(
             settings=MockInferenceSettings(
@@ -265,6 +314,48 @@ class MockInferenceBatchTests(unittest.TestCase):
 
         self.assertEqual(retries, 9)
         self.assertEqual(registry.attempts, 10)
+
+    def test_durable_completion_retries_a_registry_transport_interruption(self):
+        class InterruptedRegistry:
+            def __init__(self):
+                self.attempts = 0
+
+            def complete_inference_jobs(self, _completions):
+                self.attempts += 1
+                if self.attempts <= 3:
+                    raise RegistryTransportError("temporary Registry timeout")
+
+        registry = InterruptedRegistry()
+
+        with patch("beanoflight.mock_inference.time.sleep"):
+            retries = _complete_inference_batch_with_registration_retry(
+                registry,
+                (("bean", "job", "result", {}, "event"),),
+                frozenset(),
+            )
+
+        self.assertEqual(retries, 3)
+        self.assertEqual(registry.attempts, 4)
+
+    def test_durable_completion_does_not_retry_a_validation_failure(self):
+        class InvalidRegistry:
+            def __init__(self):
+                self.attempts = 0
+
+            def complete_inference_jobs(self, _completions):
+                self.attempts += 1
+                raise RegistryRemoteError("ValueError", "invalid enrichment")
+
+        registry = InvalidRegistry()
+
+        with self.assertRaisesRegex(RegistryRemoteError, "invalid enrichment"):
+            _complete_inference_batch_with_registration_retry(
+                registry,
+                (("bean", "job", "result", {}, "event"),),
+                frozenset(),
+            )
+
+        self.assertEqual(registry.attempts, 1)
 
 
 if __name__ == "__main__":

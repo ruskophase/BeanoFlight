@@ -143,6 +143,13 @@ Mock Inferencer and BeanoSorter status panels show direct sent/received and
 context cache counts; the timing ledger labels evidence and trajectory delivery
 independently as `direct` or `registry`.
 
+The Mock Inferencer also displays pending Registry audits and retry counts.
+Closing its window or choosing **Stop all** drains accepted inference results
+before the process exits. Transient Registry transport interruptions and delayed
+job registration are retried off the actuation-critical path. When the launcher
+owns BeanRegistry, it keeps Registry running until the worker processes finish
+their orderly shutdown.
+
 For real-time runs, inspect `source_timeline_fps`, `frames_skipped`, and
 `frame_age_ms` together. Processed FPS intentionally falls when an old replay
 frame is discarded; source-timeline FPS shows whether the input clock was kept,
