@@ -29,3 +29,23 @@ Keep Desktop as the default until every entry has been boot-tested. The
 performance service does nothing on normal, headless-only, or safe-driver boots.
 All headless profiles start the normal multi-user target, so the existing SSH
 service remains available without starting the graphical desktop.
+
+On the development Jetson, the UEFI selector numbers these entries from zero:
+
+```text
+0  primary kernel
+1  Beano Desktop
+2  Beano Desktop Performance
+3  Beano Headless
+4  Beano Headless Performance
+5  Beano Safe Driver Desktop
+6  Beano Safe Driver Headless
+```
+
+Use the entry label rather than relying on the number if another boot entry is
+later inserted. After boot, verify the selected profile with `/proc/cmdline`.
+Headless Performance must contain both `systemd.unit=multi-user.target` and
+`beanoflight.performance=1`.
+
+The measured effect of clock locking is recorded in
+[`docs/benchmarks/2026-08-20-jetson-clocks.md`](../../docs/benchmarks/2026-08-20-jetson-clocks.md).

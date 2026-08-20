@@ -373,6 +373,13 @@ and all 93 requested virtual cycles succeeded. This validates repeatable
 integration and supplies a timing observation, not trained-model accuracy or
 an electromechanical hardware qualification.
 
+A subsequent matched headless A/B test isolated `jetson_clocks` from desktop
+overhead. Locking CPU/GPU/EMC clocks reduced TensorRT service p50 and p95 by
+60.6% and 60.9%, reduced mean frame analysis by 38.0%, and reduced sorter
+deadline fallbacks from 1/7/8 to the structural minimum of 1/1/1. See the
+[clock-lock benchmark](benchmarks/2026-08-20-jetson-clocks.md) for the full
+method and results.
+
 ## Replay clock
 
 FastCap timestamps remain the authoritative source-time domain. Each run
