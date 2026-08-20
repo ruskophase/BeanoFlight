@@ -1,4 +1,4 @@
-"""Tk monitor and controls for the asynchronous mock inferencer."""
+"""Tk monitor and controls for mock or TensorRT asynchronous inference."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from .mock_inference import (
     MockInferenceSettings,
 )
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
+from .tensorrt_inference import DEFAULT_TENSORRT_ENGINE
 
 RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
 
@@ -43,10 +44,15 @@ class MockInferencerApp(tk.Tk):
         *,
         show_crop: bool = True,
         show_activity: bool = True,
+        backend: str = "mock",
+        engine_path: str = "",
     ) -> None:
-        super().__init__(className="Mock Inferencer")
-        self.title("Mock Inferencer")
-        self.iconname("Mock Inferencer")
+        program_name = (
+            "TensorRT Inferencer" if backend == "tensorrt" else "Mock Inferencer"
+        )
+        super().__init__(className=program_name)
+        self.title(program_name)
+        self.iconname(program_name)
         self.geometry("1180x720")
         self.minsize(980, 600)
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -61,6 +67,10 @@ class MockInferencerApp(tk.Tk):
         self._activity_display_enabled = threading.Event()
 
         defaults = MockInferenceSettings()
+        self.backend_var = tk.StringVar(value=backend)
+        self.engine_path_var = tk.StringVar(
+            value=engine_path or str(DEFAULT_TENSORRT_ENGINE)
+        )
         self.views_var = tk.StringVar(value=str(defaults.views_per_bean))
         self.max_batch_var = tk.StringVar(value=str(defaults.max_batch_beans))
         self.result_deadline_var = tk.StringVar(value=str(defaults.result_deadline_ms))
@@ -96,7 +106,7 @@ class MockInferencerApp(tk.Tk):
 
     def _build(self) -> None:
         controls = ttk.LabelFrame(
-            self, text="Conservative stereo ResNet18 simulation", padding=10
+            self, text="Stereo ResNet18 inference", padding=10
         )
         controls.pack(fill=tk.X, padx=10, pady=10)
         fields = (
@@ -151,13 +161,32 @@ class MockInferencerApp(tk.Tk):
         ).grid(row=4, column=2, columnspan=2, sticky=tk.W, pady=(10, 0))
         ttk.Label(
             controls,
-            text="CamL is transported today; CamR compute and fusion cost are simulated.",
+            text=(
+                "Shared-weight CamL/CamR towers fuse after ResNet layer1. "
+                "Until CamR transport lands, CamL feeds both inputs."
+            ),
         ).grid(row=4, column=4, columnspan=2, sticky=tk.W, pady=(10, 0))
         ttk.Button(controls, text="Start / apply", command=self.start_service).grid(
             row=4, column=6, padx=(8, 4), pady=(8, 0), sticky=tk.E
         )
         ttk.Button(controls, text="Stop", command=self.stop_service).grid(
             row=4, column=7, pady=(8, 0), sticky=tk.W
+        )
+        ttk.Label(controls, text="Backend").grid(
+            row=5, column=0, sticky=tk.W, pady=(10, 0)
+        )
+        ttk.Combobox(
+            controls,
+            textvariable=self.backend_var,
+            values=("tensorrt", "mock"),
+            state="readonly",
+            width=12,
+        ).grid(row=6, column=0, padx=(0, 8), sticky=tk.EW)
+        ttk.Label(controls, text="TensorRT engine").grid(
+            row=5, column=1, columnspan=7, sticky=tk.W, pady=(10, 0)
+        )
+        ttk.Entry(controls, textvariable=self.engine_path_var).grid(
+            row=6, column=1, columnspan=7, sticky=tk.EW
         )
         for column in range(8):
             controls.columnconfigure(column, weight=1)
@@ -205,6 +234,8 @@ class MockInferencerApp(tk.Tk):
                 seed=int(self.seed_var.get()),
                 categories=categories,
                 weights=weights,
+                backend=self.backend_var.get(),
+                engine_path=self.engine_path_var.get(),
             )
             settings.validate()
         except ValueError as exc:
@@ -219,8 +250,11 @@ class MockInferencerApp(tk.Tk):
             activity=self._post_activity,
         )
         self.service.start()
+        backend_name = "TensorRT Inferencer" if settings.backend == "tensorrt" else "Mock Inferencer"
+        self.title(backend_name)
+        self.iconname(backend_name)
         self.status_var.set(
-            f"Starting · crops {self.crop_endpoint} · direct results "
+            f"Starting {settings.backend} · crops {self.crop_endpoint} · direct results "
             f"{self.classification_endpoint}"
         )
 
@@ -297,7 +331,7 @@ class MockInferencerApp(tk.Tk):
                 self.status_var.set(f"Error · {service.startup_error}")
             elif service.ready.is_set():
                 self.status_var.set(
-                    "Running · source-frame logical stereo batching · "
+                    f"Running {service.settings.backend} · source-frame stereo batching · "
                     f"crops {service.crop_endpoint} · direct results "
                     f"{service.classification_endpoint}"
                 )
@@ -342,7 +376,9 @@ class MockInferencerApp(tk.Tk):
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="BeanoFlight mock inference GUI")
+    result = argparse.ArgumentParser(
+        description="BeanoFlight mock or TensorRT inference GUI"
+    )
     result.add_argument("--registry", default=DEFAULT_COMMAND_ENDPOINT)
     result.add_argument("--crops", default=DEFAULT_CROP_ENDPOINT)
     result.add_argument(
@@ -357,6 +393,17 @@ def parser() -> argparse.ArgumentParser:
         "--no-activity-log",
         action="store_true",
         help="start with inference activity rendering disabled",
+    )
+    result.add_argument(
+        "--backend",
+        choices=("mock", "tensorrt"),
+        default="mock",
+        help="simulated latency or real TensorRT execution",
+    )
+    result.add_argument(
+        "--engine",
+        default=str(DEFAULT_TENSORRT_ENGINE),
+        help="TensorRT engine used by the tensorrt backend",
     )
     return result
 
@@ -390,6 +437,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         arguments.classifications,
         show_crop=not arguments.no_crop_preview,
         show_activity=not arguments.no_activity_log,
+        backend=arguments.backend,
+        engine_path=arguments.engine,
     )
 
     def request_stop(_signum, _frame) -> None:

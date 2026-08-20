@@ -128,10 +128,13 @@ frame rate. Inference jobs and sorting decisions persist their source-clock and
 host-monotonic timing marks alongside crop provenance; no image data enters
 either transport or ledger.
 
-The direct evidence message uses one bounded 15 ms acknowledgement window. A
+The direct evidence publisher uses up to three bounded 5 ms acknowledgement
+attempts. A
 dedicated ingress worker acknowledges only after validating the batch and
 admitting it to a bounded in-process queue, before classification policy work.
-A negative or missing acknowledgement is retained in timing telemetry. A
+Accepted batch IDs are cached so an acknowledgement lost in transit can be
+retried without applying the evidence twice. A negative or missing
+acknowledgement is retained in timing telemetry. A
 Registry classification notification is held for a short
 preference interval and then used as recovery if all direct attempts fail; the
 durable journal remains the restart and sequence-gap path.

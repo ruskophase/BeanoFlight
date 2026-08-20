@@ -26,6 +26,7 @@ from .registry_zmq import (
 )
 from .runtime_priority import apply_performance_affinity
 from .sorting_context_transport import DEFAULT_SORTING_CONTEXT_ENDPOINT
+from .tensorrt_inference import DEFAULT_TENSORRT_ENGINE
 
 REGISTRY_ABSENT = "absent"
 REGISTRY_CONFLICT = "conflict"
@@ -100,6 +101,14 @@ class SimulationLauncherApp(tk.Tk):
             value="" if initial_recording is None else str(initial_recording)
         )
         self.database_var = tk.StringVar(value="beanoflight-simulation.db")
+        self.inference_backend_var = tk.StringVar(
+            value=(
+                "tensorrt" if DEFAULT_TENSORRT_ENGINE.is_file() else "mock"
+            )
+        )
+        self.inference_engine_var = tk.StringVar(
+            value=str(DEFAULT_TENSORRT_ENGINE)
+        )
         self.performance_mode_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="All components stopped")
         self._processes: dict[str, subprocess.Popen] = {}
@@ -127,11 +136,27 @@ class SimulationLauncherApp(tk.Tk):
         ttk.Entry(form, textvariable=self.database_var).grid(
             row=3, column=0, sticky=tk.EW, padx=(0, 8)
         )
+        ttk.Label(form, text="Inference backend").grid(
+            row=4, column=0, sticky=tk.W, pady=(10, 0)
+        )
+        ttk.Combobox(
+            form,
+            textvariable=self.inference_backend_var,
+            values=("tensorrt", "mock"),
+            state="readonly",
+            width=14,
+        ).grid(row=5, column=0, sticky=tk.W)
+        ttk.Label(form, text="TensorRT engine").grid(
+            row=6, column=0, sticky=tk.W, pady=(10, 0)
+        )
+        ttk.Entry(form, textvariable=self.inference_engine_var).grid(
+            row=7, column=0, sticky=tk.EW, padx=(0, 8)
+        )
         ttk.Checkbutton(
             form,
             text="Performance mode (recommended for 60 FPS)",
             variable=self.performance_mode_var,
-        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(12, 0))
+        ).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(12, 0))
         ttk.Label(
             form,
             text=(
@@ -140,7 +165,7 @@ class SimulationLauncherApp(tk.Tk):
                 "still re-enable its own diagnostics."
             ),
             wraplength=720,
-        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(3, 0))
+        ).grid(row=9, column=0, columnspan=2, sticky=tk.W, pady=(3, 0))
         form.columnconfigure(0, weight=1)
 
         buttons = ttk.LabelFrame(self, text="Independent processes", padding=12)
@@ -148,7 +173,7 @@ class SimulationLauncherApp(tk.Tk):
         components = (
             ("registry", "1. BeanRegistry", self._start_registry),
             ("monitor", "2. Registry Monitor", self._start_monitor),
-            ("inferencer", "3. Mock Inferencer", self._start_inferencer),
+            ("inferencer", "3. Beano Inferencer", self._start_inferencer),
             ("actuator", "4. BeanoActuator", self._start_actuator),
             ("sorter", "5. BeanoSorter", self._start_sorter),
             ("flight", "6. BeanoFlight", self._start_flight),
@@ -287,6 +312,10 @@ class SimulationLauncherApp(tk.Tk):
             DEFAULT_CROP_ENDPOINT,
             "--classifications",
             DEFAULT_DIRECT_EVIDENCE_ENDPOINT,
+            "--backend",
+            self.inference_backend_var.get(),
+            "--engine",
+            self.inference_engine_var.get(),
             *performance_mode_arguments("inferencer", performance_mode),
         )
 

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import heapq
 import math
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -68,7 +70,34 @@ class BeanCropSelector:
         self.settings.validate()
         self._extractor = extractor or extract_square_crop
         self._deferred_extractor = deferred_extractor
-        self._counts: dict[BeanRef, int] = {}
+        self._active_counts: dict[BeanRef, int] = {}
+        self._next_indices: dict[BeanRef, int] = {}
+        self._retry_indices: dict[BeanRef, list[int]] = {}
+        self._pending: dict[str, tuple[BeanRef, int]] = {}
+        self._lock = threading.Lock()
+
+    def delivery_succeeded(self, payloads: tuple[CropPayload, ...]) -> None:
+        """Commit crop reservations after inference acknowledges the batch."""
+
+        with self._lock:
+            for payload in payloads:
+                self._pending.pop(payload.job.job_id, None)
+
+    def delivery_failed(self, payloads: tuple[CropPayload, ...]) -> None:
+        """Release failed reservations so a later frame can replace the sample."""
+
+        with self._lock:
+            for payload in payloads:
+                reserved = self._pending.pop(payload.job.job_id, None)
+                if reserved is None:
+                    continue
+                bean_ref, sample_index = reserved
+                self._active_counts[bean_ref] = max(
+                    0, self._active_counts.get(bean_ref, 1) - 1
+                )
+                retry = self._retry_indices.setdefault(bean_ref, [])
+                if sample_index not in retry:
+                    heapq.heappush(retry, sample_index)
 
     def select(
         self,
@@ -85,9 +114,10 @@ class BeanCropSelector:
             observation = track.history[-1]
             if observation.frame_index != analysis.frame_index:
                 continue
-            count = self._counts.get(track.bean_ref, 0)
-            if count >= self.settings.max_crops_per_bean:
-                continue
+            with self._lock:
+                active_count = self._active_counts.get(track.bean_ref, 0)
+                if active_count >= self.settings.max_crops_per_bean:
+                    continue
             frame_size = _frame_size_px(frame_bgr)
             if _bbox_touches_frame_edge(
                 observation.detection.bbox_px,
@@ -140,6 +170,13 @@ class BeanCropSelector:
             revision = revisions.get(track.bean_ref)
             if revision is None:
                 continue
+            with self._lock:
+                retry = self._retry_indices.get(track.bean_ref)
+                if retry:
+                    sample_index = heapq.heappop(retry)
+                else:
+                    sample_index = self._next_indices.get(track.bean_ref, 0)
+                    self._next_indices[track.bean_ref] = sample_index + 1
             job_id = ":".join(
                 (
                     "infer",
@@ -147,7 +184,7 @@ class BeanCropSelector:
                     str(track.bean_ref.sequence),
                     self.settings.camera_id,
                     str(observation.frame_index),
-                    str(count),
+                    str(sample_index),
                 )
             )
             job = InferenceJob(
@@ -176,7 +213,11 @@ class BeanCropSelector:
                     ),
                 },
             )
-            self._counts[track.bean_ref] = count + 1
+            with self._lock:
+                self._active_counts[track.bean_ref] = (
+                    self._active_counts.get(track.bean_ref, 0) + 1
+                )
+                self._pending[job_id] = (track.bean_ref, sample_index)
             selected.append(CropPayload(job, crop, materializer))
         return tuple(selected)
 

@@ -65,8 +65,14 @@ class MockInferenceSettings:
     tail_probability: float = 0.01
     tail_latency_min_ms: float = 15.0
     tail_latency_max_ms: float = 30.0
+    backend: str = "mock"
+    engine_path: str = ""
 
     def validate(self) -> None:
+        if self.backend not in {"mock", "tensorrt"}:
+            raise ValueError("inference backend must be 'mock' or 'tensorrt'")
+        if self.backend == "tensorrt" and not self.engine_path.strip():
+            raise ValueError("TensorRT inference requires an engine path")
         if self.latency_ms is not None and (
             not math.isfinite(self.latency_ms) or self.latency_ms < 0
         ):
@@ -199,6 +205,8 @@ class _CompletedBatch:
     service_times_ms: tuple[float, ...]
     deadline_misses: tuple[bool, ...]
     tail: bool
+    logits: tuple[tuple[float, ...], ...] = ()
+    preprocessing_ms: float = 0.0
     failure: str = ""
 
 
@@ -251,6 +259,7 @@ class MockInferencerService:
         self._total_service_ms = 0.0
         self._sessions = {}
         self._registry_capabilities: frozenset[str] | None = None
+        self._tensor_rt = None
         self.ready = threading.Event()
         self.received = 0
         self.completed = 0
@@ -271,6 +280,25 @@ class MockInferencerService:
     def start(self) -> None:
         if self._threads:
             return
+        if self.settings.backend == "tensorrt":
+            try:
+                from .tensorrt_inference import TensorRTStereoResNet18
+
+                self._tensor_rt = TensorRTStereoResNet18(
+                    self.settings.engine_path
+                )
+                if self.settings.max_batch_beans > self._tensor_rt.max_batch:
+                    raise ValueError(
+                        "configured maximum batch exceeds TensorRT engine maximum "
+                        f"({self.settings.max_batch_beans} > "
+                        f"{self._tensor_rt.max_batch})"
+                    )
+                self._tensor_rt.warm_up()
+            except Exception as exc:  # noqa: BLE001 - displayed by controller
+                self.startup_error = str(exc)
+                self._emit("error", detail=self.startup_error)
+                self.ready.set()
+                return
         self._worker_finished.clear()
         self._publisher_finished.clear()
         receiver = threading.Thread(
@@ -308,6 +336,9 @@ class MockInferencerService:
         for thread in self._threads:
             thread.join(2.0)
         self._threads.clear()
+        if self._tensor_rt is not None:
+            self._tensor_rt.close()
+            self._tensor_rt = None
 
     def statistics(self) -> dict[str, int | float]:
         with self._stats_lock:
@@ -472,6 +503,8 @@ class MockInferencerService:
         batch: tuple[_QueuedInference, ...],
         batch_id: str,
     ) -> _CompletedBatch:
+        if self._tensor_rt is not None:
+            return self._process_tensorrt_batch(batch, batch_id)
         batch_started_ns = time.monotonic_ns()
         job_ids = tuple(_stable_batch_job_key(item.payload.job) for item in batch)
         batch_randomizer = _batch_randomizer(
@@ -543,7 +576,7 @@ class MockInferencerService:
                 service_times_ms,
                 tuple(False for _item in batch),
                 tail,
-                "mock inferencer stopped",
+                failure="mock inferencer stopped",
             )
 
         batch_ready_ns = time.monotonic_ns()
@@ -570,6 +603,75 @@ class MockInferencerService:
             service_times_ms,
             deadline_misses,
             tail,
+        )
+
+    def _process_tensorrt_batch(
+        self,
+        batch: tuple[_QueuedInference, ...],
+        batch_id: str,
+    ) -> _CompletedBatch:
+        batch_started_ns = time.monotonic_ns()
+        queue_times_ms = tuple(
+            (batch_started_ns - item.accepted_monotonic_ns) / 1_000_000.0
+            for item in batch
+        )
+        try:
+            result = self._tensor_rt.infer(
+                tuple(item.payload.image_bgr for item in batch)
+            )
+            failure = ""
+        except Exception as exc:  # noqa: BLE001 - durable failure is published
+            result = None
+            failure = str(exc)
+        batch_ready_ns = time.monotonic_ns()
+        service_times_ms = tuple(
+            (batch_ready_ns - item.accepted_monotonic_ns) / 1_000_000.0
+            for item in batch
+        )
+        deadline_misses = tuple(
+            latency_ms > self.settings.result_deadline_ms
+            for latency_ms in service_times_ms
+        )
+        delay_ms = (
+            (batch_ready_ns - batch_started_ns) / 1_000_000.0
+            if result is None
+            else result.total_ms
+        )
+        image_count = len(batch) * 2
+        with self._stats_lock:
+            self.batches += 1
+            self.last_batch_size = len(batch)
+            self.max_batch_size = max(self.max_batch_size, len(batch))
+            self.last_batch_latency_ms = delay_ms
+            self._total_batch_beans += len(batch)
+            self._total_queue_ms += sum(queue_times_ms)
+            self._total_service_ms += sum(service_times_ms)
+            self.deadline_misses += sum(deadline_misses)
+        self._emit(
+            "batch",
+            batch_id=batch_id,
+            batch_beans=len(batch),
+            batch_images=image_count,
+            batch_latency_ms=delay_ms,
+            detail=(
+                f"{len(batch)} bean pair(s) / {image_count} tower inputs · "
+                f"TensorRT {delay_ms:.2f} ms"
+            ),
+        )
+        return _CompletedBatch(
+            batch,
+            batch_id,
+            batch_started_ns,
+            batch_ready_ns,
+            delay_ms,
+            image_count,
+            queue_times_ms,
+            service_times_ms,
+            deadline_misses,
+            False,
+            () if result is None else result.logits,
+            0.0 if result is None else result.preprocessing_ms,
+            failure,
         )
 
     def _publish_completed_batch(
@@ -601,36 +703,64 @@ class MockInferencerService:
         direct_items = []
         results = []
         completion_request_ns = time.monotonic_ns()
-        for item, queue_ms, service_ms, deadline_missed in zip(
-            batch, queue_times_ms, service_times_ms, deadline_misses
-        ):
+        for result_index, (
+            item,
+            queue_ms,
+            service_ms,
+            deadline_missed,
+        ) in enumerate(zip(batch, queue_times_ms, service_times_ms, deadline_misses)):
             payload = item.payload
-            bean_randomizer = _job_randomizer(
-                self.settings.seed,
-                _stable_job_key(payload.job),
-            )
-            category = bean_randomizer.choices(
-                self.settings.categories,
-                weights=self.settings.weights,
-                k=1,
-            )[0]
             sample_index = _job_sample_index(payload.job)
-            sample_randomizer = _job_randomizer(
-                self.settings.seed,
-                _stable_sample_job_key(payload.job, sample_index),
-            )
-            confidence = sample_randomizer.uniform(
-                self.settings.confidence_min,
-                self.settings.confidence_max,
-            )
-            probabilities = _mock_probability_vector(
-                self.settings.categories,
-                category,
-                confidence,
-                sample_randomizer,
-            )
-            confidence = probabilities[self.settings.categories.index(category)]
-            logits = tuple(math.log(max(value, 1e-12)) for value in probabilities)
+            if completed.logits:
+                logits = completed.logits[result_index]
+                if len(logits) != len(self.settings.categories):
+                    raise ValueError(
+                        "TensorRT logit count does not match configured categories"
+                    )
+                probabilities = _softmax_logits(logits)
+                winner = max(range(len(probabilities)), key=probabilities.__getitem__)
+                category = self.settings.categories[winner]
+                confidence = probabilities[winner]
+                result_source = "tensorrt-inferencer"
+                result_version = "mock-stereo-resnet18-fp16-v1"
+                inference_profile = "shared-layer1-stereo-resnet18-fp16-v1"
+                input_mode = "shared_layer1_stereo"
+                logical_views = 2
+            else:
+                bean_randomizer = _job_randomizer(
+                    self.settings.seed,
+                    _stable_job_key(payload.job),
+                )
+                category = bean_randomizer.choices(
+                    self.settings.categories,
+                    weights=self.settings.weights,
+                    k=1,
+                )[0]
+                sample_randomizer = _job_randomizer(
+                    self.settings.seed,
+                    _stable_sample_job_key(payload.job, sample_index),
+                )
+                confidence = sample_randomizer.uniform(
+                    self.settings.confidence_min,
+                    self.settings.confidence_max,
+                )
+                probabilities = _mock_probability_vector(
+                    self.settings.categories,
+                    category,
+                    confidence,
+                    sample_randomizer,
+                )
+                confidence = probabilities[
+                    self.settings.categories.index(category)
+                ]
+                logits = tuple(
+                    math.log(max(value, 1e-12)) for value in probabilities
+                )
+                result_source = "mock-inferencer"
+                result_version = "mock-resnet18-stereo-v3"
+                inference_profile = "resnet18-stereo-fp16-conservative-v1"
+                input_mode = "logical_stereo"
+                logical_views = self.settings.views_per_bean
             run_id = payload.job.bean_ref.run_id
             marks = payload.job.timing_marks_ns
             expected_samples = int(marks.get("expected_inference_samples", 0))
@@ -647,7 +777,7 @@ class MockInferencerService:
             expected_samples = max(1, min(5, expected_samples))
             ensemble_id = (
                 f"{payload.job.bean_ref.run_id}:"
-                f"{payload.job.bean_ref.sequence}:mock-resnet18-stereo-v3"
+                f"{payload.job.bean_ref.sequence}:{result_version}"
             )
             result_timestamp = max(
                 payload.job.capture_timestamp_ns,
@@ -658,7 +788,7 @@ class MockInferencerService:
                 ),
             )
             enrichment = Enrichment(
-                source="mock-inferencer",
+                source=result_source,
                 kind=CLASSIFICATION_EVIDENCE,
                 value={
                     "category": category,
@@ -672,16 +802,17 @@ class MockInferencerService:
                         "expected_samples": expected_samples,
                     },
                     "inference": {
-                        "profile": "resnet18-stereo-fp16-conservative-v1",
-                        "input_mode": "logical_stereo",
+                        "profile": inference_profile,
+                        "input_mode": input_mode,
                         "transported_camera": payload.job.camera_id,
                         "transported_views": 1,
                         "stereo_pair_complete": False,
-                        "logical_views": self.settings.views_per_bean,
+                        "logical_views": logical_views,
                         "batch_id": batch_id,
                         "batch_beans": len(batch),
                         "batch_images": image_count,
                         "batch_latency_ms": delay_ms,
+                        "preprocessing_ms": completed.preprocessing_ms,
                         "queue_ms": queue_ms,
                         "service_latency_ms": service_ms,
                         "result_deadline_ms": self.settings.result_deadline_ms,
@@ -690,7 +821,7 @@ class MockInferencerService:
                     },
                 },
                 timestamp_ns=result_timestamp,
-                version="mock-resnet18-stereo-v3",
+                version=result_version,
                 result_id=payload.job.job_id,
                 confidence=confidence,
             )
@@ -951,10 +1082,13 @@ def _complete_inference_batch_with_registration_retry(
 
 
 def _retryable_audit_error(exc: Exception) -> bool:
+    registration_races = ("inference job does not exist", "unknown bean")
     if isinstance(exc, RegistryRemoteError):
-        return "inference job does not exist" in exc.remote_message.lower()
+        message = exc.remote_message.lower()
+        return any(value in message for value in registration_races)
+    message = str(exc).lower()
     return isinstance(exc, RegistryTransportError) or (
-        "inference job does not exist" in str(exc).lower()
+        any(value in message for value in registration_races)
     )
 
 
@@ -1053,6 +1187,15 @@ def _mock_probability_vector(
     # strict probability-sum tolerance after JSON round trips.
     probabilities[winner] += 1.0 - sum(probabilities)
     return tuple(probabilities)
+
+
+def _softmax_logits(logits: tuple[float, ...]) -> tuple[float, ...]:
+    if not logits or any(not math.isfinite(value) for value in logits):
+        raise ValueError("inference logits must be finite and non-empty")
+    maximum = max(logits)
+    exponentials = tuple(math.exp(value - maximum) for value in logits)
+    total = sum(exponentials)
+    return tuple(value / total for value in exponentials)
 
 
 def _batch_priority_deadline_ns(

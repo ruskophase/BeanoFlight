@@ -140,7 +140,7 @@ waiting for Registry or SQLite; the ordered persistence queue then commits track
 updates and job metadata. An inference completion that wins this short race uses
 bounded registration retry. This preserves every observation while removing
 Registry acknowledgement from the crop deadline. The Registry replaces
-provisional crop revisions with exact durable revisions. The mock inferencer
+provisional crop revisions with exact durable revisions. The inferencer
 returns the whole GPU batch through `complete_inference_jobs_ack()`, so one commit
 makes all results visible without echoing records the worker does not use. The
 older record-returning and single-item calls remain available for other clients.

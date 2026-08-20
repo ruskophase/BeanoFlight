@@ -242,11 +242,14 @@ class CropDispatcher:
         *,
         capacity: int = 16,
         timeout_ms: int = 1_000,
+        delivery_result: Callable[[tuple[CropPayload, ...], bool], None]
+        | None = None,
     ) -> None:
         self.registry_endpoint = registry_endpoint
         self.inference_endpoint = inference_endpoint
         self.timeout_ms = timeout_ms
         self.capacity = max(1, capacity)
+        self.delivery_result = delivery_result
         self._items: deque[_FrameDispatch] = deque()
         self._condition = threading.Condition()
         self._active = 0
@@ -258,6 +261,7 @@ class CropDispatcher:
         self._registry_thread: threading.Thread | None = None
         self.submitted = 0
         self.dropped = 0
+        self.delivery_failures = 0
         self.track_frames_dropped = 0
         self.registry_batches = 0
         self.dispatch_items_coalesced = 0
@@ -347,6 +351,7 @@ class CropDispatcher:
         return {
             **{name: timing.summary() for name, timing in self._timings.items()},
             "track_frames_dropped": self.track_frames_dropped,
+            "delivery_failures": self.delivery_failures,
             "registry_batches": self.registry_batches,
             "dispatch_items_coalesced": self.dispatch_items_coalesced,
             "maximum_dispatch_items_per_batch": (
@@ -445,6 +450,8 @@ class CropDispatcher:
                         raise RuntimeError("asynchronous Registry queue is full")
                     send_started = time.perf_counter_ns()
                     sender.submit_batch(materialized_items)
+                    if self.delivery_result is not None:
+                        self.delivery_result(payloads, True)
                     send_ms = (
                         time.perf_counter_ns() - send_started
                     ) / 1_000_000.0
@@ -459,6 +466,9 @@ class CropDispatcher:
                         )
                 except Exception as exc:  # noqa: BLE001 - durable failure state
                     self.dropped += len(payloads)
+                    self.delivery_failures += len(payloads)
+                    if payloads and self.delivery_result is not None:
+                        self.delivery_result(payloads, False)
                     if registered_jobs:
                         self._queue_registry(
                             _RegistryJobFailure(
@@ -637,6 +647,14 @@ class ReplayRunner:
             # waits for SQLite or ZeroMQ. Interactive review without a dispatcher
             # keeps AnalysisEngine's original synchronous Registry behaviour.
             self.engine.registry = None
+            if self.crop_selector is not None:
+                self.crop_dispatcher.delivery_result = (
+                    lambda payloads, succeeded: (
+                        self.crop_selector.delivery_succeeded(payloads)
+                        if succeeded
+                        else self.crop_selector.delivery_failed(payloads)
+                    )
+                )
 
     def run(
         self,
@@ -966,7 +984,11 @@ class ReplayRunner:
                             )
                             for track in analysis.tracks
                         )
-                        self.crop_dispatcher.enqueue_frame(updates, selected_crops)
+                        accepted = self.crop_dispatcher.enqueue_frame(
+                            updates, selected_crops
+                        )
+                        if not accepted and selected_crops:
+                            self.crop_selector.delivery_failed(selected_crops)
                     crop_ms = (time.perf_counter_ns() - crop_started) / 1_000_000.0
                     timing_samples["crop_select_ms"].append(crop_select_ms)
                     timing_samples["frame_dispatch_enqueue_ms"].append(crop_ms)

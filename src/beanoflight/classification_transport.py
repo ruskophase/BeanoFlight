@@ -54,8 +54,8 @@ class ZeroMQDirectEvidencePublisher:
         *,
         context: zmq.Context | None = None,
         capacity: int = 256,
-        acknowledgement_timeout_ms: int = 15,
-        maximum_attempts: int = 1,
+        acknowledgement_timeout_ms: int = 5,
+        maximum_attempts: int = 3,
     ) -> None:
         self.endpoint = endpoint
         self.context = context or zmq.Context.instance()

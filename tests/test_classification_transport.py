@@ -5,6 +5,7 @@ from pathlib import Path
 
 from beanoflight.classification import CLASSIFICATION_EVIDENCE
 from beanoflight.classification_transport import (
+    DirectEvidenceBatch,
     DirectEvidenceTransportError,
     DirectInferenceEvidence,
     ZeroMQDirectEvidencePublisher,
@@ -16,6 +17,7 @@ from beanoflight.registry_models import (
     InferenceJob,
     InferenceStatus,
 )
+from beanoflight.sorter import SorterService
 
 
 def direct_item() -> DirectInferenceEvidence:
@@ -122,6 +124,49 @@ class DirectClassificationTransportTests(unittest.TestCase):
             self.assertFalse(sent)
             publisher.close()
             receiver.close()
+
+    def test_publisher_retries_a_negatively_acknowledged_batch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            endpoint = f"ipc://{Path(temporary) / 'evidence.sock'}"
+            receiver = ZeroMQDirectEvidenceReceiver(endpoint)
+            publisher = ZeroMQDirectEvidencePublisher(
+                endpoint,
+                acknowledgement_timeout_ms=20,
+                maximum_attempts=2,
+            )
+            received = []
+
+            def receive_twice():
+                received.append(
+                    receiver.receive_batch(
+                        accept=lambda _batch, _received_ns: False
+                    )
+                )
+                received.append(receiver.receive_batch())
+
+            receive_thread = threading.Thread(target=receive_twice, daemon=True)
+            receive_thread.start()
+            sent, _sent_ns = publisher.send_batch("batch-retry", (direct_item(),))
+
+            receive_thread.join(1.0)
+            self.assertFalse(receive_thread.is_alive())
+            self.assertTrue(sent)
+            self.assertIsNone(received[0])
+            self.assertEqual(received[1].batch_id, "batch-retry")
+            publisher.close()
+            receiver.close()
+
+    def test_sorter_acknowledges_duplicate_batch_without_requeueing(self):
+        service = SorterService(
+            classification_endpoint="",
+            sorting_context_endpoint="",
+        )
+        item = direct_item()
+        batch = DirectEvidenceBatch("batch-duplicate", 100, (item,))
+
+        self.assertTrue(service._admit_direct_evidence(batch, 110))
+        self.assertTrue(service._admit_direct_evidence(batch, 120))
+        self.assertEqual(service._direct_ingress.qsize(), 1)
 
 
 if __name__ == "__main__":

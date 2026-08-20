@@ -52,7 +52,7 @@ event has a persistent stream sequence; critical consumers recover through the
 `events_since` query rather than assuming publish/subscribe delivery. Frame
 images are never written to the registry or its database.
 
-The mock inferencer sends each completed probability vector over a dedicated,
+The inferencer sends each completed probability vector over a dedicated,
 bounded inference-to-sorter socket before committing it to BeanRegistry. The
 message contains job metadata, probabilities and logits only—never an image.
 BeanoFlight sends the current tracks, predictions and replay-clock anchor over
@@ -63,10 +63,11 @@ decision are then persisted by its audit worker. Each selected frame contributes
 only one logical CamL/CamR inference per bean; the second requested sample
 remains a later frame, not a duplicate inference of the same frame pair.
 
-The direct inference notification uses one bounded 15 ms acknowledgement
-window. The sorter acknowledges only after validating the batch and admitting
-it to its bounded ingress queue; a negative or missing acknowledgement leaves
-BeanRegistry as the recovery path. BeanRegistry still atomically stores every completed job and can
+The direct inference notification uses up to three bounded 5 ms acknowledgement
+attempts. The sorter acknowledges only after validating the batch and admitting
+it to its bounded ingress queue; accepted batch IDs make a retry idempotent.
+A negative or missing acknowledgement leaves BeanRegistry as the recovery path.
+BeanRegistry still atomically stores every completed job and can
 materialize the same immutable
 `classification_pooled` result. Registry notifications and the durable event
 journal recover a lost direct message. If the later temporal sample would
@@ -98,7 +99,7 @@ boundaries intended for the machine:
 beano-registry --database ./beanoflight-simulation.db
 beano-registry-monitor
 beano-actuator
-beano-mock-inferencer
+beano-inferencer --backend tensorrt
 beano-sorter --actuator ipc:///tmp/beanoflight-actuation-plans.ipc
 beano-flight /recordings/example
 ```
@@ -106,12 +107,13 @@ beano-flight /recordings/example
 In BeanoFlight, select 3 empty background frames, choose **Simulation**, set
 the replay rate, replay prebuffer and crop count, then press **Run**. Leave
 **Use memory-mapped RAW fast path** selected for the supplied complete bundle.
-Live playback defaults off for throughput. The mock inferencer treats all bean
-crops first detected in the same frame as one simulated GPU batch, charges for
-a future CamL/CamR pair and feature-fusion head, and adds a deterministic
-random category/confidence. Only CamL is transported today, so Registry
-telemetry explicitly distinguishes the physical input from the logical
-two-view compute model. The sorter waits for a confirmed trajectory before it
+Live playback defaults off for throughput. The inferencer treats all bean
+crops selected in the same frame as one GPU batch. Its selectable TensorRT
+backend runs a real shared-weight ResNet18 tower through `layer1` for each view,
+fuses feature maps, and runs the remaining backbone once. Only CamL is
+transported today, so CamL temporarily feeds both inputs and Registry telemetry
+marks the pair incomplete; the mock backend remains available for deterministic
+timing/category tests. The sorter waits for a confirmed trajectory before it
 makes an immutable decision, then applies its configurable policy and sends an
 absolute gate plan to BeanoActuator. BeanoSorter's GUI is primarily a settings
 console; its screen gate mirror is an opt-in diagnostic. Hardware gate state is
@@ -179,12 +181,12 @@ beano-system-test /recordings/example \
   --crop-size 224 \
   --prebuffer-frames 60 \
   --maximum-frames 1000 \
-  --crops-per-bean 1 \
+  --crops-per-bean 2 \
   --target-fps 60
 ```
 
 For an isolated multi-run performance test, `beano-performance-benchmark`
-starts a private Registry, Mock Inferencer and Sorter, keeps them alive across
+starts a private Registry, Inferencer and Sorter, keeps them alive across
 all repetitions, and writes one JSON report containing stage timings and
 outcomes. See [simulation.md](docs/simulation.md#repeatable-performance-matrix)
 for the reference command and current results. Pass

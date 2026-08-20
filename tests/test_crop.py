@@ -78,6 +78,56 @@ class CropTests(unittest.TestCase):
         self.assertEqual([item.job.frame_index for item in selected], [0, 1, 2])
         self.assertEqual(len({item.job.job_id for item in selected}), 3)
 
+    def test_failed_delivery_releases_sample_for_next_complete_frame(self):
+        selector = BeanCropSelector(CropSettings(size_px=20, max_crops_per_bean=2))
+        bean_ref = BeanRef("retry-run", 1)
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        observations = []
+
+        def select(index):
+            observations.append(
+                Observation(
+                    index,
+                    index * 10,
+                    Detection(
+                        (50.0, 50.0),
+                        (40, 40, 20, 20),
+                        400,
+                        1.0,
+                        (0, 0, 0),
+                    ),
+                    (0.0, float(index)),
+                )
+            )
+            track = TrackSnapshot(
+                bean_ref,
+                TrackStatus.CONFIRMED,
+                index * 10,
+                (0.0, float(index), 0.0, 1.0),
+                tuple(tuple(0.0 for _ in range(4)) for _ in range(4)),
+                index + 2,
+                0,
+                (40, 40, 20, 20),
+                tuple(observations),
+            )
+            return selector.select(
+                frame,
+                FrameAnalysis(index, index * 10, (), (), (track,), (), 0.1),
+                {bean_ref: index + 1},
+            )
+
+        first = select(0)
+        selector.delivery_failed(first)
+        replacement = select(1)
+        selector.delivery_succeeded(replacement)
+        second = select(2)
+        selector.delivery_succeeded(second)
+
+        self.assertEqual(first[0].job.job_id.rsplit(":", 1)[1], "0")
+        self.assertEqual(replacement[0].job.job_id.rsplit(":", 1)[1], "0")
+        self.assertEqual(second[0].job.job_id.rsplit(":", 1)[1], "1")
+        self.assertEqual(select(3), ())
+
     def test_selector_defers_clipped_tentative_crop_until_next_observation(self):
         selector = BeanCropSelector(CropSettings(size_px=20))
         bean_ref = BeanRef("early-run", 1)

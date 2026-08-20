@@ -19,7 +19,7 @@ from .classification import (
     CLASSIFICATION_POOLED,
 )
 from .esp32_actuator import DEFAULT_ESP32_PORT, ESP32ActuatorService
-from .mock_inference import MockInferencerService
+from .mock_inference import MockInferencerService, MockInferenceSettings
 from .registry_models import InferenceStatus
 from .registry_zmq import ZeroMQRegistryClient
 from .runtime_priority import (
@@ -28,6 +28,7 @@ from .runtime_priority import (
 )
 from .sorter import SorterService
 from .telemetry import summarize_samples
+from .tensorrt_inference import DEFAULT_TENSORRT_ENGINE
 from .timing_ledger import summarize_timing_ledgers
 
 
@@ -56,6 +57,18 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--prebuffer-frames", type=int, default=60)
     result.add_argument("--crops-per-bean", type=int, default=1)
     result.add_argument("--crop-size", type=int, default=224)
+    result.add_argument(
+        "--inference-backend",
+        choices=("tensorrt", "mock"),
+        default=("tensorrt" if DEFAULT_TENSORRT_ENGINE.is_file() else "mock"),
+        help="real TensorRT execution or conservative deterministic timing model",
+    )
+    result.add_argument(
+        "--inference-engine",
+        type=Path,
+        default=DEFAULT_TENSORRT_ENGINE,
+        help="shared-layer1 stereo ResNet18 TensorRT engine",
+    )
     result.add_argument(
         "--no-adaptive-edge-resize",
         action="store_true",
@@ -101,7 +114,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     actuator_ready = context.Event()
     inferencer = context.Process(
         target=_run_inferencer,
-        args=(commands, crops, classifications, service_stop, inference_ready),
+        args=(
+            commands,
+            crops,
+            classifications,
+            arguments.inference_backend,
+            str(arguments.inference_engine),
+            service_stop,
+            inference_ready,
+        ),
         name="beano-benchmark-inferencer",
     )
     sorter = context.Process(
@@ -203,6 +224,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "target_fps": arguments.target_fps,
             "repeats": arguments.repeats,
             "adaptive_edge_resize": not arguments.no_adaptive_edge_resize,
+            "inference_backend": arguments.inference_backend,
+            "inference_engine": str(arguments.inference_engine.resolve()),
             "esp32_actuator": bool(arguments.esp32_actuator),
             "esp32_port": arguments.esp32_port,
             "summaries": _scenario_summaries(
@@ -239,16 +262,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         temporary.cleanup()
 
 
-def _run_inferencer(commands, crops, classifications, stop, ready) -> None:
+def _run_inferencer(
+    commands, crops, classifications, backend, engine_path, stop, ready
+) -> None:
     apply_performance_affinity("general")
     service = MockInferencerService(
         registry_endpoint=commands,
         crop_endpoint=crops,
         classification_endpoint=classifications,
+        settings=MockInferenceSettings(
+            backend=backend,
+            engine_path=engine_path if backend == "tensorrt" else "",
+        ),
         activity=None,
     )
     service.start()
-    if service.ready.wait(5.0):
+    if service.ready.wait(15.0) and not service.startup_error:
         ready.set()
     stop.wait()
     service.close(drain=False)
@@ -383,7 +412,7 @@ def _run_replay(
 
 def _wait_for_outcome(
     endpoint: str, run_id: str, expected_jobs: int
-) -> dict[str, int | bool]:
+) -> dict[str, object]:
     client = ZeroMQRegistryClient(endpoint, timeout_ms=2_000)
     records = ()
     settled = False
@@ -429,6 +458,17 @@ def _wait_for_outcome(
     finally:
         client.close()
     jobs = tuple(job for record in records for job in record.inference_jobs)
+    incomplete_jobs = tuple(
+        {
+            "bean_id": str(record.bean_ref),
+            "job_id": job.job_id,
+            "status": job.status.value,
+            "detail": job.detail,
+        }
+        for record in records
+        for job in record.inference_jobs
+        if job.status != InferenceStatus.COMPLETED
+    )
     actuation_failures = tuple(
         {
             "bean_id": str(record.bean_ref),
@@ -463,6 +503,7 @@ def _wait_for_outcome(
         "jobs_completed": sum(job.status == InferenceStatus.COMPLETED for job in jobs),
         "jobs_dropped": sum(job.status == InferenceStatus.DROPPED for job in jobs),
         "jobs_failed": sum(job.status == InferenceStatus.FAILED for job in jobs),
+        "incomplete_jobs": incomplete_jobs,
         "classification_evidence": len(evidence),
         "classification_pooled": len(pooled),
         "classification_decision_bases": len(decision_bases),

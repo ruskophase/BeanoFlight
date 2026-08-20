@@ -6,6 +6,7 @@ import math
 import queue
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from itertools import pairwise
@@ -213,6 +214,7 @@ class SorterService:
         self._direct_ingress: queue.Queue[_ReceivedDirectBatch] = queue.Queue(
             maxsize=1_024
         )
+        self._admitted_direct_batches: OrderedDict[str, None] = OrderedDict()
         self._direct_ingress_ready = threading.Event()
         if not self.classification_endpoint:
             self._direct_ingress_ready.set()
@@ -398,6 +400,12 @@ class SorterService:
         batch: DirectEvidenceBatch,
         received_monotonic_ns: int,
     ) -> bool:
+        # A missing ACK makes the publisher reset its REQ socket and resend the
+        # identical batch. Acknowledge that retry without consuming ingress
+        # capacity or processing its evidence twice.
+        if batch.batch_id in self._admitted_direct_batches:
+            self._admitted_direct_batches.move_to_end(batch.batch_id)
+            return True
         try:
             self._direct_ingress.put_nowait(
                 _ReceivedDirectBatch(batch, received_monotonic_ns)
@@ -405,6 +413,9 @@ class SorterService:
         except queue.Full:
             self.direct_batches_rejected += 1
             return False
+        self._admitted_direct_batches[batch.batch_id] = None
+        while len(self._admitted_direct_batches) > 4_096:
+            self._admitted_direct_batches.popitem(last=False)
         return True
 
     def _drain_direct_ingress(self, *, limit: int) -> int:

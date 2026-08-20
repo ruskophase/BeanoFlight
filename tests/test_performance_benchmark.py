@@ -25,6 +25,21 @@ class PerformanceBenchmarkTests(unittest.TestCase):
         self.assertTrue(enabled.esp32_actuator)
         self.assertEqual(enabled.esp32_port, "/dev/test-actuator")
 
+    def test_inference_backend_can_be_selected(self):
+        arguments = benchmark_parser().parse_args(
+            [
+                "/recording",
+                "--background-frames",
+                "1,2,3",
+                "--inference-backend",
+                "mock",
+                "--inference-engine",
+                "/tmp/test.engine",
+            ]
+        )
+        self.assertEqual(arguments.inference_backend, "mock")
+        self.assertEqual(str(arguments.inference_engine), "/tmp/test.engine")
+
     def test_scenarios_are_validated_and_deduplicated(self):
         self.assertEqual(_scenarios("core,full,core"), ("core", "full"))
         with self.assertRaises(argparse.ArgumentTypeError):

@@ -315,6 +315,30 @@ class MockInferenceBatchTests(unittest.TestCase):
         self.assertEqual(retries, 9)
         self.assertEqual(registry.attempts, 10)
 
+    def test_durable_completion_outlasts_a_delayed_bean_registration(self):
+        class DelayedRegistry:
+            def __init__(self):
+                self.attempts = 0
+
+            def complete_inference_jobs(self, _completions):
+                self.attempts += 1
+                if self.attempts <= 4:
+                    raise RegistryRemoteError(
+                        "BeanNotFoundError", "unknown bean run/000001"
+                    )
+
+        registry = DelayedRegistry()
+
+        with patch("beanoflight.mock_inference.time.sleep"):
+            retries = _complete_inference_batch_with_registration_retry(
+                registry,
+                (("bean", "job", "result", {}, "event"),),
+                frozenset(),
+            )
+
+        self.assertEqual(retries, 4)
+        self.assertEqual(registry.attempts, 5)
+
     def test_durable_completion_retries_a_registry_transport_interruption(self):
         class InterruptedRegistry:
             def __init__(self):

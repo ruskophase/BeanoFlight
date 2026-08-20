@@ -11,7 +11,7 @@ CamL mmap RG10 (fast) or calibrated MKV (fallback)
  BeanoFlight replay -- async audit --------> BeanRegistry --> SQLite WAL
        |                 |                       ^  ^             |
        |                 +-- direct context ---> |  |             +--> Monitor
-       +-- BGR crop --> Mock Inferencer ==ACK==> Sorter
+       +-- BGR crop --> Beano Inferencer ==ACK==> Sorter
                                                 |  |
                        decision audit -----------+  |
                                                 v  |
@@ -27,12 +27,13 @@ CamL mmap RG10 (fast) or calibrated MKV (fallback)
   that snapshot current from coalesced events instead of repeatedly loading all
   historical beans. It makes no-gate and scheduled actuation states explicit,
   and can pause polling.
-- `beano-mock-inferencer` receives lossless BGR crops, optionally shows the
-  latest crop and activity log, preserves each source frame's new-bean group as
-  one simulated GPU batch, and writes a seeded category and confidence to the
-  registry. Its default timing model charges for two views through a shared
-  ResNet18 backbone and a feature-fusion head, even though only CamL is
-  transported in this release.
+- `beano-inferencer` (with `beano-mock-inferencer` retained as a compatibility
+  name) receives lossless BGR crops, optionally shows the latest crop and
+  activity log, and preserves each source frame's crop group as one GPU batch.
+  It can run either the conservative seeded timing model or the local FP16
+  TensorRT shared-layer1 stereo ResNet18 engine. Only CamL is transported in
+  this release, so the real engine temporarily receives CamL at both tower
+  inputs and explicitly records `stereo_pair_complete: false`.
 - `beano-sorter` joins direct classification evidence with BeanoFlight's direct
   track/prediction context. Registry notifications and the SQLite journal recover
   a dropped message, sequence gap or restart. It owns classification policy and
@@ -76,7 +77,7 @@ beano-registry --database ./beanoflight-simulation.db
 beano-registry-monitor
 beano-actuator
 beano-sorter --actuator ipc:///tmp/beanoflight-actuation-plans.ipc
-beano-mock-inferencer
+beano-inferencer --backend tensorrt
 ```
 
 Then start the replay GUI:
@@ -207,9 +208,11 @@ with `--maximum-frame-age-ms`. The BeanoFlight GUI exposes the same policy.
 
 Use the benchmark command when comparing code or machine configuration. It
 creates private IPC endpoints and a temporary database, starts independent
-Registry, Mock Inferencer and Sorter processes, and deliberately reuses them
+Registry, Inferencer and Sorter processes, and deliberately reuses them
 across repetitions so cumulative slowdown is visible. `core` disables crop
-dispatch; `full` exercises crop transfer, mock classification and sorting.
+dispatch; `full` exercises crop transfer, classification and sorting. When the
+locally built engine exists, TensorRT is the default; select the deterministic
+model explicitly with `--inference-backend mock`.
 
 ```bash
 beano-performance-benchmark \
@@ -222,7 +225,8 @@ beano-performance-benchmark \
   --prebuffer-frames 60 \
   --crop-processing ml-fast \
   --crop-size 224 \
-  --crops-per-bean 1 \
+  --crops-per-bean 2 \
+  --inference-backend tensorrt \
   --output ./performance-report.json
 ```
 
@@ -293,7 +297,7 @@ tracks and jobs, sends the crop batch, then persists the other tracks; unrelated
 history therefore does not consume the current crop deadline. Queued track-only
 frames may share a transaction while retaining per-bean timestamp order.
 
-The mock GPU uses a physical crossing estimate to choose among frame batches
+The inference worker uses a physical crossing estimate to choose among frame batches
 that are already waiting; it never merges frames or delays a frame to make a
 larger batch. GPU execution and CPU-side result publication use separate
 workers, allowing the next simulated TensorRT batch to start while the previous
@@ -302,11 +306,52 @@ uses a bounded non-blocking queue; the Registry completion remains its durable
 fallback. Both queues remain bounded. Jobs finish as `completed`,
 `dropped`, or `failed`; neither crops nor source frames are stored in SQLite.
 
-## Source-frame stereo inference model
+## Source-frame stereo inference
 
-The mock inferencer incurs one batch-level delay for exactly the bean group
+The real timing prototype is a shared-weight two-tower ResNet18. CamL and CamR
+each pass through the same stem and `layer1`; their 64-channel feature maps are
+concatenated and reduced by a learned 1 x 1 convolution, then one shared
+`layer2`--`layer4`, average pool and classifier head produce the logits. It is
+not two independently trained networks and it does not combine model weights.
+The TensorRT engine accepts dynamic same-frame batches of 1--10 bean pairs and
+is warmed at every supported batch size before the crop receiver becomes ready.
+
+The current replay transport has only CamL crops. To measure the actual
+two-tower compute and transfer cost without claiming stereo evidence, it feeds
+the same CamL tensor to both engine bindings. The future paired-crop transport
+will replace the second binding with CamR without changing the feature-fusion
+architecture, probability/logit result contract, BeanRegistry schema, or sorter.
+
+The integration model is intentionally not a defect classifier. It was trained
+on lossless 224 x 224 crops extracted from the August 16 recording and balanced
+arbitrary brightness-quartile labels. Its only purposes are exercising real
+GPU kernels, producing real logits, and measuring the asynchronous pipeline.
+The deployed production network must be retrained from labelled, synchronized
+CamL/CamR pairs using the same `ml-fast` scaling.
+
+Rebuild the timing artefacts on the target Jetson with:
+
+```bash
+python3 -m venv .venv-model
+.venv-model/bin/pip install -r requirements-model.txt
+PYTHONPATH=src .venv/bin/python tools/extract_mock_crops.py \
+  /path/to/20260816T134132.801241Z-beans \
+  --output artifacts/mock-resnet18/crops \
+  --background-frames 43,222,347 --crops-per-bean 2
+.venv-model/bin/python tools/train_mock_resnet18.py \
+  artifacts/mock-resnet18/crops \
+  --output artifacts/mock-resnet18/model
+python3 tools/build_mock_tensorrt_engine.py \
+  artifacts/mock-resnet18/model/mock-stereo-resnet18.onnx \
+  --output artifacts/mock-resnet18/model/mock-stereo-resnet18-fp16.engine
+```
+
+The generated crops, checkpoint, ONNX graph and target-specific TensorRT engine
+are ignored build artefacts rather than source-controlled model claims.
+
+The conservative mock backend incurs one batch-level delay for exactly the bean group
 detected in one source frame. It neither waits for later frames nor merges
-unrelated detections. The conservative default TensorRT FP16 curve is expressed
+unrelated detections. Its FP16 timing curve is expressed
 in input images: 2 images/1 bean is 15 ms, 4/2 is 18 ms, 8/4 is 23 ms, 16/8 is
 32 ms and 20/10 is 38 ms. Intermediate sizes are linearly interpolated. Normal
 batches receive up to 15% seeded jitter; one percent also receive a seeded
@@ -317,11 +362,16 @@ deadline misses and drops. Each evidence result stores the same fields in its
 Registry enrichment, including a source-frame batch ID and explicit
 `stereo_pair_complete: false` marker.
 
-This is currently a compute-load model, not fabricated stereo evidence: the
-transport still contains one physical CamL crop per job. When CamR crop pairing
-is added, the same logical job boundary can carry the two synchronized views;
-the classifier should pass both views through a shared-weight backbone and
-fuse their feature vectors rather than combine trained network weights.
+On 2026-08-20, three warmed real-engine full-pipeline runs each replayed all 601
+August 16 frames. Minimum throughput was 59.999 FPS, mean frame analysis was
+5.40--5.44 ms, and no frame or crop batch was dropped. All 939 jobs for 471
+bean records completed, and all 471 selected-result batches were directly
+acknowledged. Inference service time was 9.13--10.50 ms p50 and 16.86--18.59 ms
+p95. The runs used 7, 9 and 5 deliberate one-result physical-deadline fallbacks;
+the later second jobs still completed for audit. No sorting decision was late,
+and all 93 requested virtual cycles succeeded. This validates repeatable
+integration and supplies a timing observation, not trained-model accuracy or
+an electromechanical hardware qualification.
 
 ## Replay clock
 
@@ -340,9 +390,10 @@ an untrusted network.
 
 ## Scope of this simulator
 
-The mock category is deterministic for a seed, camera and bean sequence, so a
+The mock-backend category is deterministic for a seed, camera and bean sequence, so a
 new run ID or earlier crop frame does not silently change the test population.
-It has no connection to crop content. The ESP32 outputs are indicator-only in
+It has no connection to crop content. The TensorRT integration model does use
+crop pixels but its arbitrary labels have no defect meaning. The ESP32 outputs are indicator-only in
 this release: they validate schedule delivery and edge timing, but are not
 authority to drive valves. Frame drops, delayed messages, corrupt results and process restarts
 are planned fault-injection/analysis work after this baseline.

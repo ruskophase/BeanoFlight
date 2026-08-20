@@ -76,7 +76,8 @@ filesystem.
 ## Multi-process simulation check
 
 Start `beano-simulation` for a convenience control panel, or run the registry,
-monitor, actuator, sorter, mock inferencer and BeanoFlight in separate terminals. Select
+monitor, actuator, sorter, inferencer and BeanoFlight in separate terminals.
+Select
 the same command and crop endpoints in each GUI. Start the registry first;
 BeanoFlight refuses to begin Simulation if its ping is not acknowledged.
 The launcher reuses a healthy existing registry only when it reports the
@@ -86,7 +87,7 @@ immediately with a recovery message instead of creating a second database
 writer.
 
 The launcher labels an already-running Registry without current capability
-metadata as **legacy; compatibility mode**. The mock inferencer then uses the
+metadata as **legacy; compatibility mode**. The inferencer then uses the
 older atomic result-batch operation. Restarting the Registry enables the newer
 compact acknowledgement, but version skew no longer turns classifications into
 failed jobs.
@@ -117,7 +118,7 @@ the completed job ledger without a separate hot-path `accepted` write.
 
 The Actuation column reads `Awaiting`, `Not required`, `Scheduled`, `OK` or
 `FAIL`; a blank result is no longer used for the normal no-gate case. Turn off
-live playback, mock crop display, activity logs, registry live updates and
+live playback, inference crop display, activity logs, registry live updates and
 virtual-gate animation when measuring throughput. These controls affect GUI
 work only and do not stop the corresponding service.
 
@@ -133,17 +134,17 @@ timings, process resource samples, prebuffer time, missed deadlines and crop
 counts in the session `settings.performance` object. These values remain
 available after the BeanoFlight window closes.
 
-**Start all** launches BeanoActuator, then BeanoSorter, before Mock Inferencer so
+**Start all** launches BeanoActuator, then BeanoSorter, before Beano Inferencer so
 the dedicated plan and inference-evidence receivers own their IPC endpoints
 before the producers connect. Starting the components individually should follow
 the same order. Exhausted evidence retries are not fatal: BeanoFlight and the
 inferencer still commit authoritative state to BeanRegistry, and the sorter
 recovers it from Registry notifications after a short preference interval. The
-Mock Inferencer and BeanoSorter status panels show direct sent/received and
+Beano Inferencer and BeanoSorter status panels show direct sent/received and
 context cache counts; the timing ledger labels evidence and trajectory delivery
 independently as `direct` or `registry`.
 
-The Mock Inferencer also displays pending Registry audits and retry counts.
+The Beano Inferencer also displays pending Registry audits and retry counts.
 Closing its window or choosing **Stop all** drains accepted inference results
 before the process exits. Transient Registry transport interruptions and delayed
 job registration are retried off the actuation-critical path. When the launcher
@@ -171,7 +172,8 @@ beano-performance-benchmark /path/to/recording-bundle \
   --background-frames 43,222,347 \
   --scenarios core,full --repeats 5 \
   --target-fps 60 --maximum-frames 601 \
-  --prebuffer-frames 60 --crops-per-bean 1 \
+  --prebuffer-frames 60 --crops-per-bean 2 \
+  --inference-backend tensorrt \
   --output ./performance-report.json
 ```
 
