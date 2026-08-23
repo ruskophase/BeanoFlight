@@ -137,12 +137,17 @@ available after the BeanoFlight window closes.
 **Start all** launches BeanoActuator, then BeanoSorter, before Beano Inferencer so
 the dedicated plan and inference-evidence receivers own their IPC endpoints
 before the producers connect. Starting the components individually should follow
-the same order. Exhausted evidence retries are not fatal: BeanoFlight and the
-inferencer still commit authoritative state to BeanRegistry, and the sorter
-recovers it from Registry notifications after a short preference interval. The
-Beano Inferencer and BeanoSorter status panels show direct sent/received and
-context cache counts; the timing ledger labels evidence and trajectory delivery
-independently as `direct` or `registry`.
+the same order. Evidence submission returns after a bounded in-memory enqueue;
+a dedicated transport worker owns acknowledgement and retry, so a slow ACK does
+not hold the inference result thread. Exhausted retries are not fatal:
+BeanoFlight and the inferencer still commit authoritative state to BeanRegistry,
+and the sorter recovers it from Registry notifications after a short preference
+interval. Each crop also carries its exact track/prediction context through the
+inferencer to the sorter, avoiding a cross-socket join on the critical path; the
+standalone context stream remains available for later trajectory refinements.
+The Beano Inferencer and BeanoSorter status panels show direct sent/received and
+context cache counts; the timing ledger labels trajectory delivery as
+`embedded-evidence`, `direct`, or `registry`.
 
 The Beano Inferencer also displays pending Registry audits and retry counts.
 Closing its window or choosing **Stop all** drains accepted inference results

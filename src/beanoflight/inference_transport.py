@@ -12,10 +12,14 @@ import zmq
 
 from .crop import CropPayload
 from .registry_models import inference_job_from_dict, inference_job_to_dict
+from .sorting_context_transport import (
+    sorting_context_from_dict,
+    sorting_context_to_dict,
+)
 from .stereo import StereoPairMetadata
 
-CROP_SCHEMA = "beanoflight-crop/v2"
-BATCH_CROP_SCHEMA = "beanoflight-crop-batch/v2"
+CROP_SCHEMA = "beanoflight-crop/v3"
+BATCH_CROP_SCHEMA = "beanoflight-crop-batch/v3"
 MAX_CROP_BYTES = 16 * 1024 * 1024
 MAX_BATCH_BYTES = 64 * 1024 * 1024
 MAX_BATCH_CROPS = 16
@@ -56,6 +60,11 @@ class ZeroMQCropClient:
                 if payload.stereo_pair is None
                 else payload.stereo_pair.to_json()
             ),
+            "sorting_context": (
+                None
+                if payload.sorting_context is None
+                else sorting_context_to_dict(payload.sorting_context)
+            ),
             "job": inference_job_to_dict(payload.job),
         }
         self._send(request_id, CROP_SCHEMA, header, views)
@@ -90,6 +99,11 @@ class ZeroMQCropClient:
                         None
                         if payload.stereo_pair is None
                         else payload.stereo_pair.to_json()
+                    ),
+                    "sorting_context": (
+                        None
+                        if payload.sorting_context is None
+                        else sorting_context_to_dict(payload.sorting_context)
                     ),
                     "job": inference_job_to_dict(payload.job),
                 }
@@ -229,6 +243,7 @@ class ZeroMQCropReceiver:
                         shapes,
                         parts[1:],
                         header.get("stereo_pair"),
+                        header.get("sorting_context"),
                     ),
                 )
             else:
@@ -251,6 +266,7 @@ class ZeroMQCropReceiver:
                             shapes,
                             parts[offset:next_offset],
                             item.get("stereo_pair"),
+                            item.get("sorting_context"),
                         )
                     )
                     offset = next_offset
@@ -343,6 +359,7 @@ def _decode_payload(
     shape_values: list[object],
     data_values: list[object],
     pair_value: object,
+    sorting_context_value: object,
 ) -> CropPayload:
     if len(shape_values) not in {1, 2} or len(data_values) != len(shape_values):
         raise CropTransportError("crop must contain one or two views")
@@ -370,6 +387,16 @@ def _decode_payload(
         if pair_value is not None:
             raise CropTransportError("single-view crop contains stereo metadata")
         pair = None
+    sorting_context = (
+        None
+        if sorting_context_value is None
+        else sorting_context_from_dict(sorting_context_value)
+    )
+    if (
+        sorting_context is not None
+        and sorting_context.track.bean_ref != job.bean_ref
+    ):
+        raise CropTransportError("sorting context does not match crop job")
     return CropPayload(
         job,
         images[0],
@@ -377,6 +404,7 @@ def _decode_payload(
         None if len(images) == 1 else images[1],
         None,
         pair,
+        sorting_context,
     )
 
 

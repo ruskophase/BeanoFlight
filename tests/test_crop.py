@@ -23,6 +23,7 @@ from beanoflight.models import (
     TrackStatus,
 )
 from beanoflight.registry_models import InferenceJob, InferenceStatus
+from beanoflight.sorting_context_transport import SortingContext
 from beanoflight.stereo import StereoPairMetadata
 
 
@@ -422,7 +423,32 @@ class CropTests(unittest.TestCase):
                 4.25,
                 2_300,
             )
-            payload = CropPayload(job, left, None, right, None, pair)
+            context = SortingContext(
+                TrackSnapshot(
+                    job.bean_ref,
+                    TrackStatus.CONFIRMED,
+                    job.capture_timestamp_ns,
+                    (0.0, -20.0, 1.0, 800.0),
+                    tuple(
+                        tuple(0.0 for _ in range(4))
+                        for _ in range(4)
+                    ),
+                    3,
+                    0,
+                    (20, 20, 60, 60),
+                    (),
+                ),
+                None,
+            )
+            payload = CropPayload(
+                job,
+                left,
+                None,
+                right,
+                None,
+                pair,
+                context,
+            )
             observed = []
 
             thread = threading.Thread(
@@ -440,6 +466,7 @@ class CropTests(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             self.assertTrue(observed[0][0].stereo_pair_complete)
             self.assertEqual(observed[0][0].stereo_pair, pair)
+            self.assertEqual(observed[0][0].sorting_context, context)
             np.testing.assert_array_equal(observed[0][0].image_bgr, left)
             np.testing.assert_array_equal(observed[0][0].camr_image_bgr, right)
 

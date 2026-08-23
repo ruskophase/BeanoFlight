@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from .classification import CLASSIFICATION_EVIDENCE
 from .classification_transport import (
     DEFAULT_DIRECT_EVIDENCE_ENDPOINT,
+    DirectEvidenceReceipt,
     DirectInferenceEvidence,
     ZeroMQDirectEvidencePublisher,
 )
@@ -219,6 +220,11 @@ class _RegistryCompletedBatch:
     delay_ms: float
     image_count: int
     tail: bool
+    direct_receipt: DirectEvidenceReceipt | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 class MockInferencerService:
@@ -918,7 +924,13 @@ class MockInferencerService:
                     f"complete:{payload.job.job_id}",
                 )
             )
-            direct_items.append(DirectInferenceEvidence(payload.job, enrichment))
+            direct_items.append(
+                DirectInferenceEvidence(
+                    payload.job,
+                    enrichment,
+                    payload.sorting_context,
+                )
+            )
             # Durable completion does not retain the 224x224 image while it
             # waits behind Registry work. The direct path has already consumed
             # all inference output needed for an immediate decision.
@@ -932,38 +944,14 @@ class MockInferencerService:
                     deadline_missed,
                 )
             )
+        direct_receipt = None
         if direct is not None:
-            direct_attempt_ns = time.monotonic_ns()
             try:
-                sent, direct_sent_ns = direct.send_batch(
+                direct_receipt = direct.send_batch(
                     batch_id, tuple(direct_items)
                 )
             except Exception as exc:  # noqa: BLE001 - Registry remains recovery path
-                sent = False
-                direct_sent_ns = time.monotonic_ns()
                 self._emit("error", detail=f"direct evidence: {exc}")
-            direct_completed_ns = time.monotonic_ns()
-            for _bean_ref, _job_id, _enrichment, marks, _event_id in completions:
-                marks.update(
-                    {
-                        "direct_delivery_attempted": 1,
-                        "direct_delivery_acknowledged": int(sent),
-                        "direct_delivery_attempt_monotonic_ns": direct_attempt_ns,
-                        "direct_delivery_completed_monotonic_ns": (
-                            direct_completed_ns
-                        ),
-                    }
-                )
-            with self._stats_lock:
-                if sent:
-                    self.direct_batches_sent += 1
-                    self.direct_evidence_sent += len(direct_items)
-                else:
-                    self.direct_batches_dropped += 1
-                    self.direct_evidence_dropped += len(direct_items)
-            if sent:
-                for _bean_ref, _job_id, _enrichment, marks, _event_id in completions:
-                    marks["direct_result_send_monotonic_ns"] = direct_sent_ns
         self._registry_results.put(
             _RegistryCompletedBatch(
                 tuple(completions),
@@ -972,6 +960,7 @@ class MockInferencerService:
                 delay_ms,
                 image_count,
                 tail,
+                direct_receipt,
             )
         )
 
@@ -981,6 +970,46 @@ class MockInferencerService:
         registry: ZeroMQRegistryClient,
     ) -> None:
         try:
+            if completed.direct_receipt is not None:
+                delivery = completed.direct_receipt.wait(0.1)
+                for (
+                    _bean_ref,
+                    _job_id,
+                    _enrichment,
+                    marks,
+                    _event_id,
+                ) in completed.completions:
+                    marks.update(
+                        {
+                            "direct_delivery_attempted": 1,
+                            "direct_delivery_acknowledged": int(
+                                delivery.acknowledged
+                            ),
+                            "direct_delivery_attempt_count": delivery.attempts,
+                            "direct_delivery_queued_monotonic_ns": (
+                                delivery.queued_monotonic_ns
+                            ),
+                            "direct_delivery_attempt_monotonic_ns": (
+                                delivery.first_sent_monotonic_ns
+                            ),
+                            "direct_delivery_completed_monotonic_ns": (
+                                delivery.completed_monotonic_ns
+                            ),
+                            "direct_delivery_receiver_received_monotonic_ns": (
+                                delivery.receiver_received_monotonic_ns
+                            ),
+                            "direct_result_send_monotonic_ns": (
+                                delivery.first_sent_monotonic_ns
+                            ),
+                        }
+                    )
+                with self._stats_lock:
+                    if delivery.acknowledged:
+                        self.direct_batches_sent += 1
+                        self.direct_evidence_sent += len(completed.results)
+                    else:
+                        self.direct_batches_dropped += 1
+                        self.direct_evidence_dropped += len(completed.results)
             if self._registry_capabilities is None:
                 self._registry_capabilities = _registry_capabilities(registry)
             retries = _complete_inference_batch_with_registration_retry(

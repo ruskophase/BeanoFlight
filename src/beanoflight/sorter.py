@@ -64,7 +64,7 @@ class SorterSettings:
     open_lead_ms: float = 8.0
     close_lag_ms: float = 12.0
     minimum_notice_ms: float = 4.0
-    ensemble_deadline_reserve_ms: float = 10.0
+    ensemble_deadline_reserve_ms: float = 5.0
     allow_adjacent_gate_pair: bool = True
     policy_version: str = "simulation-v3-ensemble"
 
@@ -135,7 +135,9 @@ class _PendingEnsemble:
     direct_sent_monotonic_ns: int | None = None
     direct_received_monotonic_ns: int | None = None
     context_path: bool = False
+    context_sent_monotonic_ns: int | None = None
     context_received_monotonic_ns: int | None = None
+    context_embedded_with_evidence: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,8 +149,10 @@ class _PendingRegistryRecovery:
 @dataclass(frozen=True, slots=True)
 class _CachedSortingContext:
     record: BeanRecord
+    sent_monotonic_ns: int
     received_monotonic_ns: int
     frame_index: int
+    embedded_with_evidence: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +223,7 @@ class SorterService:
         if not self.classification_endpoint:
             self._direct_ingress_ready.set()
         self._sorting_contexts: dict[BeanRef, _CachedSortingContext] = {}
+        self._registry_recovery_timing: dict[BeanRef, dict[str, int]] = {}
         self._recovery_queue: queue.Queue[RunSession | _RecoveredRecord] = (
             queue.Queue(maxsize=2_048)
         )
@@ -338,13 +343,16 @@ class SorterService:
                             else min(1, self._ensemble_receive_timeout_ms())
                         )
                     )
+                    # Evidence now carries the exact trajectory associated with
+                    # its crop. Admit it before best-effort standalone context
+                    # so a burst of track refinements cannot consume an
+                    # inference deadline while an already-received result waits.
+                    self._drain_direct_ingress(limit=256)
                     if contexts is not None and (
                         contexts.socket in readable
                         or contexts.socket.poll(0, zmq.POLLIN)
                     ):
-                        # Context is cheaper than a Registry lookup and should be
-                        # current before inference evidence is considered.
-                        for _index in range(256):
+                        for _index in range(64):
                             if not contexts.socket.poll(0, zmq.POLLIN):
                                 break
                             self._process_sorting_context(
@@ -352,11 +360,10 @@ class SorterService:
                                 None,
                                 received_monotonic_ns=time.monotonic_ns(),
                             )
-                    # The ingress worker has already decoded, admitted and ACKed
-                    # these batches. Context wins when both become ready together,
-                    # then evidence is drained without more socket work.
-                    self._drain_direct_ingress(limit=256)
-                    self._drain_recovery_queue(limit=256)
+                            # Bound context-induced head-of-line blocking during
+                            # a busy multi-bean frame.
+                            self._drain_direct_ingress(limit=256)
+                    self._drain_recovery_queue(limit=64)
                     # A result may have arrived while a context or Registry
                     # recovery item was handled. Poll once more at zero wait so
                     # queued evidence wins over an expiring fallback.
@@ -402,7 +409,7 @@ class SorterService:
         batch: DirectEvidenceBatch,
         received_monotonic_ns: int,
     ) -> bool:
-        # A missing ACK makes the publisher reset its REQ socket and resend the
+        # A missing ACK makes the publisher's transport worker resend the
         # identical batch. Acknowledge that retry without consuming ingress
         # capacity or processing its evidence twice.
         if batch.batch_id in self._admitted_direct_batches:
@@ -441,6 +448,7 @@ class SorterService:
     def _recovery_loop(self) -> None:
         """Own all Registry reads and notifications away from control timing."""
 
+        lower_current_thread_priority()
         registry = ZeroMQRegistryClient(self.registry_endpoint, timeout_ms=2_000)
         subscriber = ZeroMQRegistrySubscriber(self.event_endpoint)
         initialized = False
@@ -568,7 +576,9 @@ class SorterService:
             self._cursor = events[-1].stream_sequence
 
     def _drain_recovery_queue(self, *, limit: int) -> None:
-        for _index in range(limit):
+        for index in range(limit):
+            if index and index % 8 == 0:
+                self._drain_direct_ingress(limit=256)
             try:
                 item = self._recovery_queue.get_nowait()
             except queue.Empty:
@@ -608,6 +618,11 @@ class SorterService:
             direct_sent_monotonic_ns=sent_ns,
             direct_received_monotonic_ns=direct_received_ns,
             context_path=cached_context is not None,
+            context_sent_monotonic_ns=(
+                None
+                if cached_context is None
+                else cached_context.sent_monotonic_ns
+            ),
             context_received_monotonic_ns=(
                 None
                 if cached_context is None
@@ -653,6 +668,30 @@ class SorterService:
             bean_ref = item.job.bean_ref
             if bean_ref in self._planned:
                 continue
+            if item.sorting_context is not None:
+                context = item.sorting_context
+                context_record = BeanRecord(
+                    bean_ref=bean_ref,
+                    revision=0,
+                    status=context.track.status,
+                    created_timestamp_ns=context.track.timestamp_ns,
+                    updated_timestamp_ns=context.track.timestamp_ns,
+                    track=context.track,
+                    prediction=context.prediction,
+                )
+                previous = self._sorting_contexts.get(bean_ref)
+                if (
+                    previous is None
+                    or previous.record.track.timestamp_ns
+                    <= context.track.timestamp_ns
+                ):
+                    self._sorting_contexts[bean_ref] = _CachedSortingContext(
+                        context_record,
+                        batch.sent_monotonic_ns,
+                        received_monotonic_ns,
+                        item.job.frame_index,
+                        True,
+                    )
             cached = self._direct_evidence.setdefault(bean_ref, {})
             cached.setdefault(item.enrichment.result_id, item.enrichment)
             self._direct_timing.setdefault(
@@ -661,14 +700,30 @@ class SorterService:
             )
             if bean_ref not in references:
                 references.append(bean_ref)
-            self._pending_registry_recovery.pop(bean_ref, None)
         if not references:
             return
         records = []
+        context_sent_by_ref: dict[BeanRef, int] = {}
         context_received_by_ref: dict[BeanRef, int] = {}
+        context_embedded_by_ref: dict[BeanRef, bool] = {}
         for bean_ref in references:
             cached_context = self._sorting_contexts.get(bean_ref)
             if cached_context is None:
+                pending_ensemble = self._awaiting_ensemble.get(bean_ref)
+                if pending_ensemble is not None:
+                    records.append(pending_ensemble.record)
+                    if pending_ensemble.context_sent_monotonic_ns is not None:
+                        context_sent_by_ref[bean_ref] = (
+                            pending_ensemble.context_sent_monotonic_ns
+                        )
+                    if pending_ensemble.context_received_monotonic_ns is not None:
+                        context_received_by_ref[bean_ref] = (
+                            pending_ensemble.context_received_monotonic_ns
+                        )
+                    context_embedded_by_ref[bean_ref] = (
+                        pending_ensemble.context_embedded_with_evidence
+                    )
+                    continue
                 self.context_cache_misses += 1
                 # The trajectory publisher precedes crop dispatch, but the two
                 # independent sockets can be observed in either order. Retain
@@ -680,11 +735,16 @@ class SorterService:
                     self._recovery_watch.add(bean_ref)
                 continue
             records.append(cached_context.record)
+            context_sent_by_ref[bean_ref] = cached_context.sent_monotonic_ns
             context_received_by_ref[bean_ref] = (
                 cached_context.received_monotonic_ns
             )
+            context_embedded_by_ref[bean_ref] = (
+                cached_context.embedded_with_evidence
+            )
             self.context_cache_hits += 1
         for record in records:
+            self._pending_registry_recovery.pop(record.bean_ref, None)
             record = self._with_direct_evidence(record)
             sent_ns, first_received_ns = self._direct_delivery_timing(record)
             context_received_ns = context_received_by_ref.get(record.bean_ref)
@@ -696,7 +756,13 @@ class SorterService:
                 direct_sent_monotonic_ns=sent_ns,
                 direct_received_monotonic_ns=first_received_ns,
                 context_path=context_received_ns is not None,
+                context_sent_monotonic_ns=context_sent_by_ref.get(
+                    record.bean_ref
+                ),
                 context_received_monotonic_ns=context_received_ns,
+                context_embedded_with_evidence=context_embedded_by_ref.get(
+                    record.bean_ref, False
+                ),
             )
 
     def _process_sorting_context(
@@ -771,6 +837,7 @@ class SorterService:
             )
             self._sorting_contexts[bean_ref] = _CachedSortingContext(
                 context_record,
+                batch.sent_monotonic_ns,
                 received_monotonic_ns,
                 batch.frame_index,
             )
@@ -792,6 +859,7 @@ class SorterService:
                         registry,
                     ),
                     context_path=True,
+                    context_sent_monotonic_ns=batch.sent_monotonic_ns,
                     context_received_monotonic_ns=received_monotonic_ns,
                 )
             if bean_ref not in self._awaiting_prediction:
@@ -808,6 +876,7 @@ class SorterService:
                 direct_sent_monotonic_ns=sent_ns,
                 direct_received_monotonic_ns=direct_received_ns,
                 context_path=True,
+                context_sent_monotonic_ns=batch.sent_monotonic_ns,
                 context_received_monotonic_ns=received_monotonic_ns,
             )
         self._evict_stale_sorting_contexts(batch.run_id, batch.frame_index)
@@ -923,6 +992,11 @@ class SorterService:
             direct_path = direct_received_ns is not None
             cached_context = self._sorting_contexts.get(bean_ref)
             context_path = cached_context is not None
+            context_sent_ns = (
+                None
+                if cached_context is None
+                else cached_context.sent_monotonic_ns
+            )
             context_received_ns = (
                 None
                 if cached_context is None
@@ -941,7 +1015,13 @@ class SorterService:
                 direct_sent_monotonic_ns=sent_ns,
                 direct_received_monotonic_ns=direct_received_ns,
                 context_path=context_path,
+                context_sent_monotonic_ns=context_sent_ns,
                 context_received_monotonic_ns=context_received_ns,
+                context_embedded_with_evidence=(
+                    False
+                    if cached_context is None
+                    else cached_context.embedded_with_evidence
+                ),
             )
         self._cursor = events[-1].stream_sequence
 
@@ -956,7 +1036,9 @@ class SorterService:
         direct_sent_monotonic_ns: int | None = None,
         direct_received_monotonic_ns: int | None = None,
         context_path: bool = False,
+        context_sent_monotonic_ns: int | None = None,
         context_received_monotonic_ns: int | None = None,
+        context_embedded_with_evidence: bool = False,
     ) -> None:
         decision_started_ns = time.monotonic_ns()
         arrival_monotonic_ns = arrival_monotonic_ns or decision_started_ns
@@ -965,6 +1047,7 @@ class SorterService:
             self._awaiting_prediction.discard(record.bean_ref)
             self._awaiting_ensemble.pop(record.bean_ref, None)
             self._pending_registry_recovery.pop(record.bean_ref, None)
+            self._registry_recovery_timing.pop(record.bean_ref, None)
             self._clear_direct_evidence(record.bean_ref)
             self._sorting_contexts.pop(record.bean_ref, None)
             with self._recovery_watch_lock:
@@ -1039,7 +1122,9 @@ class SorterService:
                         direct_sent_monotonic_ns,
                         direct_received_monotonic_ns,
                         context_path,
+                        context_sent_monotonic_ns,
                         context_received_monotonic_ns,
+                        context_embedded_with_evidence,
                     )
                     return
                 force_deadline_fallback = True
@@ -1213,14 +1298,22 @@ class SorterService:
                     direct_received_monotonic_ns or 0
                 ),
                 "sorting_context_direct_path": int(context_path),
+                "sorting_context_send_monotonic_ns": int(
+                    context_sent_monotonic_ns or 0
+                ),
                 "sorter_context_received_monotonic_ns": int(
                     context_received_monotonic_ns or 0
                 ),
+                "sorting_context_embedded_with_evidence": int(
+                    context_embedded_with_evidence
+                ),
+                **self._registry_recovery_timing.get(record.bean_ref, {}),
             },
         )
         planned = replace(record, decision=decision)
         self._planned.add(record.bean_ref)
         self._pending_registry_recovery.pop(record.bean_ref, None)
+        self._registry_recovery_timing.pop(record.bean_ref, None)
         self._clear_direct_evidence(record.bean_ref)
         self._sorting_contexts.pop(record.bean_ref, None)
         with self._recovery_watch_lock:
@@ -1292,10 +1385,52 @@ class SorterService:
             if bean_ref in self._planned:
                 continue
             self.registry_recovery_decisions += 1
+            original_evidence = evidence_for_ensemble(
+                pending.record.enrichments
+            )
+            record = self._with_direct_evidence(pending.record)
+            refreshed_evidence = evidence_for_ensemble(record.enrichments)
+            sent_ns, direct_received_ns = self._direct_delivery_timing(record)
+            cached_context = self._sorting_contexts.get(bean_ref)
+            if cached_context is not None:
+                record = _merge_sorting_context(cached_context.record, record)
+            self._registry_recovery_timing[bean_ref] = {
+                "registry_recovery_queued_monotonic_ns": (
+                    pending.due_monotonic_ns - 5_000_000
+                ),
+                "registry_recovery_due_monotonic_ns": pending.due_monotonic_ns,
+                "registry_recovery_released_monotonic_ns": now_ns,
+                "registry_recovery_evidence_refreshed": max(
+                    0,
+                    len(refreshed_evidence) - len(original_evidence),
+                ),
+                "registry_recovery_context_refreshed": int(
+                    cached_context is not None
+                ),
+            }
             self._consider(
-                pending.record,
+                record,
                 registry,
                 arrival_monotonic_ns=now_ns,
+                direct_path=direct_received_ns is not None,
+                direct_sent_monotonic_ns=sent_ns,
+                direct_received_monotonic_ns=direct_received_ns,
+                context_path=cached_context is not None,
+                context_sent_monotonic_ns=(
+                    None
+                    if cached_context is None
+                    else cached_context.sent_monotonic_ns
+                ),
+                context_received_monotonic_ns=(
+                    None
+                    if cached_context is None
+                    else cached_context.received_monotonic_ns
+                ),
+                context_embedded_with_evidence=(
+                    False
+                    if cached_context is None
+                    else cached_context.embedded_with_evidence
+                ),
             )
 
     def _release_due_ensemble_fallbacks(
@@ -1324,8 +1459,14 @@ class SorterService:
                         pending.direct_received_monotonic_ns
                     ),
                     context_path=pending.context_path,
+                    context_sent_monotonic_ns=(
+                        pending.context_sent_monotonic_ns
+                    ),
                     context_received_monotonic_ns=(
                         pending.context_received_monotonic_ns
+                    ),
+                    context_embedded_with_evidence=(
+                        pending.context_embedded_with_evidence
                     ),
                 )
                 continue
@@ -1407,6 +1548,7 @@ class SorterService:
             },
         )
         self._planned.add(record.bean_ref)
+        self._registry_recovery_timing.pop(record.bean_ref, None)
         self._clear_direct_evidence(record.bean_ref)
         self._sorting_contexts.pop(record.bean_ref, None)
         with self._recovery_watch_lock:

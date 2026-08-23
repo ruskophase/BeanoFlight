@@ -16,6 +16,7 @@ import numpy as np
 
 from .models import BeanRef, FrameAnalysis, TrackStatus
 from .registry_models import InferenceJob, InferenceStatus
+from .sorting_context_transport import SortingContext
 from .stereo import StereoCropPreparation, StereoPairMetadata
 
 
@@ -48,6 +49,7 @@ class CropPayload:
         default=None, compare=False, repr=False
     )
     stereo_pair: StereoPairMetadata | None = None
+    sorting_context: SortingContext | None = None
 
     @property
     def stereo_pair_complete(self) -> bool:
@@ -104,6 +106,7 @@ class CropPayload:
             right,
             None,
             self.stereo_pair,
+            self.sorting_context,
         )
 
     def with_job(self, job: InferenceJob) -> CropPayload:
@@ -114,6 +117,20 @@ class CropPayload:
             self.camr_image_bgr,
             self.camr_materializer,
             self.stereo_pair,
+            self.sorting_context,
+        )
+
+    def with_sorting_context(self, context: SortingContext) -> CropPayload:
+        if context.track.bean_ref != self.job.bean_ref:
+            raise ValueError("sorting context does not match crop job")
+        return CropPayload(
+            self.job,
+            self.image_bgr,
+            self.materializer,
+            self.camr_image_bgr,
+            self.camr_materializer,
+            self.stereo_pair,
+            context,
         )
 
 

@@ -1021,6 +1021,15 @@ class ReplayRunner:
                                     timing_marks_ns=timing_marks,
                                 )
                             )
+                            track = track_by_ref.get(payload.job.bean_ref)
+                            if track is not None:
+                                # Keep the precise trajectory used for this
+                                # crop with its eventual inference evidence.
+                                # The standalone context stream remains the
+                                # best-effort source of later refinements.
+                                payload = payload.with_sorting_context(
+                                    SortingContext(track, prediction)
+                                )
                             prioritized_crops.append(payload)
                         selected_crops = tuple(prioritized_crops)
                         updates = tuple(

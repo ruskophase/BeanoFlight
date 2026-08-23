@@ -10,9 +10,10 @@ synchronized CamL/CamR mmap RG10 (fast) or CamL calibrated MKV (fallback)
        v
  BeanoFlight replay -- async audit --------> BeanRegistry --> SQLite WAL
        |                 |                       ^  ^             |
-       |                 +-- direct context ---> |  |             +--> Monitor
-       +-- CamL/CamR crop pair --> Beano Inferencer ==ACK==> Sorter
-                                                |  |
+       |                 +-- direct context -----+  |             +--> Monitor
+       +-- crop + trajectory --> Beano Inferencer --+--> Sorter
+                                      |  async evidence + ACK     |
+                                      +---------------------------+
                        decision audit -----------+  |
                                                 v  |
                                       BeanoActuator ==USB==> ESP32 LEDs
@@ -35,10 +36,14 @@ synchronized CamL/CamR mmap RG10 (fast) or CamL calibrated MKV (fallback)
   distinct synchronized CamL and CamR crops to the corresponding tower inputs.
   The explicit single-view A/B option duplicates CamL only for timing comparison
   and records `stereo_pair_complete: false`.
-- `beano-sorter` joins direct classification evidence with BeanoFlight's direct
-  track/prediction context. Registry notifications and the SQLite journal recover
-  a dropped message, sequence gap or restart. It owns classification policy and
-  timing. Recovery starts from the current cursor plus live/latest run snapshots;
+- `beano-sorter` receives each classification result with the exact
+  track/prediction context attached to its source crop. BeanoFlight's separate
+  best-effort context stream can provide a newer trajectory; Registry
+  notifications and the SQLite journal recover a dropped message, sequence gap
+  or restart. Direct evidence is admitted ahead of bulk context/recovery work,
+  while acknowledgements and bounded retries run outside the inference hot path.
+  It owns classification policy and timing. Recovery starts from the current
+  cursor plus live/latest run snapshots;
   it never replays unrelated historical runs. The GUI is a policy/settings
   console. Its screen gate mirror and activity log are optional diagnostics.
   An approved absolute valve plan is sent to BeanoActuator before its audit

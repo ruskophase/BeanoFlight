@@ -53,6 +53,9 @@ class TimingLedgerTests(unittest.TestCase):
                 "available_notice_ns": -3_000_000,
                 "minimum_notice_ns": 4_000_000,
                 "additional_notice_required_ns": 7_000_000,
+                "direct_delivery_acknowledged": 0,
+                "direct_delivery_receiver_received_monotonic_ns": 0,
+                "direct_delivery_completed_monotonic_ns": 9_000_000_000,
             },
         )
         record = replace(record, inference_jobs=(job,), decision=decision)
@@ -64,6 +67,9 @@ class TimingLedgerTests(unittest.TestCase):
         self.assertEqual(ledger["late_by_ms"], 7.0)
         self.assertTrue(ledger["resized_crop"])
         self.assertGreater(ledger["equivalent_line_extension_mm"], 0.0)
+        self.assertNotIn(
+            "direct_receiver_to_ack_ms", ledger["durations_ms"]
+        )
         self.assertEqual(summary["shadow_recovered_with_extra_notice"]["5"], 0)
         self.assertEqual(summary["shadow_recovered_with_extra_notice"]["10"], 1)
 

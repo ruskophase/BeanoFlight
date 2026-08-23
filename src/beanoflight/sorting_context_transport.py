@@ -32,6 +32,37 @@ class SortingContext:
     prediction: CrossingPrediction | None
 
 
+def sorting_context_to_dict(context: SortingContext) -> dict[str, object]:
+    """Serialize one context for reuse by the crop and evidence transports."""
+
+    return {
+        "track": track_to_dict(context.track, include_history=False),
+        "prediction": (
+            None
+            if context.prediction is None
+            else prediction_to_dict(context.prediction)
+        ),
+    }
+
+
+def sorting_context_from_dict(value: object) -> SortingContext:
+    """Deserialize and validate one context shared with a bean crop."""
+
+    raw = _object(value)
+    track = track_from_dict(_object(raw.get("track")))
+    prediction_value = raw.get("prediction")
+    prediction = (
+        None
+        if prediction_value is None
+        else prediction_from_dict(_object(prediction_value))
+    )
+    if prediction is not None and prediction.bean_ref != track.bean_ref:
+        raise SortingContextTransportError(
+            "sorting prediction does not match its track"
+        )
+    return SortingContext(track, prediction)
+
+
 @dataclass(frozen=True, slots=True)
 class SortingContextBatch:
     run_id: str
@@ -111,17 +142,7 @@ class ZeroMQSortingContextPublisher:
                 "clock_monotonic_ns": int(clock_monotonic_ns),
                 "clock_epoch": int(clock_epoch),
                 "sent_monotonic_ns": sent_ns,
-                "items": [
-                    {
-                        "track": track_to_dict(item.track, include_history=False),
-                        "prediction": (
-                            None
-                            if item.prediction is None
-                            else prediction_to_dict(item.prediction)
-                        ),
-                    }
-                    for item in items
-                ],
+                "items": [sorting_context_to_dict(item) for item in items],
             }
         )
         if len(encoded) > MAX_SORTING_CONTEXT_BYTES:
@@ -181,17 +202,7 @@ class ZeroMQSortingContextReceiver:
         raw_items = _array(message.get("items"))
         if not 1 <= len(raw_items) <= MAX_SORTING_CONTEXT_ITEMS:
             raise SortingContextTransportError("invalid sorting context batch")
-        items = []
-        for raw in raw_items:
-            value = _object(raw)
-            track = track_from_dict(_object(value.get("track")))
-            prediction_value = value.get("prediction")
-            prediction = (
-                None
-                if prediction_value is None
-                else prediction_from_dict(_object(prediction_value))
-            )
-            items.append(SortingContext(track, prediction))
+        items = [sorting_context_from_dict(raw) for raw in raw_items]
         result = SortingContextBatch(
             run_id=str(message.get("run_id", "")),
             frame_index=int(message.get("frame_index", -1)),

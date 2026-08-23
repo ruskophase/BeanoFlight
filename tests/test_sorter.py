@@ -10,11 +10,17 @@ from beanoflight.classification import (
     CLASSIFICATION_POOLED,
     pool_classification_evidence,
 )
+from beanoflight.classification_transport import (
+    DirectEvidenceBatch,
+    DirectInferenceEvidence,
+)
 from beanoflight.models import BeanEvent, BeanRef, Gate, GateProbability, TrackStatus
 from beanoflight.prediction import GateLayout, TrajectoryPredictor
 from beanoflight.registry import BeanRegistry
 from beanoflight.registry_models import (
     Enrichment,
+    InferenceJob,
+    InferenceStatus,
     RunSession,
     RunState,
     SortingDecision,
@@ -32,6 +38,87 @@ from beanoflight.timing_ledger import bean_timing_ledger
 
 
 class SorterTimingTests(unittest.TestCase):
+    def test_direct_evidence_can_decide_from_its_embedded_context(self):
+        registry = BeanRegistry()
+        bean_ref = BeanRef("embedded-context-run", 1)
+        anchor_ns = time.monotonic_ns()
+        registry.put_session(
+            RunSession(
+                bean_ref.run_id,
+                0,
+                RunState.RUNNING,
+                "/synthetic",
+                "raw",
+                100,
+                60.0,
+                60.0,
+                0,
+                0,
+                anchor_ns,
+                False,
+                1,
+                1,
+                {"crops_per_bean": 1},
+            )
+        )
+        snapshot = track(bean_ref, 0, 1_000_000, -25.0)
+        prediction = TrajectoryPredictor(GateLayout(60.0)).predict(snapshot)
+        registry.update_track(snapshot, prediction)
+        job = InferenceJob(
+            "embedded-job-1",
+            bean_ref,
+            InferenceStatus.COMPLETED,
+            "CamL",
+            0,
+            snapshot.timestamp_ns,
+            1,
+            224,
+            224,
+            False,
+            snapshot.timestamp_ns,
+            snapshot.timestamp_ns,
+        )
+        evidence = Enrichment(
+            "mock-inferencer",
+            CLASSIFICATION_EVIDENCE,
+            {
+                "category": "acceptable",
+                "class_order": ["acceptable", "mould"],
+                "probabilities": [0.9, 0.1],
+                "ensemble": {
+                    "id": "embedded-context-run:1:model",
+                    "sample_index": 1,
+                    "expected_samples": 1,
+                },
+            },
+            snapshot.timestamp_ns,
+            result_id=job.job_id,
+            confidence=0.9,
+        )
+        sorter = SorterService()
+
+        sorter._process_direct_evidence(
+            DirectEvidenceBatch(
+                "embedded-batch",
+                anchor_ns + 1,
+                (
+                    DirectInferenceEvidence(
+                        job,
+                        evidence,
+                        SortingContext(snapshot, prediction),
+                    ),
+                ),
+            ),
+            registry,
+            received_monotonic_ns=anchor_ns + 2,
+        )
+
+        decided = registry.get(bean_ref)
+        self.assertIsNotNone(decided.decision)
+        marks = decided.decision.timing_marks_ns
+        self.assertEqual(marks["sorting_context_embedded_with_evidence"], 1)
+        self.assertEqual(marks["classification_sample_count"], 1)
+
     def test_new_trajectory_recalculates_pending_pool_deadline(self):
         registry = BeanRegistry()
         bean_ref = BeanRef("trajectory-deadline-run", 1)
@@ -189,6 +276,178 @@ class SorterTimingTests(unittest.TestCase):
         self.assertEqual(
             decided.decision.timing_marks_ns["classification_direct_path"], 0
         )
+
+    def test_registry_recovery_refreshes_new_direct_evidence(self):
+        registry = BeanRegistry()
+        bean_ref = BeanRef("recovery-refresh-run", 1)
+        snapshot = track(bean_ref, 0, 100, -25.0)
+        prediction = TrajectoryPredictor(GateLayout(60.0)).predict(snapshot)
+        record = registry.update_track(snapshot, prediction)
+        first = Enrichment(
+            "mock-inferencer",
+            CLASSIFICATION_EVIDENCE,
+            {
+                "category": "acceptable",
+                "class_order": ["acceptable", "mould"],
+                "probabilities": [0.8, 0.2],
+                "ensemble": {
+                    "id": "recovery-refresh-run:1:model",
+                    "sample_index": 1,
+                    "expected_samples": 2,
+                },
+            },
+            110,
+            result_id="refresh-job-1",
+            confidence=0.8,
+        )
+        second = replace(
+            first,
+            value={
+                **first.value,
+                "ensemble": {
+                    **first.value["ensemble"],
+                    "sample_index": 2,
+                },
+            },
+            timestamp_ns=120,
+            result_id="refresh-job-2",
+        )
+        record = registry.add_enrichment(bean_ref, first)
+        sorter = SorterService()
+        received_ns = time.monotonic_ns() - 6_000_000
+        sorter._process_events(
+            (
+                BeanEvent(
+                    "inference.completed",
+                    bean_ref,
+                    110,
+                    {"record": record_to_dict(record, include_history=False)},
+                    record.revision,
+                    "complete:refresh-job-1",
+                    1,
+                ),
+            ),
+            registry,
+            received_monotonic_ns=received_ns,
+            use_embedded_state=True,
+            defer_classifications=True,
+        )
+        sorter._direct_evidence[bean_ref] = {second.result_id: second}
+        sorter._direct_timing[second.result_id] = (
+            received_ns + 1_000,
+            received_ns + 2_000,
+        )
+
+        sorter._release_due_registry_recoveries(registry)
+
+        decided = registry.get(bean_ref)
+        basis = next(
+            item
+            for item in decided.enrichments
+            if item.kind == CLASSIFICATION_DECISION_BASIS
+        )
+        self.assertEqual(basis.value["ensemble"]["sample_count"], 2)
+        marks = decided.decision.timing_marks_ns
+        self.assertEqual(marks["classification_direct_path"], 1)
+        self.assertEqual(marks["registry_recovery_evidence_refreshed"], 1)
+
+    def test_pending_ensemble_accepts_direct_evidence_without_new_context(self):
+        registry = BeanRegistry()
+        bean_ref = BeanRef("pending-refresh-run", 1)
+        now_ns = time.monotonic_ns()
+        registry.put_session(
+            RunSession(
+                bean_ref.run_id,
+                0,
+                RunState.RUNNING,
+                "/synthetic",
+                "raw",
+                10,
+                60.0,
+                60.0,
+                100,
+                100,
+                now_ns,
+                False,
+                1,
+                1,
+                {"crops_per_bean": 2},
+            )
+        )
+        snapshot = track(bean_ref, 0, 100, -25.0)
+        prediction = TrajectoryPredictor(GateLayout(60.0)).predict(snapshot)
+        record = registry.update_track(snapshot, prediction)
+        first = Enrichment(
+            "mock-inferencer",
+            CLASSIFICATION_EVIDENCE,
+            {
+                "category": "acceptable",
+                "class_order": ["acceptable", "mould"],
+                "probabilities": [0.8, 0.2],
+                "ensemble": {
+                    "id": "pending-refresh-run:1:model",
+                    "sample_index": 1,
+                    "expected_samples": 2,
+                },
+            },
+            110,
+            result_id="pending-job-1",
+            confidence=0.8,
+        )
+        second = replace(
+            first,
+            value={
+                **first.value,
+                "ensemble": {
+                    **first.value["ensemble"],
+                    "sample_index": 2,
+                },
+            },
+            timestamp_ns=120,
+            result_id="pending-job-2",
+        )
+        sorter = SorterService()
+        sorter._consider(
+            replace(record, enrichments=(first,)),
+            registry,
+            arrival_monotonic_ns=now_ns,
+            direct_path=True,
+            direct_sent_monotonic_ns=now_ns,
+            direct_received_monotonic_ns=now_ns,
+        )
+        self.assertIn(bean_ref, sorter._awaiting_ensemble)
+        job = InferenceJob(
+            second.result_id,
+            bean_ref,
+            InferenceStatus.COMPLETED,
+            "CamL",
+            2,
+            120,
+            record.revision,
+            224,
+            224,
+            False,
+            120,
+            120,
+        )
+
+        sorter._process_direct_evidence(
+            DirectEvidenceBatch(
+                "pending-batch",
+                now_ns + 1,
+                (DirectInferenceEvidence(job, second),),
+            ),
+            registry,
+            received_monotonic_ns=now_ns + 2,
+        )
+
+        decided = registry.get(bean_ref)
+        basis = next(
+            item
+            for item in decided.enrichments
+            if item.kind == CLASSIFICATION_DECISION_BASIS
+        )
+        self.assertEqual(basis.value["ensemble"]["sample_count"], 2)
 
     def test_deadline_fallback_finalizes_first_probability_vector(self):
         registry = BeanRegistry()

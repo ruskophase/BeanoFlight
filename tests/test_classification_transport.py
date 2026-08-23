@@ -1,5 +1,6 @@
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -11,13 +12,14 @@ from beanoflight.classification_transport import (
     ZeroMQDirectEvidencePublisher,
     ZeroMQDirectEvidenceReceiver,
 )
-from beanoflight.models import BeanRef
+from beanoflight.models import BeanRef, TrackSnapshot, TrackStatus
 from beanoflight.registry_models import (
     Enrichment,
     InferenceJob,
     InferenceStatus,
 )
 from beanoflight.sorter import SorterService
+from beanoflight.sorting_context_transport import SortingContext
 
 
 def direct_item() -> DirectInferenceEvidence:
@@ -69,15 +71,60 @@ class DirectClassificationTransportTests(unittest.TestCase):
             )
             receive_thread.start()
 
-            sent, sent_ns = publisher.send_batch("batch-1", (direct_item(),))
-            self.assertTrue(sent)
+            receipt = publisher.send_batch("batch-1", (direct_item(),))
             receive_thread.join(1.0)
             self.assertFalse(receive_thread.is_alive())
             received = received_batches[0]
+            delivery = receipt.wait(1.0)
 
             self.assertEqual(received.batch_id, "batch-1")
-            self.assertEqual(received.sent_monotonic_ns, sent_ns)
+            self.assertTrue(delivery.terminal)
+            self.assertTrue(delivery.acknowledged)
+            self.assertEqual(delivery.attempts, 1)
+            self.assertEqual(
+                received.sent_monotonic_ns,
+                delivery.first_sent_monotonic_ns,
+            )
             self.assertEqual(received.items, (direct_item(),))
+            publisher.close()
+            receiver.close()
+
+    def test_embedded_sorting_context_round_trips_with_evidence(self):
+        item = direct_item()
+        snapshot = TrackSnapshot(
+            item.job.bean_ref,
+            TrackStatus.CONFIRMED,
+            item.job.capture_timestamp_ns,
+            (0.0, -20.0, 1.0, 800.0),
+            tuple(
+                tuple(0.0 for _ in range(4)) for _ in range(4)
+            ),
+            3,
+            0,
+            (20, 20, 60, 60),
+            (),
+        )
+        contextual = DirectInferenceEvidence(
+            item.job,
+            item.enrichment,
+            SortingContext(snapshot, None),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            endpoint = f"ipc://{Path(temporary) / 'context-evidence.sock'}"
+            receiver = ZeroMQDirectEvidenceReceiver(endpoint)
+            publisher = ZeroMQDirectEvidencePublisher(endpoint)
+            received = []
+            thread = threading.Thread(
+                target=lambda: received.append(receiver.receive_batch()),
+                daemon=True,
+            )
+            thread.start()
+
+            receipt = publisher.send_batch("context-batch", (contextual,))
+            thread.join(1.0)
+
+            self.assertTrue(receipt.wait(1.0).acknowledged)
+            self.assertEqual(received[0].items, (contextual,))
             publisher.close()
             receiver.close()
 
@@ -117,11 +164,14 @@ class DirectClassificationTransportTests(unittest.TestCase):
             )
             receive_thread.start()
 
-            sent, _sent_ns = publisher.send_batch("batch-rejected", (direct_item(),))
+            receipt = publisher.send_batch("batch-rejected", (direct_item(),))
 
             receive_thread.join(1.0)
             self.assertFalse(receive_thread.is_alive())
-            self.assertFalse(sent)
+            delivery = receipt.wait(1.0)
+            self.assertTrue(delivery.terminal)
+            self.assertFalse(delivery.acknowledged)
+            self.assertEqual(delivery.attempts, 1)
             publisher.close()
             receiver.close()
 
@@ -146,13 +196,47 @@ class DirectClassificationTransportTests(unittest.TestCase):
 
             receive_thread = threading.Thread(target=receive_twice, daemon=True)
             receive_thread.start()
-            sent, _sent_ns = publisher.send_batch("batch-retry", (direct_item(),))
+            receipt = publisher.send_batch("batch-retry", (direct_item(),))
 
             receive_thread.join(1.0)
             self.assertFalse(receive_thread.is_alive())
-            self.assertTrue(sent)
+            delivery = receipt.wait(1.0)
+            self.assertTrue(delivery.acknowledged)
+            self.assertEqual(delivery.attempts, 2)
             self.assertIsNone(received[0])
             self.assertEqual(received[1].batch_id, "batch-retry")
+            publisher.close()
+            receiver.close()
+
+    def test_slow_acknowledgement_does_not_block_submission(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            endpoint = f"ipc://{Path(temporary) / 'evidence.sock'}"
+            receiver = ZeroMQDirectEvidenceReceiver(endpoint)
+            publisher = ZeroMQDirectEvidencePublisher(
+                endpoint,
+                acknowledgement_timeout_ms=100,
+            )
+
+            def receive_slowly():
+                receiver.receive_batch(
+                    accept=lambda _batch, _received_ns: (
+                        time.sleep(0.025) is None
+                    )
+                )
+                receiver.receive_batch()
+
+            receive_thread = threading.Thread(target=receive_slowly, daemon=True)
+            receive_thread.start()
+            started = time.monotonic()
+            first = publisher.send_batch("batch-slow", (direct_item(),))
+            second = publisher.send_batch("batch-following", (direct_item(),))
+            submit_ms = (time.monotonic() - started) * 1_000
+
+            self.assertLess(submit_ms, 5.0)
+            self.assertTrue(first.wait(1.0).acknowledged)
+            self.assertTrue(second.wait(1.0).acknowledged)
+            receive_thread.join(1.0)
+            self.assertFalse(receive_thread.is_alive())
             publisher.close()
             receiver.close()
 

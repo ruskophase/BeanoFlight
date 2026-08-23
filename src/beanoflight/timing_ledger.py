@@ -120,6 +120,20 @@ def bean_timing_ledger(record: BeanRecord) -> dict[str, object]:
     )
     _duration(
         durations,
+        "registry_recovery_wait_ms",
+        marks,
+        "registry_recovery_queued_monotonic_ns",
+        "registry_recovery_released_monotonic_ns",
+    )
+    _duration(
+        durations,
+        "registry_recovery_release_lateness_ms",
+        marks,
+        "registry_recovery_due_monotonic_ns",
+        "registry_recovery_released_monotonic_ns",
+    )
+    _duration(
+        durations,
         "inference_result_publish_queue_ms",
         marks,
         "inference_completed_monotonic_ns",
@@ -132,6 +146,24 @@ def bean_timing_ledger(record: BeanRecord) -> dict[str, object]:
         "direct_delivery_attempt_monotonic_ns",
         "direct_delivery_completed_monotonic_ns",
     )
+    _duration(
+        durations,
+        "direct_delivery_queue_ms",
+        marks,
+        "direct_delivery_queued_monotonic_ns",
+        "direct_delivery_attempt_monotonic_ns",
+    )
+    if (
+        marks.get("direct_delivery_acknowledged", 0)
+        and marks.get("direct_delivery_receiver_received_monotonic_ns", 0)
+    ):
+        _duration(
+            durations,
+            "direct_receiver_to_ack_ms",
+            marks,
+            "direct_delivery_receiver_received_monotonic_ns",
+            "direct_delivery_completed_monotonic_ns",
+        )
     _duration(
         durations,
         "inference_complete_to_sorter_ms",
@@ -162,6 +194,13 @@ def bean_timing_ledger(record: BeanRecord) -> dict[str, object]:
             "sorter_decision_started_monotonic_ns",
         )
     if marks.get("sorting_context_direct_path", 0):
+        _duration(
+            durations,
+            "context_transport_ms",
+            marks,
+            "sorting_context_send_monotonic_ns",
+            "sorter_context_received_monotonic_ns",
+        )
         _duration(
             durations,
             "context_receive_to_decision_ms",
@@ -217,9 +256,13 @@ def bean_timing_ledger(record: BeanRecord) -> dict[str, object]:
             else "registry"
         ),
         "sorting_context_delivery": (
-            "direct"
-            if marks.get("sorting_context_direct_path", 0)
-            else "registry"
+            "embedded-evidence"
+            if marks.get("sorting_context_embedded_with_evidence", 0)
+            else (
+                "direct"
+                if marks.get("sorting_context_direct_path", 0)
+                else "registry"
+            )
         ),
         "gate_indices": [] if decision is None else list(decision.gate_indices),
         "available_notice_ms": marks.get("available_notice_ns", 0) / 1_000_000.0,
@@ -321,6 +364,41 @@ def summarize_timing_ledgers(
                 bool(item["marks_ns"].get("direct_delivery_attempted", 0))
                 and not bool(
                     item["marks_ns"].get("direct_delivery_acknowledged", 0)
+                )
+                for item in ledgers
+            ),
+            "direct_delivery_retried_decisions": sum(
+                int(
+                    item["marks_ns"].get("direct_delivery_attempt_count", 0)
+                )
+                > 1
+                for item in ledgers
+            ),
+            "direct_delivery_retry_attempts": sum(
+                max(
+                    0,
+                    int(
+                        item["marks_ns"].get(
+                            "direct_delivery_attempt_count", 0
+                        )
+                    )
+                    - 1,
+                )
+                for item in ledgers
+            ),
+            "registry_recovery_evidence_refreshes": sum(
+                int(
+                    item["marks_ns"].get(
+                        "registry_recovery_evidence_refreshed", 0
+                    )
+                )
+                for item in ledgers
+            ),
+            "registry_recovery_context_refreshes": sum(
+                bool(
+                    item["marks_ns"].get(
+                        "registry_recovery_context_refreshed", 0
+                    )
                 )
                 for item in ledgers
             ),
