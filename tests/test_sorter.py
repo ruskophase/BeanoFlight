@@ -93,6 +93,7 @@ class SorterTimingTests(unittest.TestCase):
             60.0,
             0,
             anchor_ns,
+            2,
             time.monotonic_ns(),
             (SortingContext(snapshot, revised),),
         )
@@ -105,6 +106,42 @@ class SorterTimingTests(unittest.TestCase):
 
         revised_deadline = sorter._awaiting_ensemble[bean_ref].deadline_monotonic_ns
         self.assertEqual(original_deadline - revised_deadline, 20_000_000)
+
+    def test_sorter_rejects_changed_clock_anchor_within_epoch(self):
+        bean_ref = BeanRef("clock-context-run", 1)
+        snapshot = track(bean_ref, 0, 100, -25.0)
+        prediction = TrajectoryPredictor(GateLayout(60.0)).predict(snapshot)
+        anchor_ns = time.monotonic_ns() + 100_000_000
+        batch = SortingContextBatch(
+            bean_ref.run_id,
+            0,
+            60.0,
+            60.0,
+            100,
+            anchor_ns,
+            2,
+            time.monotonic_ns(),
+            (SortingContext(snapshot, prediction),),
+        )
+        sorter = SorterService()
+
+        sorter._process_sorting_context(
+            batch,
+            registry=None,
+            received_monotonic_ns=time.monotonic_ns(),
+        )
+        sorter._process_sorting_context(
+            replace(batch, clock_monotonic_ns=anchor_ns + 1),
+            registry=None,
+            received_monotonic_ns=time.monotonic_ns(),
+        )
+
+        self.assertEqual(sorter.clock_anchor_mismatches, 1)
+        self.assertEqual(sorter.errors, 1)
+        self.assertEqual(
+            sorter._sessions[bean_ref.run_id].clock_monotonic_ns,
+            anchor_ns,
+        )
 
     def test_registry_notification_recovers_a_missing_direct_message(self):
         registry = BeanRegistry()

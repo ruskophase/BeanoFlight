@@ -121,6 +121,7 @@ class SimulationStackTests(unittest.TestCase):
                     target_fps=session.target_fps,
                     clock_source_timestamp_ns=session.clock_source_timestamp_ns,
                     clock_monotonic_ns=session.clock_monotonic_ns,
+                    clock_epoch=session.revision,
                     items=(SortingContext(snapshot, prediction),),
                 )
             )

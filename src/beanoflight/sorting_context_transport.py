@@ -40,6 +40,7 @@ class SortingContextBatch:
     target_fps: float
     clock_source_timestamp_ns: int
     clock_monotonic_ns: int
+    clock_epoch: int
     sent_monotonic_ns: int
     items: tuple[SortingContext, ...]
 
@@ -75,6 +76,7 @@ class ZeroMQSortingContextPublisher:
         target_fps: float,
         clock_source_timestamp_ns: int,
         clock_monotonic_ns: int,
+        clock_epoch: int,
         items: tuple[SortingContext, ...],
     ) -> bool:
         if not items:
@@ -83,7 +85,7 @@ class ZeroMQSortingContextPublisher:
             raise SortingContextTransportError(
                 "sorting context batch must contain between 1 and 32 items"
             )
-        if not run_id or source_fps <= 0 or target_fps < 0:
+        if not run_id or source_fps <= 0 or target_fps < 0 or clock_epoch <= 0:
             raise SortingContextTransportError("invalid sorting context clock")
         for item in items:
             if item.track.bean_ref.run_id != run_id:
@@ -107,6 +109,7 @@ class ZeroMQSortingContextPublisher:
                 "target_fps": float(target_fps),
                 "clock_source_timestamp_ns": int(clock_source_timestamp_ns),
                 "clock_monotonic_ns": int(clock_monotonic_ns),
+                "clock_epoch": int(clock_epoch),
                 "sent_monotonic_ns": sent_ns,
                 "items": [
                     {
@@ -198,6 +201,7 @@ class ZeroMQSortingContextReceiver:
                 message.get("clock_source_timestamp_ns", -1)
             ),
             clock_monotonic_ns=int(message.get("clock_monotonic_ns", -1)),
+            clock_epoch=int(message.get("clock_epoch", -1)),
             sent_monotonic_ns=int(message.get("sent_monotonic_ns", -1)),
             items=tuple(items),
         )
@@ -208,6 +212,7 @@ class ZeroMQSortingContextReceiver:
             or result.target_fps < 0
             or result.clock_source_timestamp_ns < 0
             or result.clock_monotonic_ns <= 0
+            or result.clock_epoch <= 0
             or result.sent_monotonic_ns <= 0
             or any(item.track.bean_ref.run_id != result.run_id for item in items)
         ):

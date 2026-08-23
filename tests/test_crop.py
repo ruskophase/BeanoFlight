@@ -1,6 +1,8 @@
 import tempfile
 import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +23,7 @@ from beanoflight.models import (
     TrackStatus,
 )
 from beanoflight.registry_models import InferenceJob, InferenceStatus
+from beanoflight.stereo import StereoPairMetadata
 
 
 class CropTests(unittest.TestCase):
@@ -247,6 +250,45 @@ class CropTests(unittest.TestCase):
 
         self.assertEqual(selected, ())
 
+    def test_stereo_failure_is_not_retried_with_caml_only_edge_geometry(self):
+        attempts = []
+
+        def unavailable(*_args, **_kwargs):
+            attempts.append(True)
+
+        selector = BeanCropSelector(
+            CropSettings(size_px=40, adaptive_edge_resize=True),
+            stereo_extractor=unavailable,
+        )
+        bean_ref = BeanRef("stereo-edge-run", 1)
+        observation = Observation(
+            0,
+            100,
+            Detection((50.0, 25.0), (42, 15, 16, 20), 250, 1.0, (0, 0, 0)),
+            (0.0, -10.0),
+        )
+        track = TrackSnapshot(
+            bean_ref,
+            TrackStatus.TENTATIVE,
+            100,
+            (0.0, -10.0, 0.0, 1.0),
+            tuple(tuple(0.0 for _ in range(4)) for _ in range(4)),
+            1,
+            0,
+            observation.detection.bbox_px,
+            (observation,),
+        )
+
+        selected = selector.select(
+            np.zeros((100, 100, 3), dtype=np.uint8),
+            FrameAnalysis(0, 100, (), (), (track,), (), 0.1),
+            {bean_ref: 1},
+        )
+
+        self.assertEqual(selected, ())
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(selector.statistics()["stereo_unavailable"], 1)
+
     def test_extracts_centred_lossless_crop_and_optional_padding(self):
         frame = np.arange(80 * 100 * 3, dtype=np.uint8).reshape(80, 100, 3)
         crop, padded = extract_square_crop(frame, (50.0, 40.0), 20, allow_padding=False)
@@ -348,6 +390,106 @@ class CropTests(unittest.TestCase):
             ))
             for received, expected in zip(observed[0], images):
                 np.testing.assert_array_equal(received.image_bgr, expected)
+
+    def test_zero_mq_stereo_batch_round_trip_preserves_both_views_and_pair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            endpoint = f"ipc://{Path(temporary) / 'stereo-crops.sock'}"
+            receiver = ZeroMQCropReceiver(endpoint)
+            job = InferenceJob(
+                "stereo-job",
+                BeanRef("stereo-run", 1),
+                InferenceStatus.SUBMITTED,
+                "CamL",
+                22,
+                1_000,
+                1,
+                12,
+                12,
+                False,
+                1_000,
+                1_000,
+            )
+            left = np.full((12, 12, 3), 17, dtype=np.uint8)
+            right = np.full((12, 12, 3), 91, dtype=np.uint8)
+            pair = StereoPairMetadata(
+                22,
+                22,
+                1_000,
+                1_000,
+                (400.0, 300.0),
+                (1_050.0, 301.0),
+                (1_047.0, 304.0),
+                4.25,
+                2_300,
+            )
+            payload = CropPayload(job, left, None, right, None, pair)
+            observed = []
+
+            thread = threading.Thread(
+                target=lambda: observed.append(
+                    receiver.receive_batch(timeout_ms=2_000)
+                )
+            )
+            thread.start()
+            client = ZeroMQCropClient(endpoint, timeout_ms=2_000)
+            client.submit_batch((payload,))
+            thread.join(2.0)
+            client.close()
+            receiver.close()
+
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(observed[0][0].stereo_pair_complete)
+            self.assertEqual(observed[0][0].stereo_pair, pair)
+            np.testing.assert_array_equal(observed[0][0].image_bgr, left)
+            np.testing.assert_array_equal(observed[0][0].camr_image_bgr, right)
+
+    def test_stereo_materializers_can_run_concurrently(self):
+        job = InferenceJob(
+            "parallel-job",
+            BeanRef("parallel-run", 1),
+            InferenceStatus.SUBMITTED,
+            "CamL",
+            2,
+            100,
+            1,
+            12,
+            12,
+            False,
+            100,
+            100,
+        )
+        pair = StereoPairMetadata(
+            2,
+            2,
+            100,
+            100,
+            (50.0, 50.0),
+            (90.0, 50.0),
+            (91.0, 51.0),
+            1.4,
+            1_000,
+        )
+        rendezvous = threading.Barrier(2)
+
+        def image(value):
+            rendezvous.wait(timeout=1.0)
+            time.sleep(0.01)
+            return np.full((12, 12, 3), value, dtype=np.uint8)
+
+        payload = CropPayload(
+            job,
+            None,
+            lambda: image(17),
+            None,
+            lambda: image(91),
+            pair,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            ready = payload.materialized(executor)
+
+        self.assertTrue(ready.stereo_pair_complete)
+        self.assertTrue(np.all(ready.image_bgr == 17))
+        self.assertTrue(np.all(ready.camr_image_bgr == 91))
 
 
 if __name__ == "__main__":

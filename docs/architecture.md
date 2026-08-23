@@ -44,6 +44,20 @@ Run creation/update fields remain in Unix wall-clock nanoseconds. Persisting a
 source-domain observation never rewrites those session fields; source and wall
 clocks meet only through the explicit run clock anchor.
 
+CamL remains the only detection and tracking view. For inference, its distorted
+sensor centroid is point-undistorted, mapped through PinkPlane's undistorted
+CamL-to-CamR homography, and distorted into CamR sensor coordinates. A bounded
+local CamR foreground search refines that projection to the observed bean. Both
+complete Bayer ROIs are then demosaiced and transported together with their
+frame indices, camera timestamps and both projected/refined centroids. No
+full-frame CamR demosaic, undistortion or motion-detection pass is performed.
+The localizer uses one native Bayer green sample and contour bounding boxes on
+its normal path. An averaged dual-green retry is retained if that faster mask
+finds no valid component. Precomposed 16-bit-to-detection lookup tables remove
+per-frame RAW shifting without changing CamL detection values.
+CamL and CamR Bayer crop materialization then run concurrently on the dispatch
+stage before their atomic two-view transport.
+
 ## Assignment and lifecycle
 
 Before assignment, every active Kalman state is propagated to the incoming
@@ -184,8 +198,9 @@ queries bypass it, and no persisted bean data is discarded by cache eviction.
 
 Recorded simulation uses a bounded sequential producer ahead of the analysis
 thread, and the replay clock is anchored only after that initial buffer is
-ready. In optimized mode it memory-maps CamL RG10 and stores one compact green
-plane per slot instead of expanding every frame to BGR. In fallback mode it
+ready. In optimized stereo mode it memory-maps synchronized CamL/CamR RG10,
+stores one compact CamL green plane per slot, and touches CamR only in bounded
+candidate ROIs instead of expanding either frame to BGR. In fallback mode it
 overlaps FFV1 decoding with analysis. The producer continues filling released
 slots while analysis consumes frames; both capacity (0-120, where zero disables
 it) and replay length (1-1,000 frames) are bounded and recorded in the session.

@@ -7,6 +7,7 @@ import math
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,6 +16,7 @@ import numpy as np
 
 from .models import BeanRef, FrameAnalysis, TrackStatus
 from .registry_models import InferenceJob, InferenceStatus
+from .stereo import StereoCropPreparation, StereoPairMetadata
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,16 +43,78 @@ class CropPayload:
     materializer: Callable[[], np.ndarray] | None = field(
         default=None, compare=False, repr=False
     )
+    camr_image_bgr: np.ndarray | None = field(default=None, compare=False, repr=False)
+    camr_materializer: Callable[[], np.ndarray] | None = field(
+        default=None, compare=False, repr=False
+    )
+    stereo_pair: StereoPairMetadata | None = None
 
-    def materialized(self) -> CropPayload:
-        if self.image_bgr is not None:
+    @property
+    def stereo_pair_complete(self) -> bool:
+        return self.camr_image_bgr is not None and self.stereo_pair is not None
+
+    def materialized(self, right_executor: Executor | None = None) -> CropPayload:
+        if self.image_bgr is not None and (
+            self.stereo_pair is None or self.camr_image_bgr is not None
+        ):
             return self
-        if self.materializer is None:
+        if self.image_bgr is None and self.materializer is None:
             raise ValueError("crop payload has neither an image nor a materializer")
-        image = self.materializer()
-        if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
-            raise ValueError("materialized inference crop must be an 8-bit BGR image")
-        return CropPayload(self.job, image)
+        right_future = (
+            right_executor.submit(self.camr_materializer)
+            if right_executor is not None
+            and self.stereo_pair is not None
+            and self.camr_image_bgr is None
+            and self.camr_materializer is not None
+            else None
+        )
+        try:
+            image = (
+                self.image_bgr
+                if self.image_bgr is not None
+                else self.materializer()
+            )
+        except Exception:
+            if right_future is not None:
+                right_future.cancel()
+            raise
+        _validate_materialized_image(image, "CamL")
+        right = self.camr_image_bgr
+        if self.stereo_pair is not None:
+            if right is None and self.camr_materializer is None:
+                raise ValueError("stereo crop has no CamR image or materializer")
+            right = (
+                right
+                if right is not None
+                else (
+                    right_future.result()
+                    if right_future is not None
+                    else self.camr_materializer()
+                )
+            )
+            _validate_materialized_image(right, "CamR")
+            if right.shape != image.shape:
+                raise ValueError("CamL and CamR inference crop shapes differ")
+        elif right is not None or self.camr_materializer is not None:
+            raise ValueError("CamR crop requires stereo pair metadata")
+        return CropPayload(
+            self.job,
+            image,
+            None,
+            right,
+            None,
+            self.stereo_pair,
+        )
+
+    def with_job(self, job: InferenceJob) -> CropPayload:
+        return CropPayload(
+            job,
+            self.image_bgr,
+            self.materializer,
+            self.camr_image_bgr,
+            self.camr_materializer,
+            self.stereo_pair,
+        )
 
 
 class BeanCropSelector:
@@ -65,16 +129,33 @@ class BeanCropSelector:
             ..., tuple[Callable[[], np.ndarray], int, int, bool] | None
         ]
         | None = None,
+        stereo_extractor: Callable[..., StereoCropPreparation | None] | None = None,
     ) -> None:
         self.settings = settings or CropSettings()
         self.settings.validate()
         self._extractor = extractor or extract_square_crop
         self._deferred_extractor = deferred_extractor
+        self._stereo_extractor = stereo_extractor
         self._active_counts: dict[BeanRef, int] = {}
         self._next_indices: dict[BeanRef, int] = {}
         self._retry_indices: dict[BeanRef, list[int]] = {}
         self._pending: dict[str, tuple[BeanRef, int]] = {}
         self._lock = threading.Lock()
+        self._stereo_attempts = 0
+        self._stereo_selected = 0
+        self._stereo_unavailable = 0
+        self._refinement_distances_px: list[float] = []
+
+    def statistics(self) -> dict[str, object]:
+        with self._lock:
+            distances = tuple(self._refinement_distances_px)
+            return {
+                "stereo_enabled": self._stereo_extractor is not None,
+                "stereo_attempts": self._stereo_attempts,
+                "stereo_selected": self._stereo_selected,
+                "stereo_unavailable": self._stereo_unavailable,
+                "refinement_distance_px": _sample_summary(distances),
+            }
 
     def delivery_succeeded(self, payloads: tuple[CropPayload, ...]) -> None:
         """Commit crop reservations after inference acknowledges the batch."""
@@ -128,12 +209,29 @@ class BeanCropSelector:
             source_size = self.settings.size_px
             resized = False
             materializer = None
+            camr_materializer = None
+            stereo_pair = None
             prepared = self._prepare(
                 frame_bgr,
                 observation.detection.centroid_px,
                 source_size,
             )
-            if prepared is None and self.settings.adaptive_edge_resize:
+            if (
+                prepared is not None
+                and self._stereo_extractor is not None
+                and prepared.source_size_px != source_size
+            ):
+                source_size = prepared.source_size_px
+                resized = True
+            if (
+                prepared is None
+                and self.settings.adaptive_edge_resize
+                and self._stereo_extractor is None
+            ):
+                # The stereo extractor already tries the largest complete size
+                # shared by both sensors. Repeating it with CamL-only edge
+                # geometry cannot recover a clipped CamR bean and needlessly
+                # repeats homography projection and local segmentation.
                 source_size = _largest_complete_centred_crop(
                     observation.detection.centroid_px,
                     observation.detection.bbox_px,
@@ -146,10 +244,33 @@ class BeanCropSelector:
                         observation.detection.centroid_px,
                         source_size,
                     )
+                    if prepared is not None and self._stereo_extractor is not None:
+                        source_size = prepared.source_size_px
                     resized = prepared is not None and source_size != self.settings.size_px
             if prepared is None:
                 continue
-            if self._deferred_extractor is not None:
+            if self._stereo_extractor is not None:
+                materializer = prepared.caml_materializer
+                camr_materializer = prepared.camr_materializer
+                padded = prepared.padded
+                stereo_pair = prepared.pair
+                if resized:
+                    materializer = _resized_materializer(
+                        materializer,
+                        self.settings.size_px,
+                    )
+                    camr_materializer = _resized_materializer(
+                        camr_materializer,
+                        self.settings.size_px,
+                    )
+                crop_width = crop_height = self.settings.size_px
+                crop = None
+                with self._lock:
+                    self._stereo_selected += 1
+                    self._refinement_distances_px.append(
+                        stereo_pair.refinement_distance_px
+                    )
+            elif self._deferred_extractor is not None:
                 materializer, _crop_width, _crop_height, padded = prepared
                 if resized:
                     materializer = _resized_materializer(
@@ -218,7 +339,16 @@ class BeanCropSelector:
                     self._active_counts.get(track.bean_ref, 0) + 1
                 )
                 self._pending[job_id] = (track.bean_ref, sample_index)
-            selected.append(CropPayload(job, crop, materializer))
+            selected.append(
+                CropPayload(
+                    job,
+                    crop,
+                    materializer,
+                    None,
+                    camr_materializer,
+                    stereo_pair,
+                )
+            )
         return tuple(selected)
 
     def _prepare(
@@ -227,6 +357,20 @@ class BeanCropSelector:
         centroid_px: tuple[float, float],
         source_size: int,
     ):
+        if self._stereo_extractor is not None:
+            with self._lock:
+                self._stereo_attempts += 1
+            result = self._stereo_extractor(
+                frame_bgr,
+                centroid_px,
+                source_size,
+                allow_padding=self.settings.allow_padding,
+                allow_resize=self.settings.adaptive_edge_resize,
+            )
+            if result is None:
+                with self._lock:
+                    self._stereo_unavailable += 1
+            return result
         if self._deferred_extractor is not None:
             return self._deferred_extractor(
                 frame_bgr,
@@ -301,6 +445,23 @@ def _resized_materializer(
         )
 
     return resized
+
+
+def _validate_materialized_image(image: np.ndarray, camera: str) -> None:
+    if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
+        raise ValueError(
+            f"materialized {camera} inference crop must be an 8-bit BGR image"
+        )
+
+
+def _sample_summary(values: tuple[float, ...]) -> dict[str, float | int]:
+    if not values:
+        return {"count": 0, "mean": 0.0, "max": 0.0}
+    return {
+        "count": len(values),
+        "mean": sum(values) / len(values),
+        "max": max(values),
+    }
 
 
 def extract_square_crop(

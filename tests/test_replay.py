@@ -1,3 +1,4 @@
+import gc
 import threading
 import time
 import unittest
@@ -56,6 +57,16 @@ class SlowEngine(FakeEngine):
         return FrameAnalysis(index, timestamp, (), (), (), (), 20.0)
 
 
+class GcRecordingEngine(FakeEngine):
+    def __init__(self):
+        super().__init__()
+        self.gc_states = []
+
+    def process(self, _frame, index, timestamp):
+        self.gc_states.append(gc.isenabled())
+        return super().process(_frame, index, timestamp)
+
+
 class FakeRegistry:
     def __init__(self, source):
         self.source = source
@@ -66,6 +77,21 @@ class FakeRegistry:
         self.transitions.append((session.state, len(self.source.calls)))
         stored = replace(session, revision=expected_revision + 1)
         self.sessions.append(stored)
+        return stored
+
+
+class DelayedRunningRegistry(FakeRegistry):
+    def __init__(self, source, delay_seconds):
+        super().__init__(source)
+        self.delay_seconds = delay_seconds
+        self.running_returns_ns = []
+
+    def put_session(self, session, *, expected_revision):
+        if session.state == RunState.RUNNING and not self.running_returns_ns:
+            time.sleep(self.delay_seconds)
+        stored = super().put_session(session, expected_revision=expected_revision)
+        if session.state == RunState.RUNNING:
+            self.running_returns_ns.append(time.monotonic_ns())
         return stored
 
 
@@ -154,6 +180,8 @@ class ReplayBufferTests(unittest.TestCase):
             ReplaySettings(prebuffer_frames=121),
             ReplaySettings(maximum_frames=0),
             ReplaySettings(maximum_frames=1001),
+            ReplaySettings(clock_start_lead_ms=0),
+            ReplaySettings(maximum_clock_offset_ms=0),
         ):
             with self.assertRaises(ValueError):
                 settings.validate()
@@ -217,6 +245,59 @@ class ReplayBufferTests(unittest.TestCase):
         self.assertGreaterEqual(
             running.clock_monotonic_ns,
             dispatcher.ready_monotonic_ns,
+        )
+
+    def test_runner_suppresses_and_restores_cyclic_gc(self):
+        source = FakeSequentialSource(frame_count=2)
+        engine = GcRecordingEngine()
+        registry = FakeRegistry(source)
+        gc_was_enabled = gc.isenabled()
+        if not gc_was_enabled:
+            gc.enable()
+        try:
+            ReplayRunner(
+                source,
+                engine,
+                registry,
+                settings=ReplaySettings(
+                    target_fps=0,
+                    prebuffer_frames=0,
+                    maximum_frames=2,
+                ),
+            ).run()
+            self.assertEqual(engine.gc_states, [False, False])
+            self.assertTrue(gc.isenabled())
+        finally:
+            if not gc_was_enabled:
+                gc.disable()
+
+    def test_registry_startup_stall_cannot_consume_the_run_clock_budget(self):
+        source = FakeSequentialSource(frame_count=1)
+        registry = DelayedRunningRegistry(source, delay_seconds=0.025)
+
+        summary = ReplayRunner(
+            source,
+            FakeEngine(),
+            registry,
+            settings=ReplaySettings(
+                target_fps=60,
+                prebuffer_frames=0,
+                maximum_frames=1,
+                clock_start_lead_ms=50,
+                maximum_clock_offset_ms=2,
+            ),
+        ).run()
+
+        running = next(
+            session for session in registry.sessions if session.state == RunState.RUNNING
+        )
+        self.assertTrue(summary.clock_synchronized)
+        self.assertEqual(summary.clock_anchor_attempts, 1)
+        self.assertEqual(summary.clock_anchor_misses, 0)
+        self.assertLess(abs(summary.clock_start_offset_ms), 2.0)
+        self.assertGreater(
+            running.clock_monotonic_ns - registry.running_returns_ns[0],
+            5_000_000,
         )
 
     def test_runner_drops_stale_frames_and_reports_source_timeline(self):

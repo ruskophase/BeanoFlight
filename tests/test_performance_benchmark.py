@@ -1,7 +1,14 @@
 import argparse
 import unittest
+from types import SimpleNamespace
 
-from beanoflight.performance_benchmark import _scenario_summaries, _scenarios
+from beanoflight.models import BeanRef, Detection, Observation
+from beanoflight.performance_benchmark import (
+    _identity_continuity,
+    _scenario_summaries,
+    _scenarios,
+    _soak_acceptance,
+)
 from beanoflight.performance_benchmark import parser as benchmark_parser
 from beanoflight.system_test import parser as system_test_parser
 
@@ -74,6 +81,36 @@ class PerformanceBenchmarkTests(unittest.TestCase):
         self.assertTrue(benchmark.no_adaptive_edge_resize)
         self.assertTrue(system_test.no_adaptive_edge_resize)
 
+    def test_soak_mode_and_clock_barrier_are_configurable(self):
+        benchmark = benchmark_parser().parse_args(
+            [
+                "recording",
+                "--background-frames",
+                "1,2,3",
+                "--soak-runs",
+                "12",
+                "--clock-start-lead-ms",
+                "75",
+                "--maximum-clock-offset-ms",
+                "1.5",
+            ]
+        )
+        system_test = system_test_parser().parse_args(
+            [
+                "recording",
+                "--background-frames",
+                "1,2,3",
+                "--clock-start-lead-ms",
+                "75",
+                "--maximum-clock-offset-ms",
+                "1.5",
+            ]
+        )
+        self.assertEqual(benchmark.soak_runs, 12)
+        self.assertEqual(benchmark.clock_start_lead_ms, 75)
+        self.assertEqual(system_test.clock_start_lead_ms, 75)
+        self.assertEqual(system_test.maximum_clock_offset_ms, 1.5)
+
     def test_scenario_summary_reports_repeat_stability(self):
         runs = [
             {
@@ -133,6 +170,119 @@ class PerformanceBenchmarkTests(unittest.TestCase):
         self.assertTrue(simulated["passed"])
         self.assertFalse(hardware["all_outcomes_complete"])
         self.assertFalse(hardware["passed"])
+
+    def test_soak_acceptance_enforces_evidence_clock_and_identity(self):
+        run = {
+            "scenario": "full",
+            "summary": {
+                "achieved_fps": 60.0,
+                "frames_skipped": 0,
+                "missed_deadlines": 0,
+                "crops_dropped": 0,
+                "clock_synchronized": True,
+                "clock_start_offset_ms": 0.1,
+                "clock_anchor_misses": 0,
+                "timings": {"crop_selection": {"stereo_enabled": True}},
+            },
+            "outcome": {
+                "beans": 2,
+                "jobs_completed": 6,
+                "jobs_dropped": 0,
+                "jobs_failed": 0,
+                "classification_evidence": 6,
+                "stereo_pairs_complete": 6,
+                "stereo_pairs_incomplete": 0,
+                "stereo_pairing": {"maximum_synchronization_delta_ns": 0},
+                "settled": True,
+                "clock_consistency": {"all_consistent": True},
+                "identity_continuity": {"suspected_fragments": 0},
+                "timing_ledger": {
+                    "results": {"too_late": 0},
+                    "per_bean": [
+                        {
+                            "classification": {
+                                "sample_count": 3,
+                                "expected_samples": 3,
+                            }
+                        },
+                        {
+                            "classification": {
+                                "sample_count": 3,
+                                "expected_samples": 3,
+                            }
+                        },
+                    ],
+                },
+            },
+        }
+
+        passed = _soak_acceptance(
+            [run, run],
+            target_fps=60.0,
+            minimum_three_sample_rate=0.95,
+            minimum_samples_per_bean=2,
+            expected_beans=2,
+        )
+        failed = _soak_acceptance(
+            [
+                {
+                    **run,
+                    "outcome": {
+                        **run["outcome"],
+                        "identity_continuity": {"suspected_fragments": 1},
+                    },
+                }
+            ],
+            target_fps=60.0,
+            minimum_three_sample_rate=0.95,
+            minimum_samples_per_bean=2,
+            expected_beans=2,
+        )
+
+        self.assertTrue(passed["passed"])
+        self.assertFalse(failed["passed"])
+        self.assertFalse(failed["checks"]["zero_suspected_duplicate_ids"])
+
+    def test_identity_continuity_detects_adjacent_track_fragment(self):
+        def observation(frame, timestamp_ns, x_mm, y_mm):
+            return Observation(
+                frame,
+                timestamp_ns,
+                Detection((100.0, 100.0), (80, 80, 40, 40), 2_000, 0.9, (0, 0, 0)),
+                (x_mm, y_mm),
+            )
+
+        earlier_history = (
+            observation(420, 0, 16.48, -35.50),
+            observation(421, 16_666_000, 16.65, -29.54),
+        )
+        later_history = (
+            observation(422, 33_332_000, 16.84, -16.32),
+            observation(423, 49_998_000, 16.86, -0.07),
+        )
+        records = (
+            SimpleNamespace(
+                bean_ref=BeanRef("fragment-run", 105),
+                track=SimpleNamespace(
+                    history=earlier_history,
+                    state=(16.65, -29.54, 0.0, 400.0),
+                ),
+                prediction=None,
+            ),
+            SimpleNamespace(
+                bean_ref=BeanRef("fragment-run", 106),
+                track=SimpleNamespace(
+                    history=later_history,
+                    state=(16.86, -0.07, 0.0, 900.0),
+                ),
+                prediction=None,
+            ),
+        )
+
+        result = _identity_continuity(records)
+
+        self.assertEqual(result["suspected_fragments"], 1)
+        self.assertEqual(result["suspects"][0]["frame_gap"], 1)
 
 
 if __name__ == "__main__":

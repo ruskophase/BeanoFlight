@@ -249,6 +249,8 @@ class SorterService:
         self.context_cache_misses = 0
         self.external_plans_accepted = 0
         self.external_plans_rejected = 0
+        self.clock_anchor_mismatches = 0
+        self.stale_clock_contexts = 0
         self.ready = threading.Event()
         self.startup_error = ""
 
@@ -706,9 +708,9 @@ class SorterService:
     ) -> None:
         self.context_batches_received += 1
         self.contexts_received += len(batch.items)
-        self._sessions[batch.run_id] = RunSession(
+        incoming_session = RunSession(
             run_id=batch.run_id,
-            revision=0,
+            revision=batch.clock_epoch,
             state=RunState.RUNNING,
             source_path="/direct-sorting-context",
             source_kind="direct",
@@ -723,6 +725,32 @@ class SorterService:
             updated_timestamp_ns=0,
             settings={},
         )
+        previous_session = self._sessions.get(batch.run_id)
+        if previous_session is not None:
+            if incoming_session.revision < previous_session.revision:
+                self.stale_clock_contexts += 1
+                return
+            same_epoch = incoming_session.revision == previous_session.revision
+            same_anchor = (
+                incoming_session.clock_source_timestamp_ns
+                == previous_session.clock_source_timestamp_ns
+                and incoming_session.clock_monotonic_ns
+                == previous_session.clock_monotonic_ns
+                and incoming_session.source_fps == previous_session.source_fps
+                and incoming_session.target_fps == previous_session.target_fps
+            )
+            if same_epoch and not same_anchor:
+                self.clock_anchor_mismatches += 1
+                self.errors += 1
+                self._emit(
+                    "error",
+                    detail=(
+                        f"run clock mismatch for {batch.run_id} epoch "
+                        f"{batch.clock_epoch}"
+                    ),
+                )
+                return
+        self._sessions[batch.run_id] = incoming_session
         for item in batch.items:
             track = item.track
             bean_ref = track.bean_ref
@@ -1149,6 +1177,7 @@ class SorterService:
             reason = "classification arrived too late for safe actuation"
             open_timestamp = decision_timestamp
             close_timestamp = decision_timestamp
+        clock_session = session or self._sessions.get(record.bean_ref.run_id)
         decision = SortingDecision(
             decision_id=f"sort:{record.bean_ref.run_id}:{record.bean_ref.sequence}",
             source="beano-sorter",
@@ -1161,6 +1190,7 @@ class SorterService:
             crossing_timestamp_ns=prediction.crossing_timestamp_ns,
             based_on_revision=record.revision,
             timing_marks_ns={
+                **_run_clock_timing_marks(clock_session),
                 "sorter_event_received_monotonic_ns": arrival_monotonic_ns,
                 "sorter_decision_started_monotonic_ns": decision_started_ns,
                 "sorter_plan_ready_monotonic_ns": time.monotonic_ns(),
@@ -1367,6 +1397,9 @@ class SorterService:
             crossing_timestamp_ns=None,
             based_on_revision=record.revision,
             timing_marks_ns={
+                **_run_clock_timing_marks(
+                    self._sessions.get(record.bean_ref.run_id)
+                ),
                 "sorter_event_received_monotonic_ns": (
                     arrival_monotonic_ns or time.monotonic_ns()
                 ),
@@ -1867,6 +1900,19 @@ def _classification_pool_details(
         int(ensemble.get("expected_samples", 1)),
         bool(ensemble.get("deadline_fallback", False)),
     )
+
+
+def _run_clock_timing_marks(session: RunSession | None) -> dict[str, int]:
+    if session is None:
+        return {}
+    return {
+        "run_clock_source_ns": session.clock_source_timestamp_ns,
+        "run_clock_monotonic_ns": session.clock_monotonic_ns,
+        "run_clock_epoch": session.revision,
+        "run_clock_scale_ppb": round(
+            session.playback_scale * 1_000_000_000
+        ),
+    }
 
 
 def _is_deadline_fallback(classification: Enrichment) -> bool:

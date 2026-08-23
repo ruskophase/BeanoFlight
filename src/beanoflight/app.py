@@ -326,6 +326,7 @@ class BeanoFlightApp(tk.Tk):
         )
         self.target_fps_var = tk.StringVar(value="60")
         self.fast_raw_var = tk.BooleanVar(value=True)
+        self.stereo_crops_var = tk.BooleanVar(value=True)
         self.crop_processing_var = tk.StringVar(value="ml-fast")
         self.preview_enabled_var = tk.BooleanVar(value=False)
         self.prebuffer_enabled_var = tk.BooleanVar(value=True)
@@ -782,7 +783,7 @@ class BeanoFlightApp(tk.Tk):
                 ),
                 wraplength=370,
                 style="Muted.TLabel",
-            ).grid(row=15, column=0, columnspan=2, sticky=tk.W, pady=(12, 0))
+            ).grid(row=18, column=0, columnspan=2, sticky=tk.W, pady=(12, 0))
         ttk.Label(parent, text="Target processing FPS").grid(
             row=1, column=0, sticky=tk.W, pady=3
         )
@@ -797,6 +798,11 @@ class BeanoFlightApp(tk.Tk):
             text="Use memory-mapped RAW fast path",
             variable=self.fast_raw_var,
         ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=5)
+        ttk.Checkbutton(
+            parent,
+            text="Use genuine synchronized CamL/CamR crops",
+            variable=self.stereo_crops_var,
+        ).grid(row=16, column=0, columnspan=2, sticky=tk.W, pady=5)
         ttk.Label(parent, text="RAW crop processing").grid(
             row=3, column=0, sticky=tk.W, pady=3
         )
@@ -903,7 +909,7 @@ class BeanoFlightApp(tk.Tk):
             ),
             wraplength=390,
             style="Muted.TLabel",
-        ).grid(row=16, column=0, columnspan=2, sticky=tk.W)
+        ).grid(row=17, column=0, columnspan=2, sticky=tk.W)
         parent.columnconfigure(1, weight=1)
 
     def open_video(self) -> None:
@@ -1311,12 +1317,21 @@ class BeanoFlightApp(tk.Tk):
             messagebox.showerror("Simulation settings", str(exc), parent=self)
             return
         use_fast_raw = self.fast_raw_var.get()
+        use_stereo_crops = self.stereo_crops_var.get()
         raw_bundle = find_raw_bundle(self.source.path) if use_fast_raw else None
         if use_fast_raw and raw_bundle is None:
             messagebox.showerror(
                 "Simulation input",
                 "The memory-mapped fast path needs a complete recording bundle "
                 "with CamL RAW frames. Turn it off to replay the calibrated video.",
+                parent=self,
+            )
+            return
+        if use_stereo_crops and raw_bundle is None:
+            messagebox.showerror(
+                "Simulation input",
+                "Genuine synchronized stereo crops currently require the "
+                "memory-mapped RAW fast path and a complete CamL/CamR bundle.",
                 parent=self,
             )
             return
@@ -1353,6 +1368,14 @@ class BeanoFlightApp(tk.Tk):
                         )
 
                     deferred_crop_extractor = source.prepare_crop
+                    stereo_crop_extractor = None
+                    if use_stereo_crops:
+                        source.configure_stereo(
+                            calibration.source_path,
+                            background_indices,
+                        )
+                        stereo_crop_extractor = source.prepare_stereo_crop
+                        deferred_crop_extractor = None
                 else:
                     source = open_replay_source(
                         source_path, prefer_raw=prefer_raw, cache_frames=1
@@ -1361,6 +1384,7 @@ class BeanoFlightApp(tk.Tk):
                     detector = BeanDetector(settings)
                     positions_mapper = None
                     deferred_crop_extractor = None
+                    stereo_crop_extractor = None
                 registry = ZeroMQRegistryClient(registry_endpoint, timeout_ms=2_000)
                 registry.ping()
                 layout = GateLayout(calibration.sorting_line_y(self.sorting_offset_mm))
@@ -1376,6 +1400,7 @@ class BeanoFlightApp(tk.Tk):
                 selector = BeanCropSelector(
                     crop_settings,
                     deferred_extractor=deferred_crop_extractor,
+                    stereo_extractor=stereo_crop_extractor,
                 )
                 dispatcher = CropDispatcher(
                     registry_endpoint,
@@ -1403,6 +1428,7 @@ class BeanoFlightApp(tk.Tk):
                             if isinstance(source, MMapRawVideoSource)
                             else "calibrated-video"
                         ),
+                        "stereo_crops": stereo_crop_extractor is not None,
                         "background": {
                             "method": self.background_provenance.method,
                             "frame_indices": list(
@@ -1473,6 +1499,7 @@ class BeanoFlightApp(tk.Tk):
         )
         self.status_var.set(
             f"Simulation starting at {rate}; {source_status}; {buffer_status}; "
+            f"stereo crops {'enabled' if use_stereo_crops else 'disabled'}; "
             "live playback "
             f"{'enabled' if replay_settings.preview_enabled else 'disabled'}…"
         )

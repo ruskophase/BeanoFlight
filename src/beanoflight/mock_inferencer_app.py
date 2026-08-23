@@ -12,6 +12,7 @@ from dataclasses import replace
 from tkinter import messagebox, ttk
 
 import cv2
+import numpy as np
 from PIL import Image, ImageTk
 
 from .classification_transport import DEFAULT_DIRECT_EVIDENCE_ENDPOINT
@@ -28,8 +29,25 @@ from .tensorrt_inference import DEFAULT_TENSORRT_ENGINE
 RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
 
 
-def crop_preview_image(image_bgr) -> Image.Image:
-    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+def crop_preview_image(image_bgr, camr_image_bgr=None) -> Image.Image:
+    left = image_bgr.copy()
+    cv2.putText(
+        left, "CamL", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1
+    )
+    if camr_image_bgr is not None:
+        right = camr_image_bgr.copy()
+        cv2.putText(
+            right,
+            "CamR",
+            (8, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 255),
+            1,
+        )
+        divider = 255 * np.ones((left.shape[0], 3, 3), dtype=np.uint8)
+        left = np.concatenate((left, divider, right), axis=1)
+    rgb = cv2.cvtColor(left, cv2.COLOR_BGR2RGB)
     image = Image.fromarray(rgb)
     image.thumbnail((440, 440), RESAMPLE)
     return image
@@ -163,7 +181,7 @@ class MockInferencerApp(tk.Tk):
             controls,
             text=(
                 "Shared-weight CamL/CamR towers fuse after ResNet layer1. "
-                "Until CamR transport lands, CamL feeds both inputs."
+                "Paired payloads feed distinct synchronized camera views."
             ),
         ).grid(row=4, column=4, columnspan=2, sticky=tk.W, pady=(10, 0))
         ttk.Button(controls, text="Start / apply", command=self.start_service).grid(
@@ -194,7 +212,7 @@ class MockInferencerApp(tk.Tk):
         body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         image_frame = ttk.LabelFrame(
-            body, text="Latest transported crop (CamL)", padding=8
+            body, text="Latest transported crop pair (CamL / CamR)", padding=8
         )
         event_frame = ttk.LabelFrame(body, text="Activity", padding=8)
         body.add(image_frame, weight=2)
@@ -268,7 +286,7 @@ class MockInferencerApp(tk.Tk):
 
     def _post_activity(self, activity: MockInferenceActivity) -> None:
         if activity.crop is not None and not self._crop_display_enabled.is_set():
-            activity = replace(activity, crop=None)
+            activity = replace(activity, crop=None, crop_right=None)
         if activity.crop is None and not self._activity_display_enabled.is_set():
             return
         try:
@@ -299,7 +317,7 @@ class MockInferencerApp(tk.Tk):
                 message += f" · {item.detail}"
             if item.crop is not None and self._crop_display_enabled.is_set():
                 try:
-                    self._show_crop(item.crop)
+                    self._show_crop(item.crop, item.crop_right)
                 except Exception as exc:  # noqa: BLE001 - keep activity polling alive
                     message += f" · preview error: {exc}"
             if self._activity_display_enabled.is_set():
@@ -326,6 +344,8 @@ class MockInferencerApp(tk.Tk):
                 f"service {stats['mean_service_ms']:.1f} ms · "
                 f"SLA misses {stats['deadline_misses']} · "
                 f"tails {stats['tail_batches']}"
+                f" · paired {stats['stereo_pairs_received']}"
+                f" · single {stats['single_view_samples_received']}"
             )
             if service.startup_error:
                 self.status_var.set(f"Error · {service.startup_error}")
@@ -343,8 +363,8 @@ class MockInferencerApp(tk.Tk):
         )
         self.after(delay_ms, self._poll)
 
-    def _show_crop(self, image_bgr) -> None:
-        image = crop_preview_image(image_bgr)
+    def _show_crop(self, image_bgr, camr_image_bgr=None) -> None:
+        image = crop_preview_image(image_bgr, camr_image_bgr)
         self._photo = ImageTk.PhotoImage(image)
         self.image_label.configure(image=self._photo, text="")
 

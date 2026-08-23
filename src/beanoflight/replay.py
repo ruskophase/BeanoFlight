@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import gc
 import math
 import queue
 import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
+from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -34,6 +36,9 @@ class ReplaySettings:
     crop_queue_capacity: int = 16
     drop_stale_frames: bool = True
     maximum_frame_age_ms: float = 30.0
+    clock_start_lead_ms: float = 50.0
+    maximum_clock_offset_ms: float = 2.0
+    suppress_cyclic_gc: bool = True
 
     def validate(self) -> None:
         if not math.isfinite(self.target_fps) or self.target_fps < 0:
@@ -49,6 +54,16 @@ class ReplaySettings:
             or self.maximum_frame_age_ms <= 0
         ):
             raise ValueError("maximum frame age must be finite and positive")
+        if (
+            not math.isfinite(self.clock_start_lead_ms)
+            or self.clock_start_lead_ms <= 0
+        ):
+            raise ValueError("clock start lead must be finite and positive")
+        if (
+            not math.isfinite(self.maximum_clock_offset_ms)
+            or self.maximum_clock_offset_ms <= 0
+        ):
+            raise ValueError("maximum clock offset must be finite and positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +104,18 @@ class ReplaySummary:
     source_timeline_fps: float = 0.0
     mean_frame_age_ms: float = 0.0
     max_frame_age_ms: float = 0.0
+    clock_start_offset_ms: float = 0.0
+    clock_anchor_attempts: int = 0
+    clock_anchor_misses: int = 0
+    clock_synchronized: bool = False
     timings: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class _RunClockStart:
+    session: RunSession
+    start_perf_counter_ns: int
+    metrics: dict[str, object]
 
 
 class DecodedFrameBuffer:
@@ -310,16 +336,14 @@ class CropDispatcher:
 
         queued_monotonic_ns = time.monotonic_ns()
         payloads = tuple(
-            CropPayload(
+            payload.with_job(
                 replace(
                     payload.job,
                     timing_marks_ns={
                         **payload.job.timing_marks_ns,
                         "crop_queued_monotonic_ns": queued_monotonic_ns,
                     },
-                ),
-                payload.image_bgr,
-                payload.materializer,
+                )
             )
             for payload in payloads
         )
@@ -381,6 +405,10 @@ class CropDispatcher:
 
     def _run(self) -> None:
         sender = ZeroMQCropClient(self.inference_endpoint, timeout_ms=self.timeout_ms)
+        right_materializer = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="beano-camr-materialize",
+        )
         try:
             while True:
                 with self._condition:
@@ -423,18 +451,18 @@ class CropDispatcher:
                     materialized_items, materialize_ms = _materialize_payloads(
                         payloads,
                         time.monotonic_ns(),
+                        right_executor=right_materializer,
                     )
                     inference_send_ns = time.monotonic_ns()
                     materialized_items = tuple(
-                        CropPayload(
+                        payload.with_job(
                             replace(
                                 payload.job,
                                 timing_marks_ns={
                                     **payload.job.timing_marks_ns,
                                     "inference_send_monotonic_ns": inference_send_ns,
                                 },
-                            ),
-                            payload.image_bgr,
+                            )
                         )
                         for payload in materialized_items
                     )
@@ -481,6 +509,7 @@ class CropDispatcher:
                         self._active -= len(items)
                         self._condition.notify_all()
         finally:
+            right_materializer.shutdown(wait=True, cancel_futures=True)
             sender.close()
 
     def _queue_registry(
@@ -574,14 +603,17 @@ class CropDispatcher:
 
 
 def _materialize_payloads(
-    payloads: tuple[CropPayload, ...], dispatch_dequeued_ns: int
+    payloads: tuple[CropPayload, ...],
+    dispatch_dequeued_ns: int,
+    *,
+    right_executor: Executor | None = None,
 ) -> tuple[tuple[CropPayload, ...], float]:
     started = time.perf_counter_ns()
     materialized = []
     for payload in payloads:
-        ready = payload.materialized()
+        ready = payload.materialized(right_executor)
         materialized.append(
-            CropPayload(
+            ready.with_job(
                 replace(
                     ready.job,
                     timing_marks_ns={
@@ -589,8 +621,7 @@ def _materialize_payloads(
                         "dispatch_dequeued_monotonic_ns": dispatch_dequeued_ns,
                         "crop_materialized_monotonic_ns": time.monotonic_ns(),
                     },
-                ),
-                ready.image_bgr,
+                )
             )
         )
     elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000.0
@@ -683,7 +714,10 @@ class ReplayRunner:
             target_fps=self.settings.target_fps,
             source_start_timestamp_ns=start_source_ns,
             clock_source_timestamp_ns=start_source_ns,
-            clock_monotonic_ns=time.monotonic_ns(),
+            # CREATED sessions are deliberately unarmed. The authoritative
+            # mapping is persisted as a future barrier only after all replay
+            # workers and buffers are ready.
+            clock_monotonic_ns=0,
             preview_enabled=self.settings.preview_enabled,
             created_timestamp_ns=created_ns,
             updated_timestamp_ns=created_ns,
@@ -693,7 +727,12 @@ class ReplayRunner:
                     if self.crop_selector is None
                     else self.crop_selector.settings.size_px
                 ),
-                "camera_id": "CamL",
+                "camera_id": (
+                    "CamL/CamR"
+                    if self.crop_selector is not None
+                    and self.crop_selector.statistics()["stereo_enabled"]
+                    else "CamL"
+                ),
                 "maximum_frames": self.settings.maximum_frames,
                 "prebuffer_frames": self.settings.prebuffer_frames,
                 "drop_stale_frames": self.settings.drop_stale_frames,
@@ -717,6 +756,7 @@ class ReplayRunner:
                 ),
                 "source_pipeline": getattr(self.source, "pipeline_metadata", {}),
                 "execution_profile": self.profile_metadata,
+                "suppress_cyclic_gc": self.settings.suppress_cyclic_gc,
             },
         )
         session = self.registry.put_session(session, expected_revision=0)
@@ -743,7 +783,16 @@ class ReplayRunner:
         system_metrics: dict[str, object] = {}
         registry_metrics: dict[str, object] = {}
         crop_dispatch_metrics: dict[str, object] = {}
+        crop_selection_metrics: dict[str, object] = {}
         sorting_context_metrics: dict[str, object] = {"enabled": False}
+        source_metrics: dict[str, object] = {}
+        clock_metrics: dict[str, object] = {
+            "synchronized": False,
+            "anchor_attempts": 0,
+            "anchor_misses": 0,
+            "start_offset_ms": 0.0,
+        }
+        gc_was_enabled = False
         sorting_context_publisher = None
         try:
             if self.settings.prebuffer_frames > 0:
@@ -762,21 +811,25 @@ class ReplayRunner:
                     self.sorting_context_endpoint
                 )
             system_telemetry.start()
-            # A live camera timestamp is anchored when its frame becomes
-            # available, not while downstream workers are still starting.
-            # Starting transports and telemetry before this mapping prevents a
-            # fixed startup delay from consuming every bean's inference and
-            # actuator notice budget during recorded replay.
-            session = self.registry.put_session(
-                replace(
-                    session,
-                    state=RunState.RUNNING,
-                    clock_monotonic_ns=time.monotonic_ns(),
-                    updated_timestamp_ns=time.time_ns(),
-                ),
-                expected_revision=session.revision,
+            # A bounded replay creates many short-lived Python objects but no
+            # intentional reference cycles on the acquisition path. Collect
+            # before arming the shared clock and suppress cyclic-GC pauses while
+            # frames are time-critical; reference counting continues normally.
+            # Always restore the interpreter's prior state in the outer finally.
+            gc_was_enabled = gc.isenabled()
+            if self.settings.suppress_cyclic_gc and gc_was_enabled:
+                gc.collect()
+                gc.disable()
+            clock_start = self._arm_run_clock(
+                session,
+                start_source_ns=start_source_ns,
+                cancellation=cancellation,
             )
-            started = time.perf_counter()
+            session = clock_start.session
+            clock_metrics = clock_start.metrics
+            if not clock_metrics["synchronized"]:
+                raise RuntimeError(str(clock_metrics["failure"]))
+            started = clock_start.start_perf_counter_ns / 1_000_000_000.0
             next_deadline = started
             index = 0
             while index < frame_limit:
@@ -804,17 +857,18 @@ class ReplayRunner:
                         break
                 if was_paused:
                     current_source = self.source.timestamp_ns(index)
-                    session = self.registry.put_session(
-                        replace(
-                            session,
-                            state=RunState.RUNNING,
-                            clock_source_timestamp_ns=current_source,
-                            clock_monotonic_ns=time.monotonic_ns(),
-                            updated_timestamp_ns=time.time_ns(),
-                        ),
-                        expected_revision=session.revision,
+                    resume_clock = self._arm_run_clock(
+                        session,
+                        start_source_ns=current_source,
+                        cancellation=cancellation,
                     )
-                    next_deadline = time.perf_counter()
+                    session = resume_clock.session
+                    if not resume_clock.metrics["synchronized"]:
+                        raise RuntimeError(str(resume_clock.metrics["failure"]))
+                    clock_metrics = resume_clock.metrics
+                    next_deadline = (
+                        resume_clock.start_perf_counter_ns / 1_000_000_000.0
+                    )
                     was_paused = False
                 if (
                     self.settings.target_fps > 0
@@ -909,6 +963,7 @@ class ReplayRunner:
                                 session.clock_source_timestamp_ns
                             ),
                             clock_monotonic_ns=session.clock_monotonic_ns,
+                            clock_epoch=session.revision,
                             items=tuple(
                                 SortingContext(
                                     track,
@@ -951,6 +1006,7 @@ class ReplayRunner:
                                     session.clock_source_timestamp_ns
                                 ),
                                 "run_clock_monotonic_ns": session.clock_monotonic_ns,
+                                "run_clock_epoch": session.revision,
                                 "run_clock_scale_ppb": round(
                                     session.playback_scale * 1_000_000_000
                                 ),
@@ -959,13 +1015,11 @@ class ReplayRunner:
                                 timing_marks[
                                     "inference_priority_crossing_source_ns"
                                 ] = crossing_source_ns
-                            payload = CropPayload(
+                            payload = payload.with_job(
                                 replace(
                                     payload.job,
                                     timing_marks_ns=timing_marks,
-                                ),
-                                payload.image_bgr,
-                                payload.materializer,
+                                )
                             )
                             prioritized_crops.append(payload)
                         selected_crops = tuple(prioritized_crops)
@@ -1041,11 +1095,22 @@ class ReplayRunner:
                 playback_elapsed = max(time.perf_counter() - started, 1e-9)
             raise
         finally:
+            if (
+                self.settings.suppress_cyclic_gc
+                and gc_was_enabled
+                and not gc.isenabled()
+            ):
+                gc.enable()
             if frame_buffer is not None:
                 frame_buffer.close()
             if self.crop_dispatcher is not None:
                 self.crop_dispatcher.close(drain=True)
                 crop_dispatch_metrics = self.crop_dispatcher.performance_metrics()
+            if self.crop_selector is not None:
+                crop_selection_metrics = self.crop_selector.statistics()
+            source_statistics = getattr(self.source, "stereo_statistics", None)
+            if callable(source_statistics):
+                source_metrics = source_statistics()
             if sorting_context_publisher is not None:
                 sorting_context_metrics = {
                     "enabled": True,
@@ -1109,7 +1174,10 @@ class ReplayRunner:
                             },
                             "system": system_metrics,
                             "crop_dispatch": crop_dispatch_metrics,
+                            "crop_selection": crop_selection_metrics,
+                            "source": source_metrics,
                             "sorting_context": sorting_context_metrics,
+                            "clock": clock_metrics,
                         },
                     },
                 ),
@@ -1140,6 +1208,10 @@ class ReplayRunner:
             source_timeline_fps=source_timeline_fps,
             mean_frame_age_ms=mean_frame_age_ms,
             max_frame_age_ms=frame_age_max,
+            clock_start_offset_ms=float(clock_metrics["start_offset_ms"]),
+            clock_anchor_attempts=int(clock_metrics["anchor_attempts"]),
+            clock_anchor_misses=int(clock_metrics["anchor_misses"]),
+            clock_synchronized=bool(clock_metrics["synchronized"]),
             timings={
                 "timings_ms": timing_summary,
                 "registry": {
@@ -1148,7 +1220,141 @@ class ReplayRunner:
                 },
                 "system": system_metrics,
                 "crop_dispatch": crop_dispatch_metrics,
+                "crop_selection": crop_selection_metrics,
+                "source": source_metrics,
                 "sorting_context": sorting_context_metrics,
+                "clock": clock_metrics,
+            },
+        )
+
+    def _arm_run_clock(
+        self,
+        session: RunSession,
+        *,
+        start_source_ns: int,
+        cancellation: threading.Event,
+    ) -> _RunClockStart:
+        """Persist and meet a future clock barrier before releasing frame zero."""
+
+        lead_ns = round(self.settings.clock_start_lead_ms * 1_000_000)
+        minimum_margin_ns = min(5_000_000, max(500_000, lead_ns // 4))
+        maximum_offset_ns = round(
+            self.settings.maximum_clock_offset_ms * 1_000_000
+        )
+        attempts: list[dict[str, object]] = []
+        misses = 0
+        maximum_attempts = 4
+        current = session
+        for attempt in range(1, maximum_attempts + 1):
+            anchor_monotonic_ns = time.monotonic_ns() + lead_ns
+            expected_epoch = current.revision + 1
+            clock_contract = {
+                "version": "future-barrier-v1",
+                "epoch": expected_epoch,
+                "source_timestamp_ns": start_source_ns,
+                "monotonic_ns": anchor_monotonic_ns,
+                "playback_scale_ppb": round(
+                    current.playback_scale * 1_000_000_000
+                ),
+            }
+            previous_contracts = current.settings.get("clock_contracts", ())
+            if not isinstance(previous_contracts, (list, tuple)):
+                previous_contracts = ()
+            update_started_ns = time.perf_counter_ns()
+            current = self.registry.put_session(
+                replace(
+                    current,
+                    state=RunState.RUNNING,
+                    clock_source_timestamp_ns=start_source_ns,
+                    clock_monotonic_ns=anchor_monotonic_ns,
+                    updated_timestamp_ns=time.time_ns(),
+                    settings={
+                        **current.settings,
+                        "clock_contract": clock_contract,
+                        "clock_contracts": [
+                            *previous_contracts,
+                            clock_contract,
+                        ],
+                    },
+                ),
+                expected_revision=current.revision,
+            )
+            persisted_monotonic_ns = time.monotonic_ns()
+            update_ms = (
+                time.perf_counter_ns() - update_started_ns
+            ) / 1_000_000.0
+            margin_ns = anchor_monotonic_ns - persisted_monotonic_ns
+            attempt_metrics: dict[str, object] = {
+                "attempt": attempt,
+                "epoch": current.revision,
+                "registry_update_ms": update_ms,
+                "post_persistence_margin_ms": margin_ns / 1_000_000.0,
+            }
+            if current.revision != expected_epoch or margin_ns < minimum_margin_ns:
+                attempt_metrics["result"] = "persistence-missed-barrier"
+                attempts.append(attempt_metrics)
+                misses += 1
+                continue
+            if cancellation.wait(margin_ns / 1_000_000_000.0):
+                attempt_metrics["result"] = "cancelled"
+                attempts.append(attempt_metrics)
+                return _RunClockStart(
+                    current,
+                    time.perf_counter_ns(),
+                    {
+                        "synchronized": False,
+                        "failure": "replay cancelled while arming the run clock",
+                        "start_offset_ms": 0.0,
+                        "anchor_attempts": attempt,
+                        "anchor_misses": misses,
+                        "attempts": attempts,
+                    },
+                )
+            actual_monotonic_ns = time.monotonic_ns()
+            start_perf_counter_ns = time.perf_counter_ns()
+            offset_ns = actual_monotonic_ns - anchor_monotonic_ns
+            attempt_metrics["start_offset_ms"] = offset_ns / 1_000_000.0
+            if abs(offset_ns) > maximum_offset_ns:
+                attempt_metrics["result"] = "scheduler-missed-barrier"
+                attempts.append(attempt_metrics)
+                misses += 1
+                continue
+            attempt_metrics["result"] = "synchronized"
+            attempts.append(attempt_metrics)
+            return _RunClockStart(
+                current,
+                start_perf_counter_ns,
+                {
+                    "contract": "future-barrier-v1",
+                    "epoch": current.revision,
+                    "anchor_source_ns": start_source_ns,
+                    "anchor_monotonic_ns": anchor_monotonic_ns,
+                    "actual_start_monotonic_ns": actual_monotonic_ns,
+                    "start_lead_ms": self.settings.clock_start_lead_ms,
+                    "minimum_post_persistence_margin_ms": (
+                        minimum_margin_ns / 1_000_000.0
+                    ),
+                    "maximum_offset_ms": self.settings.maximum_clock_offset_ms,
+                    "start_offset_ms": offset_ns / 1_000_000.0,
+                    "anchor_attempts": attempt,
+                    "anchor_misses": misses,
+                    "synchronized": True,
+                    "attempts": attempts,
+                },
+            )
+        return _RunClockStart(
+            current,
+            time.perf_counter_ns(),
+            {
+                "synchronized": False,
+                "failure": (
+                    "could not establish a synchronized replay clock after "
+                    f"{maximum_attempts} attempts"
+                ),
+                "start_offset_ms": 0.0,
+                "anchor_attempts": maximum_attempts,
+                "anchor_misses": misses,
+                "attempts": attempts,
             },
         )
 

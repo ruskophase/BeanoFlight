@@ -2,16 +2,16 @@
 
 The simulation is split at the same process boundaries proposed for the live
 sorter. Only small immutable records cross BeanRegistry; each selected 224 x
-224 crop crosses a separate bounded image socket.
+224 crop pair crosses a separate bounded image socket.
 
 ```text
-CamL mmap RG10 (fast) or calibrated MKV (fallback)
+synchronized CamL/CamR mmap RG10 (fast) or CamL calibrated MKV (fallback)
        |
        v
  BeanoFlight replay -- async audit --------> BeanRegistry --> SQLite WAL
        |                 |                       ^  ^             |
        |                 +-- direct context ---> |  |             +--> Monitor
-       +-- BGR crop --> Beano Inferencer ==ACK==> Sorter
+       +-- CamL/CamR crop pair --> Beano Inferencer ==ACK==> Sorter
                                                 |  |
                        decision audit -----------+  |
                                                 v  |
@@ -31,9 +31,10 @@ CamL mmap RG10 (fast) or calibrated MKV (fallback)
   name) receives lossless BGR crops, optionally shows the latest crop and
   activity log, and preserves each source frame's crop group as one GPU batch.
   It can run either the conservative seeded timing model or the local FP16
-  TensorRT shared-layer1 stereo ResNet18 engine. Only CamL is transported in
-  this release, so the real engine temporarily receives CamL at both tower
-  inputs and explicitly records `stereo_pair_complete: false`.
+  TensorRT shared-layer1 stereo ResNet18 engine. Optimized RAW replay transports
+  distinct synchronized CamL and CamR crops to the corresponding tower inputs.
+  The explicit single-view A/B option duplicates CamL only for timing comparison
+  and records `stereo_pair_complete: false`.
 - `beano-sorter` joins direct classification evidence with BeanoFlight's direct
   track/prediction context. Registry notifications and the SQLite journal recover
   a dropped message, sequence gap or restart. It owns classification policy and
@@ -253,19 +254,26 @@ much slower. These RAW modes require the complete `metadata`, `raw` and
 
 ## Crop and backpressure contract
 
-Between one and five crops may be requested per public bean; the default is
-one at 224 x 224. Identity and motion tracking still start at the initial
+Between one and five crop pairs may be requested per public bean; the default is
+one pair at 224 x 224. Identity and motion tracking still start at the initial
 tentative detection. When the bean bounding box is fully inside the sensor but
 the centred 224 x 224 window is not, the default adaptive policy takes the
 largest complete centred square containing the bean and resizes it to the
 requested model size. It never pads with unseen top-edge evidence. If the
-actual bean bounding box touches an image edge, crop selection always waits for
-a later observation. Clear the BeanoFlight checkbox—or pass
+actual bean component touches either image edge, crop selection always waits for
+a later observation. CamL continues to own motion detection and identity. Its
+distorted sensor centroid is point-undistorted, transferred through the frozen
+PinkPlane CamL-to-CamR homography, distorted into CamR sensor coordinates, and
+locally refined using the synchronized CamR frame and its background model.
+Only the two Bayer crop ROIs are demosaiced. Clear the adaptive crop checkbox—or pass
 `--no-adaptive-edge-resize` to either headless runner—to require the complete
 requested-size window as well.
-The frame thread copies only the selected Bayer ROI (about 0.10 MiB including
-its demosaic halo), then releases the full RAW mapping. With the default
-`ml-fast` profile, the dispatch thread performs only sensor-level linear
+The normal CamR refinement mask reads one of the two native green samples and
+uses contour boxes, with the former averaged dual-green segmentation retained
+as an automatic fallback when no valid component is found.
+The frame thread copies only the two selected Bayer ROIs (about 0.20 MiB total
+including their demosaic halos), then releases the full RAW mappings. With the
+default `ml-fast` profile, the dispatch thread performs only sensor-level linear
 conversion and bilinear demosaic before producing contiguous `uint8` BGR.
 This representation is intended for a model trained on the same pipeline, not
 for display. The selectable `calibrated` reference additionally applies the
@@ -316,18 +324,21 @@ not two independently trained networks and it does not combine model weights.
 The TensorRT engine accepts dynamic same-frame batches of 1--10 bean pairs and
 is warmed at every supported batch size before the crop receiver becomes ready.
 
-The current replay transport has only CamL crops. To measure the actual
-two-tower compute and transfer cost without claiming stereo evidence, it feeds
-the same CamL tensor to both engine bindings. The future paired-crop transport
-will replace the second binding with CamR without changing the feature-fusion
-architecture, probability/logit result contract, BeanRegistry schema, or sorter.
+Optimized RAW replay now sends the distinct CamL and CamR crop from each
+synchronized source-frame pair. CamR CPU preprocessing overlaps CamL
+preprocessing before the two pinned tensors are copied to their TensorRT
+bindings. Crop transport records both camera timestamps and centroids; the
+probability/logit result contract, BeanRegistry schema and sorter are unchanged.
+`--single-view-inference` retains the former duplicated-CamL path solely as a
+matched performance baseline.
 
 The integration model is intentionally not a defect classifier. It was trained
 on lossless 224 x 224 crops extracted from the August 16 recording and balanced
 arbitrary brightness-quartile labels. Its only purposes are exercising real
 GPU kernels, producing real logits, and measuring the asynchronous pipeline.
 The deployed production network must be retrained from labelled, synchronized
-CamL/CamR pairs using the same `ml-fast` scaling.
+CamL/CamR pairs using the same `ml-fast` scaling. The current arbitrary-label
+timing model was not trained to make meaningful use of the view difference.
 
 Rebuild the timing artefacts on the target Jetson with:
 
@@ -359,8 +370,9 @@ batches receive up to 15% seeded jitter; one percent also receive a seeded
 
 The GUI reports batch count and size, queue and service latency, rare tails,
 deadline misses and drops. Each evidence result stores the same fields in its
-Registry enrichment, including a source-frame batch ID and explicit
-`stereo_pair_complete: false` marker.
+Registry enrichment, including a source-frame batch ID, an explicit
+`stereo_pair_complete` marker, and synchronized pair provenance when both views
+are present.
 
 On 2026-08-20, three warmed real-engine full-pipeline runs each replayed all 601
 August 16 frames. Minimum throughput was 59.999 FPS, mean frame analysis was

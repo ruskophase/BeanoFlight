@@ -169,6 +169,7 @@ class MockInferenceActivity:
     confidence: float | None = None
     detail: str = ""
     crop: object | None = None
+    crop_right: object | None = None
     batch_id: str = ""
     batch_beans: int = 0
     batch_images: int = 0
@@ -258,6 +259,7 @@ class MockInferencerService:
         self._total_queue_ms = 0.0
         self._total_service_ms = 0.0
         self._sessions = {}
+        self._run_clock_anchors: dict[tuple[str, int], tuple[int, int, int]] = {}
         self._registry_capabilities: frozenset[str] | None = None
         self._tensor_rt = None
         self.ready = threading.Event()
@@ -272,6 +274,9 @@ class MockInferencerService:
         self.direct_evidence_sent = 0
         self.direct_evidence_dropped = 0
         self.registry_completion_retries = 0
+        self.clock_anchor_mismatches = 0
+        self.stereo_pairs_received = 0
+        self.single_view_samples_received = 0
         self.last_batch_size = 0
         self.max_batch_size = 0
         self.last_batch_latency_ms = 0.0
@@ -359,6 +364,9 @@ class MockInferencerService:
                 "direct_evidence_sent": self.direct_evidence_sent,
                 "direct_evidence_dropped": self.direct_evidence_dropped,
                 "registry_completion_retries": self.registry_completion_retries,
+                "clock_anchor_mismatches": self.clock_anchor_mismatches,
+                "stereo_pairs_received": self.stereo_pairs_received,
+                "single_view_samples_received": self.single_view_samples_received,
                 "last_batch_size": self.last_batch_size,
                 "max_batch_size": self.max_batch_size,
                 "last_batch_latency_ms": self.last_batch_latency_ms,
@@ -409,6 +417,45 @@ class MockInferencerService:
                     detail="frame batch exceeds configured bean limit",
                 )
             return False
+        pair_states = {payload.stereo_pair_complete for payload in payloads}
+        if len(pair_states) != 1:
+            with self._stats_lock:
+                self.dropped += len(payloads)
+            for payload in payloads:
+                self._emit(
+                    "rejected",
+                    payload,
+                    detail="frame batch mixes paired and single-view crops",
+                )
+            return False
+        for payload in payloads:
+            if not _job_has_run_clock(payload.job):
+                continue
+            marks = payload.job.timing_marks_ns
+            key = (
+                payload.job.bean_ref.run_id,
+                int(marks.get("run_clock_epoch", 0)),
+            )
+            anchor = (
+                int(marks["run_clock_source_ns"]),
+                int(marks["run_clock_monotonic_ns"]),
+                int(marks["run_clock_scale_ppb"]),
+            )
+            previous = self._run_clock_anchors.setdefault(key, anchor)
+            if previous != anchor:
+                with self._stats_lock:
+                    self.clock_anchor_mismatches += 1
+                    self.dropped += len(payloads)
+                for rejected in payloads:
+                    self._emit(
+                        "rejected",
+                        rejected,
+                        detail=(
+                            "run clock anchor changed within inference epoch "
+                            f"{key[1]}"
+                        ),
+                    )
+                return False
         accepted_ns = time.monotonic_ns()
         self._arrival_order += 1
         queued = _QueuedBatch(
@@ -432,8 +479,17 @@ class MockInferencerService:
         with self._stats_lock:
             self.received += len(payloads)
             self._queued_beans += len(payloads)
+            if next(iter(pair_states)):
+                self.stereo_pairs_received += len(payloads)
+            else:
+                self.single_view_samples_received += len(payloads)
         for payload in payloads:
-            self._emit("received", payload, crop=payload.image_bgr)
+            self._emit(
+                "received",
+                payload,
+                crop=payload.image_bgr,
+                crop_right=payload.camr_image_bgr,
+            )
         return True
 
     def _worker_loop(self) -> None:
@@ -616,8 +672,14 @@ class MockInferencerService:
             for item in batch
         )
         try:
+            paired = all(item.payload.stereo_pair_complete for item in batch)
             result = self._tensor_rt.infer(
-                tuple(item.payload.image_bgr for item in batch)
+                tuple(item.payload.image_bgr for item in batch),
+                (
+                    tuple(item.payload.camr_image_bgr for item in batch)
+                    if paired
+                    else None
+                ),
             )
             failure = ""
         except Exception as exc:  # noqa: BLE001 - durable failure is published
@@ -710,6 +772,7 @@ class MockInferencerService:
             deadline_missed,
         ) in enumerate(zip(batch, queue_times_ms, service_times_ms, deadline_misses)):
             payload = item.payload
+            stereo_complete = payload.stereo_pair_complete
             sample_index = _job_sample_index(payload.job)
             if completed.logits:
                 logits = completed.logits[result_index]
@@ -805,8 +868,18 @@ class MockInferencerService:
                         "profile": inference_profile,
                         "input_mode": input_mode,
                         "transported_camera": payload.job.camera_id,
-                        "transported_views": 1,
-                        "stereo_pair_complete": False,
+                        "transported_cameras": (
+                            ["CamL", "CamR"]
+                            if stereo_complete
+                            else [payload.job.camera_id]
+                        ),
+                        "transported_views": 2 if stereo_complete else 1,
+                        "stereo_pair_complete": stereo_complete,
+                        "stereo_pair": (
+                            payload.stereo_pair.to_json()
+                            if stereo_complete
+                            else None
+                        ),
                         "logical_views": logical_views,
                         "batch_id": batch_id,
                         "batch_beans": len(batch),
@@ -818,6 +891,8 @@ class MockInferencerService:
                         "result_deadline_ms": self.settings.result_deadline_ms,
                         "deadline_missed": deadline_missed,
                         "tail_latency": tail,
+                        "clock_epoch": int(marks.get("run_clock_epoch", 0)),
+                        "clock_consistent": True,
                     },
                 },
                 timestamp_ns=result_timestamp,
@@ -985,6 +1060,7 @@ class MockInferencerService:
         confidence: float | None = None,
         detail: str = "",
         crop: object | None = None,
+        crop_right: object | None = None,
         batch_id: str = "",
         batch_beans: int = 0,
         batch_images: int = 0,
@@ -1005,6 +1081,7 @@ class MockInferencerService:
                 confidence=confidence,
                 detail=detail,
                 crop=crop,
+                crop_right=crop_right,
                 batch_id=batch_id,
                 batch_beans=batch_beans,
                 batch_images=batch_images,

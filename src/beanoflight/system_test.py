@@ -110,7 +110,27 @@ def parser() -> argparse.ArgumentParser:
         default=30.0,
         help="drop replay frames older than this when stale-frame dropping is enabled",
     )
+    result.add_argument(
+        "--clock-start-lead-ms",
+        type=float,
+        default=50.0,
+        help="future run-clock barrier lead used to absorb startup persistence",
+    )
+    result.add_argument(
+        "--maximum-clock-offset-ms",
+        type=float,
+        default=2.0,
+        help="maximum permitted frame-zero offset from the shared run clock",
+    )
     result.add_argument("--no-crops", action="store_true")
+    result.add_argument(
+        "--single-view-inference",
+        action="store_true",
+        help=(
+            "transport CamL only and duplicate it at the TensorRT adapter; "
+            "intended only for paired-pipeline A/B comparisons"
+        ),
+    )
     result.add_argument("--registry", default=DEFAULT_COMMAND_ENDPOINT)
     result.add_argument("--crops", default=DEFAULT_CROP_ENDPOINT)
     result.add_argument(
@@ -168,6 +188,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         if calibration_path is None:
             raise SourceError("could not locate a PinkPlane homography")
+        stereo_crop_extractor = None
+        if (
+            arguments.optimized_raw
+            and not arguments.no_crops
+            and not arguments.single_view_inference
+        ):
+            source.configure_stereo(
+                calibration_path,
+                arguments.background_frames,
+            )
+            stereo_crop_extractor = source.prepare_stereo_crop
+            deferred_crop_extractor = None
         calibration = MetricPlaneCalibration.from_pinkplane(
             calibration_path,
             image_size_px=(source.metadata.width, source.metadata.height),
@@ -200,6 +232,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     adaptive_edge_resize=not arguments.no_adaptive_edge_resize,
                 ),
                 deferred_extractor=deferred_crop_extractor,
+                stereo_extractor=stereo_crop_extractor,
             )
             dispatcher = CropDispatcher(arguments.registry, arguments.crops)
         runner = ReplayRunner(
@@ -213,6 +246,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 maximum_frames=arguments.maximum_frames,
                 drop_stale_frames=not arguments.keep_stale_frames,
                 maximum_frame_age_ms=arguments.maximum_frame_age_ms,
+                clock_start_lead_ms=arguments.clock_start_lead_ms,
+                maximum_clock_offset_ms=arguments.maximum_clock_offset_ms,
             ),
             crop_selector=selector,
             crop_dispatcher=dispatcher,
@@ -221,6 +256,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "name": "headless-system-test",
                 "optimized_raw": arguments.optimized_raw,
                 "crops_enabled": not arguments.no_crops,
+                "stereo_crops": stereo_crop_extractor is not None,
                 "adaptive_edge_resize": not arguments.no_adaptive_edge_resize,
                 "crop_processing": (
                     arguments.crop_processing

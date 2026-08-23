@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -147,6 +148,10 @@ class TensorRTStereoResNet18:
         self._device_right = self._cuda.device_alloc(input_bytes)
         self._device_output = self._cuda.device_alloc(output_bytes)
         self._stream = self._cuda.stream_create()
+        self._preprocess_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="beano-camr-preprocess",
+        )
         self._closed = False
 
     def infer(
@@ -162,13 +167,21 @@ class TensorRTStereoResNet18:
         if camr_images is not None and len(camr_images) != batch:
             raise TensorRTInferenceError("CamL and CamR batch sizes differ")
         started_ns = time.perf_counter_ns()
-        for index, image in enumerate(caml_images):
-            _prepare_rgb_chw(image, self._left[index])
+        right_future = None
         if camr_images is None:
+            _prepare_batch(caml_images, self._left)
             np.copyto(self._right[:batch], self._left[:batch])
         else:
-            for index, image in enumerate(camr_images):
-                _prepare_rgb_chw(image, self._right[index])
+            # The two independent camera towers write disjoint pinned buffers.
+            # Prepare CamR concurrently with CamL so genuine stereo does not
+            # serialize twice the CPU normalization work.
+            right_future = self._preprocess_pool.submit(
+                _prepare_batch,
+                camr_images,
+                self._right,
+            )
+            _prepare_batch(caml_images, self._left)
+            right_future.result()
         prepared_ns = time.perf_counter_ns()
         input_bytes = batch * 3 * 224 * 224 * np.dtype(np.float32).itemsize
         output_bytes = batch * self.class_count * np.dtype(np.float32).itemsize
@@ -235,6 +248,7 @@ class TensorRTStereoResNet18:
         if self._closed:
             return
         self._closed = True
+        self._preprocess_pool.shutdown(wait=True, cancel_futures=True)
         cuda = self._cuda.library
         cuda.cudaStreamDestroy(self._stream)
         for pointer in (self._device_left, self._device_right, self._device_output):
@@ -259,3 +273,8 @@ def _prepare_rgb_chw(image_bgr: np.ndarray, destination: np.ndarray) -> None:
     np.multiply(image[:, :, 2], 1.0 / 255.0, out=destination[0], casting="unsafe")
     np.multiply(image[:, :, 1], 1.0 / 255.0, out=destination[1], casting="unsafe")
     np.multiply(image[:, :, 0], 1.0 / 255.0, out=destination[2], casting="unsafe")
+
+
+def _prepare_batch(images: tuple[np.ndarray, ...], destination: np.ndarray) -> None:
+    for index, image in enumerate(images):
+        _prepare_rgb_chw(image, destination[index])

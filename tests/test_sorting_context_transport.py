@@ -35,6 +35,7 @@ class SortingContextTransportTests(unittest.TestCase):
                     target_fps=60.0,
                     clock_source_timestamp_ns=100,
                     clock_monotonic_ns=clock_ns,
+                    clock_epoch=2,
                     items=(SortingContext(snapshot, prediction),),
                 )
             )
@@ -44,6 +45,7 @@ class SortingContextTransportTests(unittest.TestCase):
             self.assertEqual(received.run_id, "context-run")
             self.assertEqual(received.frame_index, 3)
             self.assertEqual(received.clock_monotonic_ns, clock_ns)
+            self.assertEqual(received.clock_epoch, 2)
             self.assertEqual(received.items[0].track.bean_ref, bean_ref)
             self.assertEqual(received.items[0].track.state, snapshot.state)
             self.assertEqual(received.items[0].prediction, prediction)
@@ -67,6 +69,7 @@ class SortingContextTransportTests(unittest.TestCase):
                     target_fps=60.0,
                     clock_source_timestamp_ns=100,
                     clock_monotonic_ns=time.monotonic_ns(),
+                    clock_epoch=2,
                     items=(SortingContext(snapshot, prediction),),
                 )
             publisher.close()

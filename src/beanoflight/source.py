@@ -18,6 +18,12 @@ from typing import ClassVar, Protocol
 import cv2
 import numpy as np
 
+from .stereo import (
+    StereoCropPreparation,
+    StereoPairMetadata,
+    StereoPointCalibration,
+)
+
 SUPPORTED_VIDEO_EXTENSIONS = {".mkv", ".avi", ".mov", ".mp4", ".m4v", ".webm"}
 
 
@@ -57,6 +63,12 @@ class RawReplayFrame:
     native_size_px: tuple[int, int]
     _mapping: mmap.mmap | None
     _mosaic: np.ndarray | None
+    right_frame_index: int | None = None
+    right_timestamp_ns: int | None = None
+    right_path: Path | None = None
+    _right_mapping: mmap.mmap | None = None
+    _right_mosaic: np.ndarray | None = None
+    _right_detection_gray: np.ndarray | None = None
 
     @property
     def mosaic(self) -> np.ndarray:
@@ -64,12 +76,34 @@ class RawReplayFrame:
             raise SourceError("RAW replay frame has already been released")
         return self._mosaic
 
+    @property
+    def right_mosaic(self) -> np.ndarray:
+        if self._right_mosaic is None:
+            raise SourceError("RAW replay frame has no active CamR pair")
+        return self._right_mosaic
+
     def close(self) -> None:
         self._mosaic = None
         mapping = self._mapping
         self._mapping = None
         if mapping is not None:
             mapping.close()
+        self._right_detection_gray = None
+        self._right_mosaic = None
+        right_mapping = self._right_mapping
+        self._right_mapping = None
+        if right_mapping is not None:
+            right_mapping.close()
+
+
+@dataclass(frozen=True, slots=True)
+class _RawStereoPair:
+    left_frame_index: int
+    right_frame_index: int
+    left_timestamp_ns: int
+    right_timestamp_ns: int
+    left_path: Path
+    right_path: Path
 
 
 def resolve_caml_video(path: Path) -> Path:
@@ -362,9 +396,40 @@ class MMapRawVideoSource:
             1.055 * np.power(linear, 1.0 / 2.4) - 0.055,
         )
         self._detection_lut = np.clip(srgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        self._stored_detection_lut = _stored_value_lut(
+            self._detection_lut,
+            self._bit_shift,
+        )
         self._crop_processor = RawCropProcessor(
             profile_path, profile, processing_profile=crop_processing
         )
+        self._stereo_calibration: StereoPointCalibration | None = None
+        self._stereo_pairs: dict[int, _RawStereoPair] = {}
+        self._right_profile: dict[str, object] | None = None
+        self._right_rows: tuple[tuple[int, Path], ...] = ()
+        self._right_width = 0
+        self._right_height = 0
+        self._right_stride = 0
+        self._right_bit_shift = 0
+        self._right_expected_bytes = 0
+        self._right_detection_lut: np.ndarray | None = None
+        self._right_stored_detection_lut: np.ndarray | None = None
+        self._right_background: np.ndarray | None = None
+        self._right_background_blurred: np.ndarray | None = None
+        self._right_fallback_background_blurred: np.ndarray | None = None
+        self._right_crop_processor: RawCropProcessor | None = None
+        self._stereo_refinement_threshold = 22
+        self._stereo_max_refinement_px = 64.0
+        self._stereo_search_margin_px = 64
+        self._stereo_close_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (5, 5)
+        )
+        self._stereo_open_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (3, 3)
+        )
+        self._stereo_failure_counts: dict[str, int] = {}
+        self._stereo_failure_examples: list[dict[str, object]] = []
+        self._stereo_refinement_fallbacks = 0
         self.crop_processing_profile = self._crop_processor.processing_profile
         self.metadata = SourceMetadata(root, width, height, len(rows), fps, True)
         self.pipeline_metadata = {
@@ -378,6 +443,163 @@ class MMapRawVideoSource:
             "crop_processing": self.crop_processing_profile,
             "pixel_coordinate_domain": "distorted RAW",
             "metric_coordinate_domain": "point-undistorted PinkPlane",
+            "stereo": "CamL only until configure_stereo()",
+        }
+
+    @property
+    def stereo_enabled(self) -> bool:
+        return self._stereo_calibration is not None
+
+    def stereo_statistics(self) -> dict[str, object]:
+        return {
+            "enabled": self.stereo_enabled,
+            "localizer": "single-green contour boxes with dual-green fallback",
+            "dual_green_fallbacks": self._stereo_refinement_fallbacks,
+            "failure_counts": dict(sorted(self._stereo_failure_counts.items())),
+            "failure_examples": list(self._stereo_failure_examples),
+        }
+
+    def _stereo_failure(
+        self, reason: str, **detail: object
+    ) -> None:
+        self._stereo_failure_counts[reason] = (
+            self._stereo_failure_counts.get(reason, 0) + 1
+        )
+        if detail and len(self._stereo_failure_examples) < 8:
+            self._stereo_failure_examples.append({"reason": reason, **detail})
+
+    def configure_stereo(
+        self,
+        homography_path: Path,
+        background_indices: tuple[int, ...],
+        *,
+        refinement_threshold: int = 22,
+        maximum_refinement_px: float = 64.0,
+        search_margin_px: int = 64,
+    ) -> None:
+        """Enable synchronized CamR ROI access and local centroid refinement."""
+
+        right_metadata_path = self.path / "metadata/CamR.csv"
+        right_profile_path = self.path / "calibration/CamR/profile.json"
+        pair_path = self.path / "postprocess/pairs.csv"
+        if not pair_path.is_file():
+            pair_path = self.path / "pairs.csv"
+        try:
+            right_rows = _read_raw_metadata(right_metadata_path)
+            right_profile = _read_json(right_profile_path)
+            capture = right_profile["capture"]
+            calibration = right_profile["calibration"]
+            right_width = int(capture["width"])
+            right_height = int(capture["height"])
+            right_stride = int(capture["bytes_per_line"])
+            right_bit_shift = int(capture.get("bit_shift", 0))
+            right_white_level = float(capture["decoded_white_level"])
+            right_dark_level = float(calibration.get("dark_level_median", 0.0))
+            right_cfa = str(capture["cfa"])
+            pairs = _read_stereo_pairs(pair_path)
+            point_calibration = StereoPointCalibration.load(
+                homography_path,
+                self.profile,
+                right_profile,
+            )
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise SourceError(f"cannot configure synchronized CamR replay: {exc}") from exc
+        if not right_rows or not pairs:
+            raise SourceError("stereo replay requires CamR metadata and pairs.csv")
+        if (
+            right_width <= 0
+            or right_height <= 0
+            or right_width % 2
+            or right_height % 2
+            or right_stride < right_width * 2
+            or right_stride % 2
+            or right_cfa != "RGGB"
+            or right_bit_shift < 0
+            or right_bit_shift > 15
+            or right_white_level <= right_dark_level
+        ):
+            raise SourceError("CamR RAW capture geometry or signal levels are invalid")
+        pair_by_left = {pair.left_frame_index: pair for pair in pairs}
+        for pair in pairs:
+            if not 0 <= pair.left_frame_index < len(self._rows):
+                raise SourceError("pairs.csv refers to an invalid CamL frame")
+            if not 0 <= pair.right_frame_index < len(right_rows):
+                raise SourceError("pairs.csv refers to an invalid CamR frame")
+            left_timestamp, left_path = self._rows[pair.left_frame_index]
+            right_timestamp, right_path = right_rows[pair.right_frame_index]
+            if (
+                left_timestamp != pair.left_timestamp_ns
+                or right_timestamp != pair.right_timestamp_ns
+                or left_path != pair.left_path
+                or right_path != pair.right_path
+            ):
+                raise SourceError("pairs.csv disagrees with RAW camera metadata")
+        if not all(index in pair_by_left for index in range(len(self._rows))):
+            raise SourceError("stereo replay requires one CamR pair for every CamL frame")
+        if not 0 <= refinement_threshold <= 255:
+            raise SourceError("CamR refinement threshold must be between 0 and 255")
+        if maximum_refinement_px <= 0 or search_margin_px <= 0:
+            raise SourceError("CamR refinement limits must be positive")
+
+        levels = np.arange(round(right_white_level) + 1, dtype=np.float32)
+        linear = np.clip(
+            (levels - right_dark_level)
+            / max(right_white_level - right_dark_level, 1.0),
+            0.0,
+            1.0,
+        )
+        srgb = np.where(
+            linear <= 0.0031308,
+            linear * 12.92,
+            1.055 * np.power(linear, 1.0 / 2.4) - 0.055,
+        )
+        self._right_profile = right_profile
+        self._right_rows = right_rows
+        self._right_width = right_width
+        self._right_height = right_height
+        self._right_stride = right_stride
+        self._right_bit_shift = right_bit_shift
+        self._right_expected_bytes = right_height * right_stride
+        self._right_detection_lut = np.clip(
+            srgb * 255.0 + 0.5, 0, 255
+        ).astype(np.uint8)
+        self._right_stored_detection_lut = _stored_value_lut(
+            self._right_detection_lut,
+            self._right_bit_shift,
+        )
+        self._right_crop_processor = RawCropProcessor(
+            right_profile_path,
+            right_profile,
+            processing_profile=self.crop_processing_profile,
+        )
+        self._stereo_pairs = pair_by_left
+        self._stereo_calibration = point_calibration
+        self._stereo_refinement_threshold = int(refinement_threshold)
+        self._stereo_max_refinement_px = float(maximum_refinement_px)
+        self._stereo_search_margin_px = int(search_margin_px)
+        (
+            self._right_background,
+            fallback_background,
+        ) = self._build_right_background(background_indices)
+        self._right_background_blurred = cv2.GaussianBlur(
+            self._right_background, (5, 5), 0
+        )
+        self._right_fallback_background_blurred = cv2.GaussianBlur(
+            fallback_background, (5, 5), 0
+        )
+        self.pipeline_metadata = {
+            **self.pipeline_metadata,
+            "stereo": "synchronized CamL/CamR RAW ROI pairs",
+            "stereo_coordinate_transfer": (
+                "CamL distorted -> point undistort -> PinkPlane homography -> "
+                "CamR point distort -> local foreground refinement"
+            ),
+            "stereo_homography": str(point_calibration.homography_path),
+            "stereo_background_frames": list(background_indices),
+            "stereo_max_refinement_px": self._stereo_max_refinement_px,
+            "stereo_localizer": (
+                "single Bayer green contour boxes; dual-green fallback"
+            ),
         }
 
     def timestamp_ns(self, index: int) -> int:
@@ -414,23 +636,43 @@ class MMapRawVideoSource:
             green_stored = cv2.addWeighted(
                 mosaic[0::2, 1::2], 0.5, mosaic[1::2, 0::2], 0.5, 0.0
             )
-            decoded = (
-                np.right_shift(green_stored, self._bit_shift)
-                if self._bit_shift
-                else green_stored
+            detection_gray = np.ascontiguousarray(
+                self._stored_detection_lut[green_stored]
             )
-            decoded = np.minimum(decoded, len(self._detection_lut) - 1)
-            detection_gray = np.ascontiguousarray(self._detection_lut[decoded])
+            pair = self._stereo_pairs.get(index)
+            right_mapping = None
+            right_mosaic = None
+            if pair is not None:
+                right_mapping, right_mosaic, right_path = _mmap_raw_mosaic(
+                    self.path,
+                    pair.right_path,
+                    width=self._right_width,
+                    height=self._right_height,
+                    stride=self._right_stride,
+                    expected_bytes=self._right_expected_bytes,
+                    frame_index=pair.right_frame_index,
+                    camera_id="CamR",
+                )
+            else:
+                right_path = None
             frame = RawReplayFrame(
-                index,
-                path,
-                detection_gray,
-                (self._width, self._height),
-                mapping,
-                mosaic,
+                index=index,
+                path=path,
+                detection_gray=detection_gray,
+                native_size_px=(self._width, self._height),
+                _mapping=mapping,
+                _mosaic=mosaic,
+                right_frame_index=(None if pair is None else pair.right_frame_index),
+                right_timestamp_ns=(None if pair is None else pair.right_timestamp_ns),
+                right_path=right_path,
+                _right_mapping=right_mapping,
+                _right_mosaic=right_mosaic,
             )
         except Exception:
             mapping.close()
+            right_mapping = locals().get("right_mapping")
+            if right_mapping is not None:
+                right_mapping.close()
             raise
         self._active[id(frame)] = frame
         return frame
@@ -476,6 +718,309 @@ class MMapRawVideoSource:
             size_px,
             allow_padding=allow_padding,
         )
+
+    def prepare_stereo_crop(
+        self,
+        frame: RawReplayFrame,
+        centroid_px: tuple[float, float],
+        size_px: int,
+        *,
+        allow_padding: bool,
+        allow_resize: bool = True,
+    ) -> StereoCropPreparation | None:
+        calibration = self._stereo_calibration
+        right_processor = self._right_crop_processor
+        if calibration is None or right_processor is None:
+            raise SourceError("synchronized CamR replay has not been configured")
+        pair = self._stereo_pairs.get(frame.index)
+        if (
+            pair is None
+            or frame.right_frame_index != pair.right_frame_index
+            or frame.right_timestamp_ns != pair.right_timestamp_ns
+        ):
+            self._stereo_failure("missing_synchronized_pair")
+            return None
+        projected = calibration.project_distorted_caml_to_distorted_camr(
+            centroid_px
+        )
+        refined = self._refine_right_centroid(frame, projected, size_px)
+        if refined is None:
+            self._stereo_failure("no_local_camr_component")
+            return None
+        refined_centroid, area_px, component_size_px = refined
+        source_size_px = size_px
+        if not allow_padding:
+            complete_size = 2 * math.floor(
+                min(
+                    centroid_px[0],
+                    centroid_px[1],
+                    self._width - centroid_px[0],
+                    self._height - centroid_px[1],
+                    refined_centroid[0],
+                    refined_centroid[1],
+                    self._right_width - refined_centroid[0],
+                    self._right_height - refined_centroid[1],
+                )
+            )
+            complete_size -= complete_size % 2
+            if complete_size < source_size_px:
+                if not allow_resize:
+                    self._stereo_failure("camr_crop_clipped_resize_disabled")
+                    return None
+                # The segmented component already describes the complete bean
+                # silhouette. Do not add an arbitrary border here: at the top
+                # of the FoV that border can defer an otherwise lossless crop
+                # by a full 16.7 ms frame.
+                required = math.ceil(max(component_size_px))
+                required += required % 2
+                if complete_size < max(32, required):
+                    self._stereo_failure(
+                        "camr_component_or_crop_clipped",
+                        left_frame_index=frame.index,
+                        caml_centroid_px=list(centroid_px),
+                        projected_camr_px=list(projected),
+                        refined_camr_px=list(refined_centroid),
+                        component_size_px=list(component_size_px),
+                        complete_size_px=complete_size,
+                        required_size_px=required,
+                    )
+                    return None
+                source_size_px = complete_size
+        left = self._crop_processor.prepare(
+            frame.mosaic,
+            centroid_px,
+            source_size_px,
+            allow_padding=allow_padding,
+        )
+        if left is None:
+            self._stereo_failure("caml_crop_unavailable")
+            return None
+        right = right_processor.prepare(
+            frame.right_mosaic,
+            refined_centroid,
+            source_size_px,
+            allow_padding=allow_padding,
+        )
+        if right is None:
+            self._stereo_failure("camr_crop_unavailable")
+            return None
+        left_materializer, left_width, left_height, left_padded = left
+        right_materializer, right_width, right_height, right_padded = right
+        if (left_width, left_height) != (right_width, right_height):
+            raise SourceError("CamL and CamR crop dimensions differ")
+        distance = math.hypot(
+            refined_centroid[0] - projected[0],
+            refined_centroid[1] - projected[1],
+        )
+        return StereoCropPreparation(
+            left_materializer,
+            right_materializer,
+            left_width,
+            left_height,
+            source_size_px,
+            left_padded or right_padded,
+            StereoPairMetadata(
+                left_frame_index=frame.index,
+                right_frame_index=pair.right_frame_index,
+                left_timestamp_ns=pair.left_timestamp_ns,
+                right_timestamp_ns=pair.right_timestamp_ns,
+                caml_centroid_px=centroid_px,
+                camr_projected_centroid_px=projected,
+                camr_centroid_px=refined_centroid,
+                refinement_distance_px=distance,
+                refinement_area_px=area_px,
+            ),
+        )
+
+    def _build_right_background(
+        self, indices: tuple[int, ...]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not indices:
+            raise SourceError("at least one CamR background frame is required")
+        frames: list[np.ndarray] = []
+        fallback_frames: list[np.ndarray] = []
+        stored_lut = self._right_stored_detection_lut
+        if stored_lut is None:
+            raise SourceError("CamR detection levels are not configured")
+        for index in indices:
+            pair = self._stereo_pairs.get(index)
+            if pair is None:
+                raise SourceError(f"background frame {index} has no CamR pair")
+            mapping, mosaic, _path = _mmap_raw_mosaic(
+                self.path,
+                pair.right_path,
+                width=self._right_width,
+                height=self._right_height,
+                stride=self._right_stride,
+                expected_bytes=self._right_expected_bytes,
+                frame_index=pair.right_frame_index,
+                camera_id="CamR",
+            )
+            try:
+                frames.append(_raw_single_green_plane(mosaic, stored_lut).copy())
+                fallback_frames.append(
+                    _raw_green_plane(mosaic, stored_lut).copy()
+                )
+            finally:
+                mapping.close()
+        return (
+            np.median(np.stack(frames, axis=0), axis=0).astype(np.uint8),
+            np.median(np.stack(fallback_frames, axis=0), axis=0).astype(np.uint8),
+        )
+
+    def _refine_right_centroid(
+        self,
+        frame: RawReplayFrame,
+        projected_px: tuple[float, float],
+        crop_size_px: int,
+    ) -> tuple[tuple[float, float], int, tuple[float, float]] | None:
+        background_blurred = self._right_background_blurred
+        if background_blurred is None:
+            raise SourceError("CamR background has not been built")
+        x_px, y_px = projected_px
+        if not (0 <= x_px < self._right_width and 0 <= y_px < self._right_height):
+            return None
+        stored_lut = self._right_stored_detection_lut
+        if stored_lut is None:
+            raise SourceError("CamR detection levels are not configured")
+        half_extent_px = crop_size_px / 2.0 + self._stereo_search_margin_px
+        native_left = max(0, math.floor(x_px - half_extent_px))
+        native_right = min(self._right_width, math.ceil(x_px + half_extent_px))
+        native_top = max(0, math.floor(y_px - half_extent_px))
+        native_bottom = min(self._right_height, math.ceil(y_px + half_extent_px))
+        # Preserve the RGGB phase and a complete 2x2 cell at every edge.
+        native_left -= native_left % 2
+        native_top -= native_top % 2
+        native_right -= native_right % 2
+        native_bottom -= native_bottom % 2
+        mosaic_roi = frame.right_mosaic[
+            native_top:native_bottom,
+            native_left:native_right,
+        ]
+        current_roi = _raw_single_green_plane(mosaic_roi, stored_lut)
+        result = self._foreground_component(
+            current_roi,
+            background_blurred,
+            native_left=native_left,
+            native_top=native_top,
+            native_right=native_right,
+            native_bottom=native_bottom,
+            projected_px=projected_px,
+        )
+        if result is not None:
+            return result
+
+        # One native green sample avoids interpolation and halves the hot ROI
+        # work. Retain averaged dual-green segmentation as a rare recovery path
+        # rather than allowing a marginal spectrum/noise case to lose evidence.
+        fallback_background = self._right_fallback_background_blurred
+        if fallback_background is None:
+            raise SourceError("CamR fallback background has not been built")
+        self._stereo_refinement_fallbacks += 1
+        return self._foreground_component(
+            _raw_green_plane(mosaic_roi, stored_lut),
+            fallback_background,
+            native_left=native_left,
+            native_top=native_top,
+            native_right=native_right,
+            native_bottom=native_bottom,
+            projected_px=projected_px,
+        )
+
+    def _foreground_component(
+        self,
+        current_roi: np.ndarray,
+        background_blurred: np.ndarray,
+        *,
+        native_left: int,
+        native_top: int,
+        native_right: int,
+        native_bottom: int,
+        projected_px: tuple[float, float],
+    ) -> tuple[tuple[float, float], int, tuple[float, float]] | None:
+        left = native_left // 2
+        right = native_right // 2
+        top = native_top // 2
+        bottom = native_bottom // 2
+        if right - left < 3 or bottom - top < 3:
+            return None
+        blurred = cv2.GaussianBlur(current_roi, (5, 5), 0)
+        difference = cv2.absdiff(
+            blurred, background_blurred[top:bottom, left:right]
+        )
+        _unused, foreground = cv2.threshold(
+            difference,
+            self._stereo_refinement_threshold,
+            255,
+            cv2.THRESH_BINARY,
+        )
+        foreground = cv2.morphologyEx(
+            foreground,
+            cv2.MORPH_CLOSE,
+            self._stereo_close_kernel,
+            iterations=1,
+        )
+        foreground = cv2.morphologyEx(
+            foreground,
+            cv2.MORPH_OPEN,
+            self._stereo_open_kernel,
+            iterations=1,
+        )
+        contours, _hierarchy = cv2.findContours(
+            foreground,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        scale_x = current_roi.shape[1] / (native_right - native_left)
+        scale_y = current_roi.shape[0] / (native_bottom - native_top)
+        x_px, y_px = projected_px
+        candidates: list[
+            tuple[float, tuple[float, float], int, tuple[float, float]]
+        ] = []
+        for contour in contours:
+            x, y, width, height = cv2.boundingRect(contour)
+            component = foreground[y : y + height, x : x + width]
+            moments = cv2.moments(component, binaryImage=True)
+            if moments["m00"] <= 0:
+                continue
+            native_width = width / scale_x
+            native_height = height / scale_y
+            native_area = round(moments["m00"] / (scale_x * scale_y))
+            if (
+                native_area < 600
+                or native_area > 80_000
+                or native_width < 20
+                or native_height < 20
+                or native_width > 360
+                or native_height > 360
+            ):
+                continue
+            centre = (
+                float(
+                    native_left
+                    + (x + moments["m10"] / moments["m00"]) / scale_x
+                ),
+                float(
+                    native_top
+                    + (y + moments["m01"] / moments["m00"]) / scale_y
+                ),
+            )
+            distance = math.hypot(centre[0] - x_px, centre[1] - y_px)
+            if distance <= self._stereo_max_refinement_px:
+                candidates.append(
+                    (
+                        distance,
+                        centre,
+                        native_area,
+                        (native_width, native_height),
+                    )
+                )
+        if not candidates:
+            return None
+        _distance, centre, area, component_size = min(
+            candidates, key=lambda item: item[0]
+        )
+        return centre, area, component_size
 
     def undistort_point(self, point: tuple[float, float]) -> tuple[float, float]:
         return self.undistort_points((point,))[0]
@@ -786,6 +1331,68 @@ def _finish_raw_crop(
     return output
 
 
+def _stored_value_lut(decoded_lut: np.ndarray, bit_shift: int) -> np.ndarray:
+    stored = np.arange(1 << 16, dtype=np.uint32)
+    decoded = np.right_shift(stored, bit_shift) if bit_shift else stored
+    return decoded_lut[np.minimum(decoded, len(decoded_lut) - 1)]
+
+
+def _raw_single_green_plane(
+    mosaic: np.ndarray,
+    stored_lut: np.ndarray,
+) -> np.ndarray:
+    return np.ascontiguousarray(stored_lut[mosaic[0::2, 1::2]])
+
+
+def _raw_green_plane(
+    mosaic: np.ndarray,
+    stored_lut: np.ndarray,
+) -> np.ndarray:
+    green_stored = cv2.addWeighted(
+        mosaic[0::2, 1::2], 0.5, mosaic[1::2, 0::2], 0.5, 0.0
+    )
+    return np.ascontiguousarray(stored_lut[green_stored])
+
+
+def _mmap_raw_mosaic(
+    root: Path,
+    relative: Path,
+    *,
+    width: int,
+    height: int,
+    stride: int,
+    expected_bytes: int,
+    frame_index: int,
+    camera_id: str,
+) -> tuple[mmap.mmap, np.ndarray, Path]:
+    path = (root / relative).resolve()
+    if root not in path.parents:
+        raise SourceError(f"{camera_id} RAW path escapes recording bundle: {relative}")
+    try:
+        descriptor = path.stat()
+    except OSError as exc:
+        raise SourceError(
+            f"cannot stat {camera_id} RAW frame {frame_index + 1}: {exc}"
+        ) from exc
+    if descriptor.st_size != expected_bytes:
+        raise SourceError(
+            f"{camera_id} RAW frame {frame_index + 1} has "
+            f"{descriptor.st_size} bytes; expected {expected_bytes}"
+        )
+    descriptor_fd = os.open(path, os.O_RDONLY)
+    try:
+        mapping = mmap.mmap(descriptor_fd, expected_bytes, access=mmap.ACCESS_READ)
+    finally:
+        os.close(descriptor_fd)
+    try:
+        words = np.ndarray((height, stride // 2), dtype="<u2", buffer=mapping)
+        mosaic = words[:, :width]
+    except Exception:
+        mapping.close()
+        raise
+    return mapping, mosaic, path
+
+
 def resolve_raw_bundle(path: Path) -> Path:
     """Resolve a bundle root from the root itself or its CamL derivative."""
 
@@ -837,6 +1444,30 @@ def _read_pair_timestamps(path: Path) -> list[int]:
     if any(later <= earlier for earlier, later in pairwise(values)):
         return []
     return values
+
+
+def _read_stereo_pairs(path: Path) -> tuple[_RawStereoPair, ...]:
+    if not path.is_file():
+        return ()
+    rows: list[_RawStereoPair] = []
+    try:
+        with path.open(newline="", encoding="utf-8") as stream:
+            for row in csv.DictReader(stream):
+                rows.append(
+                    _RawStereoPair(
+                        left_frame_index=int(row["left_frame_index"]),
+                        right_frame_index=int(row["right_frame_index"]),
+                        left_timestamp_ns=int(row["left_timestamp_ns"]),
+                        right_timestamp_ns=int(row["right_timestamp_ns"]),
+                        left_path=Path(row["left_raw_path"]),
+                        right_path=Path(row["right_raw_path"]),
+                    )
+                )
+    except (OSError, ValueError, KeyError):
+        return ()
+    if len({item.left_frame_index for item in rows}) != len(rows):
+        return ()
+    return tuple(rows)
 
 
 def _read_raw_metadata(path: Path) -> tuple[tuple[int, Path], ...]:

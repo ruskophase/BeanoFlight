@@ -9,10 +9,74 @@ import cv2
 import numpy as np
 
 from beanoflight.detection import DetectorSettings, RawGreenDetector
-from beanoflight.source import MMapRawVideoSource, SourceError, find_raw_bundle
+from beanoflight.source import (
+    MMapRawVideoSource,
+    SourceError,
+    _raw_green_plane,
+    _raw_single_green_plane,
+    _stored_value_lut,
+    find_raw_bundle,
+)
 
 
 class RawReplayTests(unittest.TestCase):
+    def test_precomposed_stored_lut_preserves_decoded_green_values(self):
+        decoded_lut = np.arange(1_024, dtype=np.uint16)
+        stored_lut = _stored_value_lut(decoded_lut, 4)
+        mosaic = np.asarray(
+            (
+                (160, 320, 480, 640),
+                (800, 960, 1_120, 1_280),
+                (1_440, 1_600, 1_760, 1_920),
+                (2_080, 2_240, 2_400, 2_560),
+            ),
+            dtype=np.uint16,
+        )
+
+        single = _raw_single_green_plane(mosaic, stored_lut)
+        averaged = _raw_green_plane(mosaic, stored_lut)
+
+        np.testing.assert_array_equal(single, mosaic[0::2, 1::2] >> 4)
+        expected_stored = cv2.addWeighted(
+            mosaic[0::2, 1::2],
+            0.5,
+            mosaic[1::2, 0::2],
+            0.5,
+            0.0,
+        )
+        np.testing.assert_array_equal(averaged, expected_stored >> 4)
+
+    def test_contour_localizer_recovers_native_sensor_centroid(self):
+        source = MMapRawVideoSource.__new__(MMapRawVideoSource)
+        source._stereo_refinement_threshold = 22
+        source._stereo_max_refinement_px = 64.0
+        source._stereo_close_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (5, 5)
+        )
+        source._stereo_open_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (3, 3)
+        )
+        current = np.zeros((80, 80), dtype=np.uint8)
+        cv2.ellipse(current, (30, 25), (10, 8), 0, 0, 360, 180, -1)
+
+        result = source._foreground_component(
+            current,
+            np.zeros_like(current),
+            native_left=0,
+            native_top=0,
+            native_right=160,
+            native_bottom=160,
+            projected_px=(60.0, 50.0),
+        )
+
+        self.assertIsNotNone(result)
+        centroid, area, component_size = result
+        self.assertAlmostEqual(centroid[0], 60.0, delta=1.0)
+        self.assertAlmostEqual(centroid[1], 50.0, delta=1.0)
+        self.assertGreater(area, 600)
+        self.assertGreaterEqual(component_size[0], 40)
+        self.assertGreaterEqual(component_size[1], 32)
+
     def test_mmaps_green_plane_and_defers_crop_colour_work(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

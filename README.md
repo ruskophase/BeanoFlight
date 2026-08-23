@@ -21,10 +21,13 @@ arrival time.
 **Simulation** replays the recording sequentially at a selected rate, including
 60 FPS or unlimited. Preview can be disabled, the display queue is latest-only,
 and full-frame history is never retained. For a complete FastCap bundle, the
-default fast path memory-maps native CamL RG10, detects on a 728 x 544 green
-plane, point-undistorts centroids for metric tracking, and processes only
-selected bean crops. IDs and trajectories begin on the first detection, while
-inference waits only while the segmented bean itself touches an image edge. If
+default fast path memory-maps synchronized native CamL/CamR RG10 frames,
+detects only on CamL's 728 x 544 green plane, point-undistorts centroids for
+metric tracking, and processes only selected bean regions. The CamL centroid is
+transferred through the PinkPlane homography into CamR, then refined against a
+local CamR foreground mask before the two views are cropped. IDs and
+trajectories begin on the first CamL detection, while inference waits only
+while the segmented bean itself touches either image edge. If
 the bean is complete but a centred 224 x 224 sensor crop would cross the frame
 edge, the largest complete centred source crop is resized to 224 x 224 without
 inventing pixels; the crop size and resize flag are retained for audit. The default
@@ -33,7 +36,7 @@ demosaic without brightness or colour calibration; the former calibrated sRGB
 path remains selectable as a reference. All newly eligible crops from one
 source frame are transported as one explicit batch. Source preparation and
 detector/tracker latency are reported separately. This is the recorded-source
-stand-in for a future live CamL frame source.
+stand-in for future synchronized live camera sources.
 
 ## BeanRegistry
 
@@ -110,12 +113,13 @@ the replay rate, replay prebuffer and crop count, then press **Run**. Leave
 Live playback defaults off for throughput. The inferencer treats all bean
 crops selected in the same frame as one GPU batch. Its selectable TensorRT
 backend runs a real shared-weight ResNet18 tower through `layer1` for each view,
-fuses feature maps, and runs the remaining backbone once. Only CamL is
-transported today, so CamL temporarily feeds both inputs and Registry telemetry
-marks the pair incomplete; the mock backend remains available for deterministic
-timing/category tests. The sorter waits for a confirmed trajectory before it
-makes an immutable decision, then applies its configurable policy and sends an
-absolute gate plan to BeanoActuator. BeanoSorter's GUI is primarily a settings
+fuses feature maps, and runs the remaining backbone once. The default paired
+path transports distinct, synchronized CamL and CamR crops with their frame,
+timestamp, projected-centroid and refined-centroid provenance. The mock backend
+remains available for deterministic timing/category tests. The sorter waits for
+a confirmed trajectory before it makes an immutable decision, then applies its
+configurable policy and sends an absolute gate plan to BeanoActuator.
+BeanoSorter's GUI is primarily a settings
 console; its screen gate mirror is an opt-in diagnostic. Hardware gate state is
 visualized by the ESP32 indicator LEDs.
 When no individual gate reaches the configured probability threshold, the

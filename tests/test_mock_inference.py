@@ -19,6 +19,7 @@ from beanoflight.mock_inference import (
 from beanoflight.models import BeanRef
 from beanoflight.registry_models import InferenceJob, InferenceStatus
 from beanoflight.registry_zmq import RegistryRemoteError, RegistryTransportError
+from beanoflight.stereo import StereoPairMetadata
 
 
 class _Session:
@@ -64,6 +65,23 @@ def _payload(sequence: int) -> CropPayload:
         updated_timestamp_ns=100,
     )
     return CropPayload(job, np.zeros((4, 4, 3), dtype=np.uint8))
+
+
+def _stereo_payload(sequence: int) -> CropPayload:
+    payload = _payload(sequence)
+    right = np.full((4, 4, 3), 71, dtype=np.uint8)
+    pair = StereoPairMetadata(
+        20,
+        20,
+        100,
+        100,
+        (400.0, 100.0),
+        (1_020.0, 101.0),
+        (1_017.0, 104.0),
+        5.0,
+        2_200,
+    )
+    return CropPayload(payload.job, payload.image_bgr, None, right, None, pair)
 
 
 class MockInferenceSettingsTests(unittest.TestCase):
@@ -172,6 +190,50 @@ class MockInferenceBatchTests(unittest.TestCase):
         self.assertEqual(batch_activities[0].batch_images, 8)
         self.assertEqual(stats["deadline_misses"], 0)
 
+    def test_genuine_stereo_pair_is_reported_as_two_transported_cameras(self):
+        settings = MockInferenceSettings(
+            latency_ms=0,
+            jitter_ms=0,
+            result_deadline_ms=1_000,
+            tail_probability=0,
+            categories=("mould",),
+            weights=(1.0,),
+        )
+        service = MockInferencerService(settings=settings)
+        self.assertTrue(service._accept_batch((_stereo_payload(1),)))
+
+        with patch(
+            "beanoflight.mock_inference.ZeroMQRegistryClient", _RegistryClient
+        ):
+            worker = threading.Thread(target=service._worker_loop, daemon=True)
+            publisher = threading.Thread(target=service._result_loop, daemon=True)
+            registry_audit = threading.Thread(
+                target=service._registry_result_loop,
+                daemon=True,
+            )
+            worker.start()
+            publisher.start()
+            registry_audit.start()
+            service._queue.join()
+            service._results.join()
+            service._registry_results.join()
+            service._stop.set()
+            worker.join(1.0)
+            publisher.join(1.0)
+            registry_audit.join(1.0)
+
+        completions = [
+            completion
+            for instance in _RegistryClient.instances
+            for completion in instance.completions
+        ]
+        inference = completions[0][2].value["inference"]
+        self.assertTrue(inference["stereo_pair_complete"])
+        self.assertEqual(inference["transported_cameras"], ["CamL", "CamR"])
+        self.assertEqual(inference["transported_views"], 2)
+        self.assertEqual(inference["stereo_pair"]["left_frame_index"], 20)
+        self.assertEqual(service.statistics()["stereo_pairs_received"], 1)
+
     def test_draining_close_waits_for_a_retried_registry_audit(self):
         class InterruptedRegistry(_RegistryClient):
             attempts = 0
@@ -233,6 +295,41 @@ class MockInferenceBatchTests(unittest.TestCase):
         )
         self.assertEqual(service.statistics()["dropped"], 3)
         self.assertEqual(service._queue.qsize(), 0)
+
+    def test_changed_clock_anchor_in_same_epoch_is_rejected(self):
+        service = MockInferencerService(
+            settings=MockInferenceSettings(max_batch_beans=2)
+        )
+        first = _payload(1)
+        first = replace(
+            first,
+            job=replace(
+                first.job,
+                timing_marks_ns={
+                    "run_clock_source_ns": 100,
+                    "run_clock_monotonic_ns": 1_000,
+                    "run_clock_scale_ppb": 1_000_000_000,
+                    "run_clock_epoch": 2,
+                },
+            ),
+        )
+        changed = _payload(2)
+        changed = replace(
+            changed,
+            job=replace(
+                changed.job,
+                timing_marks_ns={
+                    "run_clock_source_ns": 100,
+                    "run_clock_monotonic_ns": 2_000,
+                    "run_clock_scale_ppb": 1_000_000_000,
+                    "run_clock_epoch": 2,
+                },
+            ),
+        )
+
+        self.assertTrue(service._accept_batch((first,)))
+        self.assertFalse(service._accept_batch((changed,)))
+        self.assertEqual(service.statistics()["clock_anchor_mismatches"], 1)
 
     def test_physical_crossing_estimate_sets_batch_priority(self):
         relaxed = _payload(1)
