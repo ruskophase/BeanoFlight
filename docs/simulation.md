@@ -30,7 +30,11 @@ synchronized CamL/CamR mmap RG10 (fast) or CamL calibrated MKV (fallback)
   and can pause polling.
 - `beano-inferencer` (with `beano-mock-inferencer` retained as a compatibility
   name) receives lossless BGR crops, optionally shows the latest crop and
-  activity log, and preserves each source frame's crop group as one GPU batch.
+  activity log, and normally preserves each source frame's crop group as one
+  GPU batch. On a busy frame, the default deadline-aware path may send the one
+  or two earliest co-deadline second samples first, followed immediately by the
+  rest of the frame. This is restricted to frames of at least five beans so the
+  normal GPU batching benefit is retained.
   It can run either the conservative seeded timing model or the local FP16
   TensorRT shared-layer1 stereo ResNet18 engine. Optimized RAW replay transports
   distinct synchronized CamL and CamR crops to the corresponding tower inputs.
@@ -42,6 +46,8 @@ synchronized CamL/CamR mmap RG10 (fast) or CamL calibrated MKV (fallback)
   notifications and the SQLite journal recover a dropped message, sequence gap
   or restart. Direct evidence is admitted ahead of bulk context/recovery work,
   while acknowledgements and bounded retries run outside the inference hot path.
+  Bursts of standalone context are coalesced per bean before processing, so an
+  obsolete position cannot delay its newer replacement.
   It owns classification policy and timing. Recovery starts from the current
   cursor plus live/latest run snapshots;
   it never replays unrelated historical runs. The GUI is a policy/settings

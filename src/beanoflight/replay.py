@@ -26,6 +26,10 @@ from .sorting_context_transport import (
 from .source import ReplaySource, SourceError
 from .telemetry import SystemTelemetrySampler, TimingAccumulator, summarize_samples
 
+DEFAULT_EMERGENCY_MICROBATCH_WINDOW_MS = 35.0
+DEFAULT_DECISION_SAFETY_RESERVE_MS = 17.0
+DEFAULT_EMERGENCY_MICROBATCH_MINIMUM_BEANS = 5
+
 
 @dataclass(frozen=True, slots=True)
 class ReplaySettings:
@@ -39,6 +43,10 @@ class ReplaySettings:
     clock_start_lead_ms: float = 50.0
     maximum_clock_offset_ms: float = 2.0
     suppress_cyclic_gc: bool = True
+    emergency_microbatch_enabled: bool = True
+    emergency_microbatch_window_ms: float = (
+        DEFAULT_EMERGENCY_MICROBATCH_WINDOW_MS
+    )
 
     def validate(self) -> None:
         if not math.isfinite(self.target_fps) or self.target_fps < 0:
@@ -64,6 +72,13 @@ class ReplaySettings:
             or self.maximum_clock_offset_ms <= 0
         ):
             raise ValueError("maximum clock offset must be finite and positive")
+        if (
+            not math.isfinite(self.emergency_microbatch_window_ms)
+            or self.emergency_microbatch_window_ms <= 0
+        ):
+            raise ValueError(
+                "emergency microbatch window must be finite and positive"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +283,14 @@ class CropDispatcher:
         *,
         capacity: int = 16,
         timeout_ms: int = 1_000,
+        emergency_microbatch_enabled: bool = True,
+        emergency_microbatch_window_ms: float = (
+            DEFAULT_EMERGENCY_MICROBATCH_WINDOW_MS
+        ),
+        decision_safety_reserve_ms: float = DEFAULT_DECISION_SAFETY_RESERVE_MS,
+        emergency_microbatch_minimum_beans: int = (
+            DEFAULT_EMERGENCY_MICROBATCH_MINIMUM_BEANS
+        ),
         delivery_result: Callable[[tuple[CropPayload, ...], bool], None]
         | None = None,
     ) -> None:
@@ -275,6 +298,34 @@ class CropDispatcher:
         self.inference_endpoint = inference_endpoint
         self.timeout_ms = timeout_ms
         self.capacity = max(1, capacity)
+        self.emergency_microbatch_enabled = bool(
+            emergency_microbatch_enabled
+        )
+        self.emergency_microbatch_window_ms = float(
+            emergency_microbatch_window_ms
+        )
+        self.decision_safety_reserve_ms = float(decision_safety_reserve_ms)
+        self.emergency_microbatch_minimum_beans = int(
+            emergency_microbatch_minimum_beans
+        )
+        if (
+            not math.isfinite(self.emergency_microbatch_window_ms)
+            or self.emergency_microbatch_window_ms <= 0
+        ):
+            raise ValueError(
+                "emergency microbatch window must be finite and positive"
+            )
+        if (
+            not math.isfinite(self.decision_safety_reserve_ms)
+            or self.decision_safety_reserve_ms < 0
+        ):
+            raise ValueError(
+                "decision safety reserve must be finite and non-negative"
+            )
+        if self.emergency_microbatch_minimum_beans < 2:
+            raise ValueError(
+                "emergency microbatch minimum must be at least two beans"
+            )
         self.delivery_result = delivery_result
         self._items: deque[_FrameDispatch] = deque()
         self._condition = threading.Condition()
@@ -292,6 +343,9 @@ class CropDispatcher:
         self.registry_batches = 0
         self.dispatch_items_coalesced = 0
         self.maximum_dispatch_items_per_batch = 0
+        self.emergency_microbatches = 0
+        self.emergency_microbatch_beans = 0
+        self.emergency_remainder_batches = 0
         self._timings = {
             name: TimingAccumulator()
             for name in (
@@ -381,6 +435,9 @@ class CropDispatcher:
             "maximum_dispatch_items_per_batch": (
                 self.maximum_dispatch_items_per_batch
             ),
+            "emergency_microbatches": self.emergency_microbatches,
+            "emergency_microbatch_beans": self.emergency_microbatch_beans,
+            "emergency_remainder_batches": self.emergency_remainder_batches,
         }
 
     def close(self, *, drain: bool = True) -> None:
@@ -428,6 +485,7 @@ class CropDispatcher:
                     update for item in items for update in item.updates
                 )
                 registered_jobs = ()
+                undelivered_payloads = payloads
                 try:
                     now_ns = time.perf_counter_ns()
                     for item in items:
@@ -448,55 +506,91 @@ class CropDispatcher:
                             self.track_frames_dropped += len(items)
                         continue
 
-                    materialized_items, materialize_ms = _materialize_payloads(
+                    dispatch_groups = _emergency_microbatch_groups(
                         payloads,
                         time.monotonic_ns(),
-                        right_executor=right_materializer,
+                        enabled=self.emergency_microbatch_enabled,
+                        window_ms=self.emergency_microbatch_window_ms,
+                        decision_safety_reserve_ms=(
+                            self.decision_safety_reserve_ms
+                        ),
+                        minimum_frame_beans=(
+                            self.emergency_microbatch_minimum_beans
+                        ),
                     )
-                    inference_send_ns = time.monotonic_ns()
-                    materialized_items = tuple(
-                        payload.with_job(
-                            replace(
-                                payload.job,
-                                timing_marks_ns={
-                                    **payload.job.timing_marks_ns,
-                                    "inference_send_monotonic_ns": inference_send_ns,
-                                },
+                    if len(dispatch_groups) > 1:
+                        self.emergency_microbatches += 1
+                        self.emergency_microbatch_beans += len(
+                            dispatch_groups[0]
+                        )
+                        self.emergency_remainder_batches += 1
+                    pending_updates = all_updates
+                    for group in dispatch_groups:
+                        materialized_items, materialize_ms = (
+                            _materialize_payloads(
+                                group,
+                                time.monotonic_ns(),
+                                right_executor=right_materializer,
                             )
                         )
-                        for payload in materialized_items
-                    )
-                    registered_jobs = tuple(
-                        (payload.job, payload.job.job_id)
-                        for payload in materialized_items
-                    )
-                    # Reserve persistence capacity, then hand the crop to inference
-                    # without waiting for SQLite or a Registry acknowledgement.
-                    if not self._queue_registry(
-                        _RegistryDispatch(all_updates, registered_jobs)
-                    ):
-                        raise RuntimeError("asynchronous Registry queue is full")
-                    send_started = time.perf_counter_ns()
-                    sender.submit_batch(materialized_items)
-                    if self.delivery_result is not None:
-                        self.delivery_result(payloads, True)
-                    send_ms = (
-                        time.perf_counter_ns() - send_started
-                    ) / 1_000_000.0
-                    per_payload = len(materialized_items)
-                    for _payload in materialized_items:
-                        self._timings["materialize_ms"].add(
-                            materialize_ms / per_payload
+                        inference_send_ns = time.monotonic_ns()
+                        materialized_items = tuple(
+                            payload.with_job(
+                                replace(
+                                    payload.job,
+                                    timing_marks_ns={
+                                        **payload.job.timing_marks_ns,
+                                        "inference_send_monotonic_ns": (
+                                            inference_send_ns
+                                        ),
+                                    },
+                                )
+                            )
+                            for payload in materialized_items
                         )
-                        self._timings["materialize_wait_ms"].add(0.0)
-                        self._timings["inference_send_ms"].add(
-                            send_ms / per_payload
+                        registered_jobs = tuple(
+                            (payload.job, payload.job.job_id)
+                            for payload in materialized_items
                         )
+                        # Reserve persistence capacity, then hand the crop to
+                        # inference without waiting for SQLite or its ACK.
+                        if not self._queue_registry(
+                            _RegistryDispatch(pending_updates, registered_jobs)
+                        ):
+                            raise RuntimeError(
+                                "asynchronous Registry queue is full"
+                            )
+                        pending_updates = ()
+                        send_started = time.perf_counter_ns()
+                        sender.submit_batch(materialized_items)
+                        if self.delivery_result is not None:
+                            self.delivery_result(group, True)
+                        delivered_ids = {
+                            payload.job.job_id for payload in group
+                        }
+                        undelivered_payloads = tuple(
+                            payload
+                            for payload in undelivered_payloads
+                            if payload.job.job_id not in delivered_ids
+                        )
+                        registered_jobs = ()
+                        send_ms = (
+                            time.perf_counter_ns() - send_started
+                        ) / 1_000_000.0
+                        per_payload = len(materialized_items)
+                        for _payload in materialized_items:
+                            self._timings["materialize_ms"].add(
+                                materialize_ms / per_payload
+                            )
+                            self._timings["materialize_wait_ms"].add(0.0)
+                            self._timings["inference_send_ms"].add(
+                                send_ms / per_payload
+                            )
                 except Exception as exc:  # noqa: BLE001 - durable failure state
-                    self.dropped += len(payloads)
-                    self.delivery_failures += len(payloads)
-                    if payloads and self.delivery_result is not None:
-                        self.delivery_result(payloads, False)
+                    self.dropped += len(undelivered_payloads)
+                    self.delivery_failures += len(undelivered_payloads)
+                    if undelivered_payloads and self.delivery_result is not None:
+                        self.delivery_result(undelivered_payloads, False)
                     if registered_jobs:
                         self._queue_registry(
                             _RegistryJobFailure(
@@ -600,6 +694,114 @@ class CropDispatcher:
             if item.payloads:
                 break
         return tuple(selected)
+
+
+def _emergency_microbatch_groups(
+    payloads: tuple[CropPayload, ...],
+    now_monotonic_ns: int,
+    *,
+    enabled: bool,
+    window_ms: float,
+    decision_safety_reserve_ms: float,
+    minimum_frame_beans: int = DEFAULT_EMERGENCY_MICROBATCH_MINIMUM_BEANS,
+) -> tuple[tuple[CropPayload, ...], ...]:
+    """Split at most one urgent second-sample cohort from a busy frame."""
+
+    if not enabled or len(payloads) < minimum_frame_beans:
+        return (payloads,)
+    candidates = []
+    for payload in payloads:
+        if _crop_sample_index(payload) != 2:
+            continue
+        marks = payload.job.timing_marks_ns
+        crossing_source_ns = marks.get(
+            "inference_priority_crossing_source_ns"
+        )
+        if crossing_source_ns is None:
+            continue
+        deadline_source_ns = int(crossing_source_ns) - round(
+            decision_safety_reserve_ms * 1_000_000
+        )
+        deadline_monotonic_ns = _job_source_to_monotonic_ns(
+            payload,
+            deadline_source_ns,
+        )
+        if deadline_monotonic_ns is None:
+            continue
+        remaining_ms = (
+            deadline_monotonic_ns - now_monotonic_ns
+        ) / 1_000_000.0
+        if 0 < remaining_ms <= window_ms:
+            candidates.append((deadline_monotonic_ns, payload))
+    if not candidates:
+        return (payloads,)
+    candidates.sort(
+        key=lambda value: (
+            value[0],
+            value[1].job.bean_ref.sequence,
+        )
+    )
+    earliest_deadline_ns = candidates[0][0]
+    urgent_ids = {
+        payload.job.job_id
+        for deadline_ns, payload in candidates[:2]
+        if deadline_ns - earliest_deadline_ns <= 1_000_000
+    }
+    # Two co-arriving beans may share the same physical deadline. Keep that
+    # cohort together, but never let an emergency batch grow into the original
+    # busy frame batch whose latency it is intended to avoid.
+    if len(urgent_ids) >= len(payloads):
+        return (payloads,)
+    urgent = []
+    remainder = []
+    for payload in payloads:
+        marks = payload.job.timing_marks_ns
+        is_urgent = payload.job.job_id in urgent_ids
+        marked = payload.with_job(
+            replace(
+                payload.job,
+                timing_marks_ns={
+                    **marks,
+                    "emergency_microbatch": int(is_urgent),
+                    "emergency_microbatch_remainder": int(not is_urgent),
+                    "emergency_microbatch_triggered_monotonic_ns": (
+                        now_monotonic_ns
+                    ),
+                    "emergency_microbatch_deadline_monotonic_ns": (
+                        earliest_deadline_ns
+                    ),
+                },
+            )
+        )
+        (urgent if is_urgent else remainder).append(marked)
+    return tuple(urgent), tuple(remainder)
+
+
+def _crop_sample_index(payload: CropPayload) -> int:
+    try:
+        return int(payload.job.job_id.rsplit(":", 1)[1]) + 1
+    except (IndexError, ValueError):
+        return 1
+
+
+def _job_source_to_monotonic_ns(
+    payload: CropPayload,
+    source_timestamp_ns: int,
+) -> int | None:
+    marks = payload.job.timing_marks_ns
+    clock_monotonic_ns = int(marks.get("run_clock_monotonic_ns", 0))
+    scale_ppb = int(marks.get("run_clock_scale_ppb", 0))
+    if (
+        clock_monotonic_ns <= 0
+        or scale_ppb <= 0
+        or "run_clock_source_ns" not in marks
+    ):
+        return None
+    return clock_monotonic_ns + round(
+        (source_timestamp_ns - int(marks["run_clock_source_ns"]))
+        * 1_000_000_000
+        / scale_ppb
+    )
 
 
 def _materialize_payloads(

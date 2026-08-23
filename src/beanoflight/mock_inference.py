@@ -283,6 +283,8 @@ class MockInferencerService:
         self.clock_anchor_mismatches = 0
         self.stereo_pairs_received = 0
         self.single_view_samples_received = 0
+        self.emergency_microbatches_received = 0
+        self.emergency_microbatch_beans_received = 0
         self.last_batch_size = 0
         self.max_batch_size = 0
         self.last_batch_latency_ms = 0.0
@@ -373,6 +375,12 @@ class MockInferencerService:
                 "clock_anchor_mismatches": self.clock_anchor_mismatches,
                 "stereo_pairs_received": self.stereo_pairs_received,
                 "single_view_samples_received": self.single_view_samples_received,
+                "emergency_microbatches_received": (
+                    self.emergency_microbatches_received
+                ),
+                "emergency_microbatch_beans_received": (
+                    self.emergency_microbatch_beans_received
+                ),
                 "last_batch_size": self.last_batch_size,
                 "max_batch_size": self.max_batch_size,
                 "last_batch_latency_ms": self.last_batch_latency_ms,
@@ -485,6 +493,17 @@ class MockInferencerService:
         with self._stats_lock:
             self.received += len(payloads)
             self._queued_beans += len(payloads)
+            emergency_count = sum(
+                int(
+                    payload.job.timing_marks_ns.get(
+                        "emergency_microbatch", 0
+                    )
+                )
+                for payload in payloads
+            )
+            if emergency_count:
+                self.emergency_microbatches_received += 1
+                self.emergency_microbatch_beans_received += emergency_count
             if next(iter(pair_states)):
                 self.stereo_pairs_received += len(payloads)
             else:
@@ -897,6 +916,12 @@ class MockInferencerService:
                         "result_deadline_ms": self.settings.result_deadline_ms,
                         "deadline_missed": deadline_missed,
                         "tail_latency": tail,
+                        "emergency_microbatch": bool(
+                            marks.get("emergency_microbatch", 0)
+                        ),
+                        "emergency_microbatch_remainder": bool(
+                            marks.get("emergency_microbatch_remainder", 0)
+                        ),
                         "clock_epoch": int(marks.get("run_clock_epoch", 0)),
                         "clock_consistent": True,
                     },
@@ -1336,11 +1361,15 @@ def _batch_priority_deadline_ns(
 
 def _frame_batch_id(payloads: tuple[CropPayload, ...]) -> str:
     first = payloads[0].job
+    membership = hashlib.sha256(
+        "|".join(payload.job.job_id for payload in payloads).encode()
+    ).hexdigest()[:12]
     return ":".join(
         (
             "frame",
             first.bean_ref.run_id,
             first.camera_id,
             str(first.frame_index),
+            membership,
         )
     )

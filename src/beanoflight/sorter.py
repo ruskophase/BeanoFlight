@@ -250,6 +250,8 @@ class SorterService:
         self.registry_recovery_decisions = 0
         self.context_batches_received = 0
         self.contexts_received = 0
+        self.context_batches_coalesced = 0
+        self.contexts_coalesced = 0
         self.context_cache_hits = 0
         self.context_cache_misses = 0
         self.external_plans_accepted = 0
@@ -352,11 +354,29 @@ class SorterService:
                         contexts.socket in readable
                         or contexts.socket.poll(0, zmq.POLLIN)
                     ):
+                        pending_contexts = []
                         for _index in range(64):
                             if not contexts.socket.poll(0, zmq.POLLIN):
                                 break
+                            pending_contexts.append(contexts.receive_batch())
+                        coalesced_contexts = _latest_only_context_batches(
+                            tuple(pending_contexts)
+                        )
+                        self.context_batches_coalesced += max(
+                            0,
+                            len(pending_contexts) - len(coalesced_contexts),
+                        )
+                        self.contexts_coalesced += max(
+                            0,
+                            sum(len(batch.items) for batch in pending_contexts)
+                            - sum(
+                                len(batch.items)
+                                for batch in coalesced_contexts
+                            ),
+                        )
+                        for context_batch in coalesced_contexts:
                             self._process_sorting_context(
-                                contexts.receive_batch(),
+                                context_batch,
                                 None,
                                 received_monotonic_ns=time.monotonic_ns(),
                             )
@@ -2000,6 +2020,27 @@ def _control_poller(
     if contexts is not None:
         poller.register(contexts.socket, zmq.POLLIN)
     return poller
+
+
+def _latest_only_context_batches(
+    batches: tuple[SortingContextBatch, ...],
+) -> tuple[SortingContextBatch, ...]:
+    """Discard superseded per-bean contexts while preserving source metadata."""
+
+    if len(batches) < 2:
+        return batches
+    seen: set[BeanRef] = set()
+    selected = []
+    for batch in reversed(batches):
+        latest_items = []
+        for item in reversed(batch.items):
+            if item.track.bean_ref in seen:
+                continue
+            seen.add(item.track.bean_ref)
+            latest_items.append(item)
+        if latest_items:
+            selected.append(replace(batch, items=tuple(reversed(latest_items))))
+    return tuple(reversed(selected))
 
 
 def _merge_sorting_context(

@@ -126,7 +126,10 @@ The headless `beano-system-test` requires exactly 3 explicit, visually
 confirmed empty-frame indices and prints a JSON performance summary on
 completion. Add `--optimized-raw` to use the same fast path as the GUI. Add
 `--no-adaptive-edge-resize` for a controlled comparison in which inference is
-deferred until the full requested-size crop fits within the frame.
+deferred until the full requested-size crop fits within the frame. The
+deadline-aware emergency microbatch path is enabled by default; add
+`--no-emergency-microbatch` for a controlled A/B run which retains each busy
+frame as one inference batch.
 
 Every completed session stores its achieved FPS, source-read and analysis
 stage distributions, Registry/SQLite operation timings, crop-dispatch queue
@@ -145,6 +148,12 @@ and the sorter recovers it from Registry notifications after a short preference
 interval. Each crop also carries its exact track/prediction context through the
 inferencer to the sorter, avoiding a cross-socket join on the critical path; the
 standalone context stream remains available for later trajectory refinements.
+When a busy frame's second-sample batch approaches its actuation deadline,
+BeanoFlight sends the one or two earliest co-deadline beans first and then sends
+the remainder. This is deliberately limited to frames containing at least five
+beans so normal GPU batching is preserved. BeanoSorter also discards superseded
+standalone context items while draining a burst; embedded evidence remains
+authoritative for the time-critical decision.
 The Beano Inferencer and BeanoSorter status panels show direct sent/received and
 context cache counts; the timing ledger labels trajectory delivery as
 `embedded-evidence`, `direct`, or `registry`.

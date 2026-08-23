@@ -13,6 +13,7 @@ from beanoflight.mock_inference import (
     _batch_priority_deadline_ns,
     _complete_inference_batch,
     _complete_inference_batch_with_registration_retry,
+    _frame_batch_id,
     _registry_capabilities,
     _stable_job_key,
 )
@@ -85,6 +86,15 @@ def _stereo_payload(sequence: int) -> CropPayload:
 
 
 class MockInferenceSettingsTests(unittest.TestCase):
+    def test_split_frame_batches_have_distinct_direct_delivery_ids(self):
+        first = _payload(1)
+        second = _payload(2)
+
+        self.assertNotEqual(
+            _frame_batch_id((first,)),
+            _frame_batch_id((second,)),
+        )
+
     def test_classification_seed_key_is_stable_across_run_and_crop_frame(self):
         first = _payload(3).job
         second = replace(

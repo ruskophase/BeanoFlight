@@ -30,6 +30,7 @@ from beanoflight.sorter import (
     SorterService,
     SorterSettings,
     _actuation_timing_result,
+    _latest_only_context_batches,
     _pending_actuation,
     _select_gate_indices,
 )
@@ -38,6 +39,46 @@ from beanoflight.timing_ledger import bean_timing_ledger
 
 
 class SorterTimingTests(unittest.TestCase):
+    def test_context_burst_retains_only_latest_item_per_bean(self):
+        first_ref = BeanRef("context-coalesce-run", 1)
+        second_ref = BeanRef("context-coalesce-run", 2)
+        first_old = track(first_ref, 0, 100, -25.0)
+        first_new = track(first_ref, 1, 200, -10.0)
+        second = track(second_ref, 0, 100, -25.0)
+        batches = (
+            SortingContextBatch(
+                first_ref.run_id,
+                0,
+                60.0,
+                60.0,
+                0,
+                1_000,
+                2,
+                2_000,
+                (SortingContext(first_old, None), SortingContext(second, None)),
+            ),
+            SortingContextBatch(
+                first_ref.run_id,
+                1,
+                60.0,
+                60.0,
+                0,
+                1_000,
+                2,
+                3_000,
+                (SortingContext(first_new, None),),
+            ),
+        )
+
+        coalesced = _latest_only_context_batches(batches)
+
+        self.assertEqual(len(coalesced), 2)
+        self.assertEqual(
+            tuple(item.track.bean_ref for item in coalesced[0].items),
+            (second_ref,),
+        )
+        self.assertEqual(coalesced[1].items[0].track, first_new)
+
     def test_direct_evidence_can_decide_from_its_embedded_context(self):
         registry = BeanRegistry()
         bean_ref = BeanRef("embedded-context-run", 1)

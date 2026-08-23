@@ -124,6 +124,14 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--no-crops", action="store_true")
     result.add_argument(
+        "--no-emergency-microbatch",
+        action="store_true",
+        help=(
+            "keep every busy source frame as one inference batch instead of "
+            "advancing a deadline-critical second sample"
+        ),
+    )
+    result.add_argument(
         "--single-view-inference",
         action="store_true",
         help=(
@@ -234,7 +242,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 deferred_extractor=deferred_crop_extractor,
                 stereo_extractor=stereo_crop_extractor,
             )
-            dispatcher = CropDispatcher(arguments.registry, arguments.crops)
+            dispatcher = CropDispatcher(
+                arguments.registry,
+                arguments.crops,
+                emergency_microbatch_enabled=(
+                    not arguments.no_emergency_microbatch
+                ),
+            )
         runner = ReplayRunner(
             source,
             engine,
@@ -248,6 +262,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 maximum_frame_age_ms=arguments.maximum_frame_age_ms,
                 clock_start_lead_ms=arguments.clock_start_lead_ms,
                 maximum_clock_offset_ms=arguments.maximum_clock_offset_ms,
+                emergency_microbatch_enabled=(
+                    not arguments.no_emergency_microbatch
+                ),
             ),
             crop_selector=selector,
             crop_dispatcher=dispatcher,
@@ -258,6 +275,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "crops_enabled": not arguments.no_crops,
                 "stereo_crops": stereo_crop_extractor is not None,
                 "adaptive_edge_resize": not arguments.no_adaptive_edge_resize,
+                "emergency_microbatch": (
+                    not arguments.no_emergency_microbatch
+                ),
                 "crop_processing": (
                     arguments.crop_processing
                     if arguments.optimized_raw

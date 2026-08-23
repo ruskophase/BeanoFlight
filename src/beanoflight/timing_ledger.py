@@ -249,6 +249,9 @@ def bean_timing_ledger(record: BeanRecord) -> dict[str, object]:
             ]
         ),
         "resized_crop": False if job is None else job.resized,
+        "emergency_microbatch": bool(
+            marks.get("emergency_microbatch", 0)
+        ),
         "classification": _classification_details(classification),
         "classification_delivery": (
             "direct"
@@ -317,6 +320,9 @@ def summarize_timing_ledgers(
         "schema": "beanoflight-timing-ledger/v1",
         "beans": len(ledgers),
         "resized_crops": sum(bool(item["resized_crop"]) for item in ledgers),
+        "emergency_microbatch_decisions": sum(
+            bool(item["emergency_microbatch"]) for item in ledgers
+        ),
         "results": {
             name: sum(item["result"] == name for item in ledgers)
             for name in (

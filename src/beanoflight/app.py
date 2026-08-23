@@ -335,6 +335,7 @@ class BeanoFlightApp(tk.Tk):
         self.crop_size_var = tk.StringVar(value="224")
         self.crops_per_bean_var = tk.StringVar(value="2")
         self.adaptive_edge_resize_var = tk.BooleanVar(value=True)
+        self.emergency_microbatch_var = tk.BooleanVar(value=True)
         self.drop_stale_frames_var = tk.BooleanVar(value=True)
         self.maximum_frame_age_var = tk.StringVar(value="30")
         self.background_frames_var = tk.StringVar(
@@ -871,6 +872,11 @@ class BeanoFlightApp(tk.Tk):
         ).grid(row=10, column=0, columnspan=2, sticky=tk.W, pady=5)
         ttk.Checkbutton(
             parent,
+            text="Advance deadline-critical second inference",
+            variable=self.emergency_microbatch_var,
+        ).grid(row=17, column=0, columnspan=2, sticky=tk.W, pady=5)
+        ttk.Checkbutton(
+            parent,
             text="Drop stale replay frames (live-stream behaviour)",
             variable=self.drop_stale_frames_var,
         ).grid(row=11, column=0, columnspan=2, sticky=tk.W, pady=5)
@@ -1311,6 +1317,9 @@ class BeanoFlightApp(tk.Tk):
                 maximum_frames=int(self.maximum_frames_var.get()),
                 drop_stale_frames=self.drop_stale_frames_var.get(),
                 maximum_frame_age_ms=float(self.maximum_frame_age_var.get()),
+                emergency_microbatch_enabled=(
+                    self.emergency_microbatch_var.get()
+                ),
             )
             replay_settings.validate()
         except ValueError as exc:
@@ -1406,6 +1415,9 @@ class BeanoFlightApp(tk.Tk):
                     registry_endpoint,
                     inference_endpoint,
                     capacity=replay_settings.crop_queue_capacity,
+                    emergency_microbatch_enabled=(
+                        replay_settings.emergency_microbatch_enabled
+                    ),
                 )
                 runner = ReplayRunner(
                     source,
@@ -1423,6 +1435,9 @@ class BeanoFlightApp(tk.Tk):
                         ),
                         "launcher_performance_mode": self.performance_mode,
                         "live_playback": replay_settings.preview_enabled,
+                        "emergency_microbatch": (
+                            replay_settings.emergency_microbatch_enabled
+                        ),
                         "crop_processing": (
                             source.crop_processing_profile
                             if isinstance(source, MMapRawVideoSource)

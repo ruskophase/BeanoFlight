@@ -256,6 +256,7 @@ class SorterApp(tk.Tk):
                 f"direct queue rejects {service.direct_batches_rejected} · "
                 f"context hits {service.context_cache_hits} · "
                 f"context misses {service.context_cache_misses} · "
+                f"contexts coalesced {service.contexts_coalesced} · "
                 f"Registry recoveries {service.registry_recovery_decisions} · "
                 f"ESP32 plans {service.external_plans_accepted}/"
                 f"{service.external_plans_rejected} · "

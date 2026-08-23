@@ -129,13 +129,14 @@ stream sequence, so a critical consumer uses `events_since(cursor)` to recover
 any gap before proceeding.
 
 The normal classification control path is a dedicated acknowledged ZeroMQ
-REQ/REP socket from the inferencer to the single sorter. One bounded message represents the GPU
-batch and carries inference-job metadata, class probabilities and logits only.
-Before dispatching crops, BeanoFlight sends the current tracks, predictions and
-replay-clock anchor over a second bounded PUSH/PULL socket. The sorter joins the
-two compact messages from local caches and can plan a valve before the
-inferencer's separate Registry commit finishes. Their independent sockets may
-arrive in either order, so evidence waits briefly for its matching context;
+REQ/REP socket from the inferencer to the single sorter. One bounded message
+represents the GPU batch and carries inference-job metadata, class
+probabilities, logits and the exact trajectory context captured with each crop.
+Before dispatching crops, BeanoFlight also sends current tracks, predictions
+and replay-clock anchors over a second bounded PUSH/PULL socket. This
+best-effort stream can refine later trajectory state, but the sorter no longer
+has to join independent sockets before making the time-critical decision.
+Superseded standalone context is coalesced per bean while a burst is drained.
 Registry notifications remain the loss-recovery path. Routine Registry
 lifecycle notifications are header-only to avoid duplicating full records at
 frame rate. Inference jobs and sorting decisions persist their source-clock and

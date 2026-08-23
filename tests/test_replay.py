@@ -15,6 +15,7 @@ from beanoflight.replay import (
     DecodedFrameBuffer,
     ReplayRunner,
     ReplaySettings,
+    _emergency_microbatch_groups,
 )
 from beanoflight.source import SourceError, SourceMetadata
 
@@ -117,6 +118,101 @@ class SlowStartingDispatcher:
 
 
 class ReplayBufferTests(unittest.TestCase):
+    def test_deadline_critical_second_samples_form_one_bounded_microbatch(self):
+        now_ns = 1_000_000_000
+        payloads = []
+        for sequence, deadline_offset_ms in (
+            (1, 20),
+            (2, 20.5),
+            (3, 26),
+            (4, 27),
+            (5, 28),
+        ):
+            job = InferenceJob(
+                f"infer:urgent-run:{sequence}:CamL:10:1",
+                BeanRef("urgent-run", sequence),
+                InferenceStatus.SUBMITTED,
+                "CamL",
+                10,
+                100,
+                1,
+                4,
+                4,
+                False,
+                100,
+                100,
+                timing_marks_ns={
+                    "run_clock_source_ns": 0,
+                    "run_clock_monotonic_ns": now_ns,
+                    "run_clock_scale_ppb": 1_000_000_000,
+                    "inference_priority_crossing_source_ns": round(
+                        (deadline_offset_ms + 17) * 1_000_000
+                    ),
+                },
+            )
+            payloads.append(
+                CropPayload(job, np.zeros((4, 4, 3), dtype=np.uint8))
+            )
+
+        groups = _emergency_microbatch_groups(
+            tuple(payloads),
+            now_ns,
+            enabled=True,
+            window_ms=35,
+            decision_safety_reserve_ms=17,
+        )
+
+        self.assertEqual(tuple(len(group) for group in groups), (2, 3))
+        self.assertEqual(
+            [item.job.bean_ref.sequence for item in groups[0]], [1, 2]
+        )
+        self.assertTrue(
+            all(
+                item.job.timing_marks_ns["emergency_microbatch"] == 1
+                for item in groups[0]
+            )
+        )
+        self.assertEqual(
+            groups[1][0].job.timing_marks_ns[
+                "emergency_microbatch_remainder"
+            ],
+            1,
+        )
+
+    def test_emergency_microbatch_can_be_disabled_for_ab_testing(self):
+        job = InferenceJob(
+            "infer:disabled-run:1:CamL:10:1",
+            BeanRef("disabled-run", 1),
+            InferenceStatus.SUBMITTED,
+            "CamL",
+            10,
+            100,
+            1,
+            4,
+            4,
+            False,
+            100,
+            100,
+        )
+        payloads = (
+            CropPayload(job, np.zeros((4, 4, 3), dtype=np.uint8)),
+            CropPayload(
+                replace(job, job_id="infer:disabled-run:2:CamL:10:1"),
+                np.zeros((4, 4, 3), dtype=np.uint8),
+            ),
+        )
+
+        groups = _emergency_microbatch_groups(
+            payloads,
+            1_000_000_000,
+            enabled=False,
+            window_ms=35,
+            decision_safety_reserve_ms=17,
+            minimum_frame_beans=2,
+        )
+
+        self.assertEqual(groups, (payloads,))
+
     def test_dispatcher_coalesces_track_only_backlog_through_urgent_crop(self):
         dispatcher = CropDispatcher("inproc://registry", "inproc://crops")
         for frame_index in range(3):
