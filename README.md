@@ -196,6 +196,9 @@ outcomes. See [simulation.md](docs/simulation.md#repeatable-performance-matrix)
 for the reference command and current results. Pass
 `--no-adaptive-edge-resize` to reproduce the BeanoFlight simulation
 checkbox-off crop policy while holding the other benchmark settings fixed.
+The benchmark also applies process-wide CPU roles, gives direct inference
+evidence a dedicated IPC I/O context and defers BeanoSorter's cyclic garbage
+collection until shutdown.
 Pass `--esp32-actuator` to include the connected indicator board and require
 observed hardware cycles in the acceptance result.
 

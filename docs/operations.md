@@ -154,6 +154,13 @@ the remainder. This is deliberately limited to frames containing at least five
 beans so normal GPU batching is preserved. BeanoSorter also discards superseded
 standalone context items while draining a burst; embedded evidence remains
 authoritative for the time-critical decision.
+Performance mode applies CPU affinity to every extant native thread, including
+threads created during CUDA, OpenCV and ZeroMQ import—not only the process
+leader. Direct inference evidence uses dedicated ZeroMQ I/O contexts so bulk
+Registry, crop and trajectory traffic cannot block its native I/O queue.
+BeanoSorter also defers cyclic garbage collection while its latency-critical
+service is running; normal reference counting remains active and cyclic
+collection is restored when the service stops.
 The Beano Inferencer and BeanoSorter status panels show direct sent/received and
 context cache counts; the timing ledger labels trajectory delivery as
 `embedded-evidence`, `direct`, or `registry`.

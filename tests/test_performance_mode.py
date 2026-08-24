@@ -29,7 +29,11 @@ class PerformanceModeTests(unittest.TestCase):
         )
         self.assertEqual(
             performance_mode_arguments("sorter", True),
-            ("--no-gate-animation", "--no-activity-log"),
+            (
+                "--no-gate-animation",
+                "--no-activity-log",
+                "--suppress-cyclic-gc",
+            ),
         )
         self.assertEqual(
             performance_mode_arguments("flight", True), ("--performance-mode",)
@@ -63,10 +67,15 @@ class PerformanceModeTests(unittest.TestCase):
         )
 
         sorter = sorter_parser().parse_args(
-            ["--no-gate-animation", "--no-activity-log"]
+            [
+                "--no-gate-animation",
+                "--no-activity-log",
+                "--suppress-cyclic-gc",
+            ]
         )
         self.assertTrue(sorter.no_gate_animation)
         self.assertTrue(sorter.no_activity_log)
+        self.assertTrue(sorter.suppress_cyclic_gc)
         self.assertTrue(
             flight_parser().parse_args(["--performance-mode"]).performance_mode
         )

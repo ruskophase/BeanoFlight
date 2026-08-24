@@ -46,6 +46,9 @@ synchronized CamL/CamR mmap RG10 (fast) or CamL calibrated MKV (fallback)
   notifications and the SQLite journal recover a dropped message, sequence gap
   or restart. Direct evidence is admitted ahead of bulk context/recovery work,
   while acknowledgements and bounded retries run outside the inference hot path.
+  In performance mode, direct evidence owns separate native ZeroMQ I/O contexts
+  and cyclic collection is deferred for the lifetime of the sorter service.
+  Reference counting remains active and cyclic collection is restored on stop.
   Bursts of standalone context are coalesced per bean before processing, so an
   obsolete position cannot delay its newer replacement.
   It owns classification policy and timing. Recovery starts from the current

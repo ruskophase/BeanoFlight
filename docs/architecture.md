@@ -129,8 +129,10 @@ stream sequence, so a critical consumer uses `events_since(cursor)` to recover
 any gap before proceeding.
 
 The normal classification control path is a dedicated acknowledged ZeroMQ
-REQ/REP socket from the inferencer to the single sorter. One bounded message
-represents the GPU batch and carries inference-job metadata, class
+PUSH/PULL data socket plus a separate acknowledgement socket from the
+inferencer to the single sorter. Its independently owned native I/O contexts
+prevent bulk sockets in either process from causing queue head-of-line
+blocking. One bounded message represents the GPU batch and carries inference-job metadata, class
 probabilities, logits and the exact trajectory context captured with each crop.
 Before dispatching crops, BeanoFlight also sends current tracks, predictions
 and replay-clock anchors over a second bounded PUSH/PULL socket. This

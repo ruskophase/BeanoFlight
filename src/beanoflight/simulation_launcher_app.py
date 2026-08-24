@@ -39,7 +39,11 @@ PERFORMANCE_MODE_ARGUMENTS = {
     "monitor": ("--no-live-updates",),
     "inferencer": ("--no-crop-preview", "--no-activity-log"),
     "actuator": ("--no-activity-log",),
-    "sorter": ("--no-gate-animation", "--no-activity-log"),
+    "sorter": (
+        "--no-gate-animation",
+        "--no-activity-log",
+        "--suppress-cyclic-gc",
+    ),
     "flight": ("--performance-mode",),
 }
 

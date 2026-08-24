@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import math
 import queue
 import threading
@@ -189,6 +190,7 @@ class SorterService:
         sorting_context_endpoint: str = DEFAULT_SORTING_CONTEXT_ENDPOINT,
         actuation_endpoint: str = "",
         settings: SorterSettings | None = None,
+        suppress_cyclic_gc: bool = False,
         activity: Callable[[SorterActivity], None] | None = None,
     ) -> None:
         self.registry_endpoint = registry_endpoint
@@ -198,6 +200,8 @@ class SorterService:
         self.actuation_endpoint = actuation_endpoint
         self.settings = settings or SorterSettings()
         self.settings.validate()
+        self.suppress_cyclic_gc = bool(suppress_cyclic_gc)
+        self._restore_cyclic_gc = False
         self.activity = activity
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -269,6 +273,13 @@ class SorterService:
     def start(self) -> None:
         if self._threads:
             return
+        if self.suppress_cyclic_gc and gc.isenabled():
+            # The sorter creates no intentional reference cycles on its hot
+            # path. Reference counting remains active; only unpredictable
+            # stop-the-world cyclic collections are deferred until shutdown.
+            gc.collect()
+            gc.disable()
+            self._restore_cyclic_gc = True
         workers = []
         if self.classification_endpoint:
             workers.append(
@@ -305,6 +316,9 @@ class SorterService:
         for thread in self._threads:
             thread.join(2.0)
         self._threads.clear()
+        if self._restore_cyclic_gc:
+            gc.enable()
+            self._restore_cyclic_gc = False
 
     def _decision_loop(self) -> None:
         contexts = None

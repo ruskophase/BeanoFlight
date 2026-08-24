@@ -31,18 +31,57 @@ def performance_cpu_set(
 
 
 def apply_performance_affinity(role: str, *, pid: int = 0) -> frozenset[int]:
-    """Apply the role's CPU set, returning an empty set when unsupported."""
+    """Apply the role's CPU set to every extant thread in a process.
+
+    Linux affinity is a per-thread property even when ``pid`` names a process
+    leader.  Python, OpenCV, CUDA and ZeroMQ may create native threads while
+    modules are imported, before the performance role is applied.  Pinning the
+    leader alone therefore lets those threads continue to execute on CPUs
+    reserved for the sorter or actuator.
+    """
 
     if not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
         return frozenset()
     cpus = performance_cpu_set(role)
     if not cpus:
         return cpus
-    try:
-        os.sched_setaffinity(pid, cpus)
-    except OSError:
-        return frozenset()
+    process_id = os.getpid() if pid == 0 else int(pid)
+    applied: set[int] = set()
+    # A second sweep closes the small race in which an existing native thread
+    # creates another thread while the first sweep is in progress.  Threads
+    # created after their parent is pinned inherit the corrected mask.
+    for _sweep in range(2):
+        task_ids = _process_task_ids(process_id)
+        for task_id in task_ids:
+            if task_id in applied:
+                continue
+            try:
+                os.sched_setaffinity(task_id, cpus)
+            except ProcessLookupError:
+                continue
+            except OSError:
+                return frozenset()
+            applied.add(task_id)
+        if set(_process_task_ids(process_id)).issubset(applied):
+            break
     return cpus
+
+
+def _process_task_ids(process_id: int) -> tuple[int, ...]:
+    """Return Linux thread IDs, falling back to the process leader."""
+
+    try:
+        with os.scandir(f"/proc/{process_id}/task") as entries:
+            task_ids = tuple(
+                sorted(
+                    int(entry.name)
+                    for entry in entries
+                    if entry.name.isdigit()
+                )
+            )
+    except OSError:
+        return (process_id,)
+    return task_ids or (process_id,)
 
 
 def apply_latency_thread_profile(*, switch_interval_ms: float = 1.0) -> float:

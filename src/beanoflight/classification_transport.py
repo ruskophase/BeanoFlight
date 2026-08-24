@@ -151,7 +151,10 @@ class ZeroMQDirectEvidencePublisher:
         acknowledgement_endpoint: str | None = None,
     ) -> None:
         self.endpoint = endpoint
-        self.context = context or zmq.Context.instance()
+        self.context, self._owns_context = _direct_transport_context(
+            endpoint,
+            context,
+        )
         self.capacity = max(1, int(capacity))
         self.acknowledgement_timeout_ms = max(
             1, int(acknowledgement_timeout_ms)
@@ -234,6 +237,8 @@ class ZeroMQDirectEvidencePublisher:
         self._worker.join(2.0)
         os.close(self._wake_read_fd)
         os.close(self._wake_write_fd)
+        if self._owns_context:
+            self.context.destroy(linger=0)
 
     def _wake_worker(self) -> None:
         try:
@@ -405,7 +410,10 @@ class ZeroMQDirectEvidenceReceiver:
         acknowledgement_endpoint: str | None = None,
     ) -> None:
         self.endpoint = endpoint
-        self.context = context or zmq.Context.instance()
+        self.context, self._owns_context = _direct_transport_context(
+            endpoint,
+            context,
+        )
         self.acknowledgement_endpoint = (
             acknowledgement_endpoint or _derived_acknowledgement_endpoint(endpoint)
         )
@@ -528,6 +536,8 @@ class ZeroMQDirectEvidenceReceiver:
     def close(self) -> None:
         self.socket.close(0)
         self.acknowledgements.close(0)
+        if self._owns_context:
+            self.context.destroy(linger=0)
 
 
 def _encode(value: object) -> bytes:
@@ -562,6 +572,25 @@ def _derived_acknowledgement_endpoint(endpoint: str) -> str:
         "a separate acknowledgement endpoint is required for non-local "
         "direct evidence transport"
     )
+
+
+def _direct_transport_context(
+    endpoint: str,
+    context: zmq.Context | None,
+) -> tuple[zmq.Context, bool]:
+    """Give IPC evidence its own native I/O worker instead of bulk traffic's.
+
+    An in-process endpoint must share its caller's singleton context.  IPC and
+    explicitly addressed network transports can use an independently owned
+    context, preventing Registry, crop and trajectory sockets from creating
+    head-of-line blocking in the direct evidence I/O worker.
+    """
+
+    if context is not None:
+        return context, False
+    if endpoint.startswith("inproc://"):
+        return zmq.Context.instance(), False
+    return zmq.Context(io_threads=1), True
 
 
 def _next_delivery_timeout_ms(

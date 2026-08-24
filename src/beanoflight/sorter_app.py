@@ -27,6 +27,7 @@ class SorterApp(tk.Tk):
         actuation_endpoint: str = "",
         animate_gates: bool = False,
         show_activity: bool = False,
+        suppress_cyclic_gc: bool = False,
     ) -> None:
         super().__init__(className="Beano Sorter")
         self.title("BeanoSorter — Policy and Scheduling")
@@ -39,6 +40,7 @@ class SorterApp(tk.Tk):
         self.classification_endpoint = classification_endpoint
         self.sorting_context_endpoint = sorting_context_endpoint
         self.actuation_endpoint = actuation_endpoint
+        self.suppress_cyclic_gc = bool(suppress_cyclic_gc)
         self.service: SorterService | None = None
         self._activities: queue.Queue[SorterActivity] = queue.Queue(maxsize=256)
         self._gate_items: dict[int, int] = {}
@@ -160,12 +162,14 @@ class SorterApp(tk.Tk):
             sorting_context_endpoint=self.sorting_context_endpoint,
             actuation_endpoint=self.actuation_endpoint,
             settings=settings,
+            suppress_cyclic_gc=self.suppress_cyclic_gc,
             activity=self._post_activity,
         )
         self.service.start()
         self.status_var.set(
             f"Running · direct results {self.classification_endpoint} · "
             f"contexts {self.sorting_context_endpoint} · "
+            + ("cyclic GC deferred · " if self.suppress_cyclic_gc else "")
             + (
                 f"ESP32 plans {self.actuation_endpoint}"
                 if self.actuation_endpoint
@@ -342,6 +346,11 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="compatibility flag: keep sorter activity rendering disabled",
     )
+    result.add_argument(
+        "--suppress-cyclic-gc",
+        action="store_true",
+        help="defer cyclic garbage collection during latency-critical sorting",
+    )
     return result
 
 
@@ -358,6 +367,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             arguments.gate_animation and not arguments.no_gate_animation
         ),
         show_activity=arguments.activity_log and not arguments.no_activity_log,
+        suppress_cyclic_gc=arguments.suppress_cyclic_gc,
     ).mainloop()
 
 

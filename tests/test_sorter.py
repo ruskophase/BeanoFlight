@@ -1,6 +1,7 @@
 import time
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 from test_registry import track
 
@@ -39,6 +40,27 @@ from beanoflight.timing_ledger import bean_timing_ledger
 
 
 class SorterTimingTests(unittest.TestCase):
+    def test_performance_service_restores_cyclic_gc_on_close(self):
+        service = SorterService(
+            classification_endpoint="",
+            sorting_context_endpoint="",
+            suppress_cyclic_gc=True,
+        )
+        with (
+            patch("beanoflight.sorter.gc.isenabled", return_value=True),
+            patch("beanoflight.sorter.gc.collect") as collect,
+            patch("beanoflight.sorter.gc.disable") as disable,
+            patch("beanoflight.sorter.gc.enable") as enable,
+            patch("beanoflight.sorter.threading.Thread.start"),
+            patch("beanoflight.sorter.threading.Thread.join"),
+        ):
+            service.start()
+            service.close()
+
+        collect.assert_called_once_with()
+        disable.assert_called_once_with()
+        enable.assert_called_once_with()
+
     def test_context_burst_retains_only_latest_item_per_bean(self):
         first_ref = BeanRef("context-coalesce-run", 1)
         second_ref = BeanRef("context-coalesce-run", 2)

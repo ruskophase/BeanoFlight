@@ -286,6 +286,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "adaptive_edge_resize": not arguments.no_adaptive_edge_resize,
             "genuine_stereo_crops": not arguments.single_view_inference,
             "emergency_microbatch": not arguments.no_emergency_microbatch,
+            "direct_evidence_dedicated_io": True,
+            "sorter_cyclic_gc_suppressed": True,
+            "process_wide_performance_affinity": True,
             "inference_backend": arguments.inference_backend,
             "inference_engine": str(arguments.inference_engine.resolve()),
             "esp32_actuator": bool(arguments.esp32_actuator),
@@ -369,6 +372,7 @@ def _run_sorter(
         classification_endpoint=classifications,
         sorting_context_endpoint=sorting_contexts,
         actuation_endpoint=actuation_plans,
+        suppress_cyclic_gc=True,
         activity=None,
     )
     service.start()

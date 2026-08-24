@@ -59,6 +59,19 @@ def direct_item() -> DirectInferenceEvidence:
 
 
 class DirectClassificationTransportTests(unittest.TestCase):
+    def test_ipc_transport_owns_dedicated_io_contexts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            endpoint = f"ipc://{Path(temporary) / 'dedicated.sock'}"
+            receiver = ZeroMQDirectEvidenceReceiver(endpoint)
+            publisher = ZeroMQDirectEvidencePublisher(endpoint)
+
+            self.assertTrue(receiver._owns_context)
+            self.assertTrue(publisher._owns_context)
+            self.assertIsNot(receiver.context, publisher.context)
+
+            publisher.close()
+            receiver.close()
+
     def test_probability_evidence_batch_round_trips_without_images(self):
         with tempfile.TemporaryDirectory() as temporary:
             endpoint = f"ipc://{Path(temporary) / 'evidence.sock'}"
