@@ -169,7 +169,7 @@ class SorterApp(tk.Tk):
         self.status_var.set(
             f"Running · direct results {self.classification_endpoint} · "
             f"contexts {self.sorting_context_endpoint} · "
-            + ("cyclic GC deferred · " if self.suppress_cyclic_gc else "")
+            + ("deadline-aware GC · " if self.suppress_cyclic_gc else "")
             + (
                 f"ESP32 plans {self.actuation_endpoint}"
                 if self.actuation_endpoint
@@ -252,6 +252,21 @@ class SorterApp(tk.Tk):
         service = self.service
         if service is not None:
             self._update_gate_states(service.gate_states)
+            gc_stats = service.garbage_collection_statistics()
+            gc_detail = (
+                " · GC "
+                f"{gc_stats['generation0_collections']}/"
+                f"{gc_stats['generation1_collections']}/"
+                f"{gc_stats['full_collections']} · "
+                f"RSS {float(gc_stats['current_rss_mib']):.0f} MiB"
+                + (
+                    " · FEEDER SLOWDOWN REQUESTED"
+                    if gc_stats["feeder_slowdown_requested"]
+                    else ""
+                )
+                if self.suppress_cyclic_gc
+                else ""
+            )
             self.counts_var.set(
                 f"decisions {service.decisions} · actuations {service.actuations} · "
                 f"pools {service.pooled_classifications} · "
@@ -266,6 +281,7 @@ class SorterApp(tk.Tk):
                 f"{service.external_plans_rejected} · "
                 f"low-confidence defects {service.low_confidence_defects} · "
                 f"errors {service.errors}"
+                f"{gc_detail}"
             )
         delay_ms = (
             50
@@ -349,7 +365,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--suppress-cyclic-gc",
         action="store_true",
-        help="defer cyclic garbage collection during latency-critical sorting",
+        help="run cyclic garbage collection only in deadline-safe windows",
     )
     return result
 

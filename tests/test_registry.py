@@ -517,6 +517,38 @@ class BeanRegistryTests(unittest.TestCase):
 
 
 class SQLiteRegistryTests(unittest.TestCase):
+    def test_per_bean_result_queries_have_cumulative_run_indexes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "indexed.db"
+            with SQLiteBeanRepository(path):
+                pass
+            with sqlite3.connect(path) as connection:
+                decision_plan = tuple(
+                    row[3]
+                    for row in connection.execute(
+                        "EXPLAIN QUERY PLAN SELECT * FROM sorting_decisions "
+                        "WHERE run_id=? AND sequence=? "
+                        "ORDER BY registry_revision DESC LIMIT 1",
+                        ("run", 1),
+                    )
+                )
+                actuation_plan = tuple(
+                    row[3]
+                    for row in connection.execute(
+                        "EXPLAIN QUERY PLAN SELECT * FROM actuation_results "
+                        "WHERE run_id=? AND sequence=? "
+                        "ORDER BY registry_revision DESC LIMIT 1",
+                        ("run", 1),
+                    )
+                )
+
+        self.assertTrue(
+            any("sorting_decisions_bean_revision_index" in row for row in decision_plan)
+        )
+        self.assertTrue(
+            any("actuation_results_bean_revision_index" in row for row in actuation_plan)
+        )
+
     def test_track_persistence_does_not_replace_session_wall_clock(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "beanoflight.db"

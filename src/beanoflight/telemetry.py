@@ -8,7 +8,7 @@ import resource
 import threading
 import time
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 
@@ -52,21 +52,55 @@ class TimingAccumulator:
             self._values.clear()
 
 
+def current_rss_mib(pid: int = 0) -> float:
+    """Read current resident memory without allocating a process snapshot."""
+
+    target_pid = os.getpid() if pid <= 0 else int(pid)
+    try:
+        fields = Path(f"/proc/{target_pid}/statm").read_text(
+            encoding="ascii"
+        ).split()
+        resident_pages = int(fields[1])
+        return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024.0 * 1024.0)
+    except (IndexError, OSError, TypeError, ValueError):
+        return 0.0
+
+
 class SystemTelemetrySampler:
     """Sample portable load plus available Linux thermal and CPU-frequency data."""
 
-    def __init__(self, interval_seconds: float = 0.5) -> None:
+    def __init__(
+        self,
+        interval_seconds: float = 0.5,
+        *,
+        watched_pids: Mapping[str, int] | None = None,
+        maximum_temperature_c: float | None = None,
+    ) -> None:
         self.interval_seconds = max(0.1, float(interval_seconds))
+        self.watched_pids = {
+            str(name): int(pid)
+            for name, pid in (watched_pids or {}).items()
+            if int(pid) > 0
+        }
+        self.maximum_temperature_c = (
+            None
+            if maximum_temperature_c is None
+            else float(maximum_temperature_c)
+        )
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._samples: list[dict[str, object]] = []
+        self._lock = threading.Lock()
         self._start_usage = None
+        self.thermal_abort = threading.Event()
+        self.thermal_abort_detail = ""
+        self.latest_max_temperature_c = 0.0
 
     def start(self) -> None:
         if self._thread is not None:
             return
         self._start_usage = resource.getrusage(resource.RUSAGE_SELF)
-        self._samples.append(_system_sample())
+        self._capture_sample()
         self._thread = threading.Thread(
             target=self._run, name="beanoflight-system-telemetry", daemon=True
         )
@@ -77,19 +111,27 @@ class SystemTelemetrySampler:
         if self._thread is not None:
             self._thread.join(1.0)
         self._thread = None
-        self._samples.append(_system_sample())
+        self._capture_sample()
         end_usage = resource.getrusage(resource.RUSAGE_SELF)
         start_usage = self._start_usage or end_usage
         temperatures: dict[str, list[float]] = {}
+        watched_rss: dict[str, list[tuple[int, float]]] = {}
         frequencies: list[float] = []
         loads: list[float] = []
-        for sample in self._samples:
+        with self._lock:
+            samples = tuple(self._samples)
+        for sample in samples:
             loads.append(float(sample["load_1m"]))
             frequencies.extend(float(value) for value in sample["cpu_frequency_mhz"])
             for name, value in sample["temperatures_c"].items():
                 temperatures.setdefault(str(name), []).append(float(value))
+            monotonic_ns = int(sample["monotonic_ns"])
+            for name, value in sample.get("watched_rss_mib", {}).items():
+                watched_rss.setdefault(str(name), []).append(
+                    (monotonic_ns, float(value))
+                )
         return {
-            "samples": len(self._samples),
+            "samples": len(samples),
             "process_cpu_seconds": (
                 end_usage.ru_utime
                 + end_usage.ru_stime
@@ -103,11 +145,71 @@ class SystemTelemetrySampler:
                 name: summarize_samples(values)
                 for name, values in sorted(temperatures.items())
             },
+            "maximum_temperature_c": self.maximum_temperature_c,
+            "thermal_abort": self.thermal_abort.is_set(),
+            "thermal_abort_detail": self.thermal_abort_detail,
+            "watched_rss_mib": {
+                name: _rss_summary(values)
+                for name, values in sorted(watched_rss.items())
+            },
         }
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval_seconds):
-            self._samples.append(_system_sample())
+            self._capture_sample()
+
+    def _capture_sample(self) -> None:
+        sample = _system_sample()
+        sample["watched_rss_mib"] = {
+            name: value
+            for name, pid in self.watched_pids.items()
+            if (value := current_rss_mib(pid)) > 0
+        }
+        temperatures = sample["temperatures_c"]
+        hottest_name = ""
+        hottest_c = 0.0
+        if temperatures:
+            hottest_name, hottest_c = max(
+                temperatures.items(), key=lambda item: float(item[1])
+            )
+            hottest_c = float(hottest_c)
+        with self._lock:
+            self._samples.append(sample)
+            self.latest_max_temperature_c = hottest_c
+            if (
+                self.maximum_temperature_c is not None
+                and hottest_c >= self.maximum_temperature_c
+                and not self.thermal_abort.is_set()
+            ):
+                self.thermal_abort_detail = (
+                    f"{hottest_name} reached {hottest_c:.1f} C "
+                    f"(limit {self.maximum_temperature_c:.1f} C)"
+                )
+                self.thermal_abort.set()
+
+
+def _rss_summary(values: list[tuple[int, float]]) -> dict[str, float | int]:
+    if not values:
+        return {
+            "count": 0,
+            "first": 0.0,
+            "last": 0.0,
+            "growth": 0.0,
+            "growth_per_hour": 0.0,
+            "max": 0.0,
+        }
+    first_ns, first = values[0]
+    last_ns, last = values[-1]
+    elapsed_hours = max(0, last_ns - first_ns) / 3_600_000_000_000.0
+    growth = last - first
+    return {
+        "count": len(values),
+        "first": first,
+        "last": last,
+        "growth": growth,
+        "growth_per_hour": growth / elapsed_hours if elapsed_hours > 0 else 0.0,
+        "max": max(value for _timestamp_ns, value in values),
+    }
 
 
 def _system_sample() -> dict[str, object]:

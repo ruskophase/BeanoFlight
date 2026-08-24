@@ -198,7 +198,11 @@ for the reference command and current results. Pass
 checkbox-off crop policy while holding the other benchmark settings fixed.
 The benchmark also applies process-wide CPU roles, gives direct inference
 evidence a dedicated IPC I/O context and defers BeanoSorter's cyclic garbage
-collection until shutdown.
+collection to deadline-safe maintenance windows. It uses frequent young,
+infrequent generation-1 and sparse full collections without requiring an empty
+camera frame. If resident-memory growth requires a full collection but bean or
+gate deadlines leave no safe window, the sorter prints a rate-limited
+**feeder slowdown requested** warning instead of risking a missed bean.
 Pass `--esp32-actuator` to include the connected indicator board and require
 observed hardware cycles in the acceptance result.
 

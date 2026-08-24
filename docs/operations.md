@@ -158,9 +158,31 @@ Performance mode applies CPU affinity to every extant native thread, including
 threads created during CUDA, OpenCV and ZeroMQ import—not only the process
 leader. Direct inference evidence uses dedicated ZeroMQ I/O contexts so bulk
 Registry, crop and trajectory traffic cannot block its native I/O queue.
-BeanoSorter also defers cyclic garbage collection while its latency-critical
-service is running; normal reference counting remains active and cyclic
-collection is restored when the service stops.
+BeanoSorter keeps normal reference counting active but replaces Python's
+allocation-triggered cyclic collection with deadline-aware maintenance. Young
+collections need only a tiny transport-queue gap; generation-1 and full
+collections require progressively more clearance from inference fallback,
+Registry recovery and gate open/close deadlines. This works even when every
+camera frame contains beans. A full collection is also guaranteed during
+orderly shutdown.
+
+If sorter RSS grows by 64 MiB since its last full collection and no safe full
+window is available, the terminal prints `feeder slowdown requested` at most
+once per minute. The sorter exposes the same red-flag state and warning count
+in its GC statistics, and its GUI status shows `FEEDER SLOWDOWN REQUESTED`.
+This warning is deliberately advisory for now; it is the future handoff point
+for reducing the stepper-driven feeder rate. The sorter never forces a long
+collection through an unsafe actuation window.
+
+Measured full-collection pauses on the Jetson reached approximately 0.49 s in
+a one-hour TensorRT endurance run, so the sorter requires at least 1.0 s of
+clearance from every known inference and actuation deadline before starting
+one, plus 0.5 s without new sorter ingress. This deliberately prevents a full
+collection from starting between frames of a continuous live stream before an
+as-yet-unknown bean acquires a deadline. Young collections retain their much
+smaller guards and remain available during continuous flow. Completed-bean and
+external-decision deduplication caches are capped at 16,384 entries so a live
+run cannot retain one entry forever for every bean ever observed.
 The Beano Inferencer and BeanoSorter status panels show direct sent/received and
 context cache counts; the timing ledger labels trajectory delivery as
 `embedded-evidence`, `direct`, or `registry`.
@@ -210,11 +232,24 @@ tolerance, zero dropped/failed jobs and complete expected decision counts. With
 fail.
 Then compare individual stage timings.
 
+For a same-process endurance test, replace the scenario/repeat options with
+`--crops-per-bean 3 --endurance-minutes 60`. The benchmark samples all Linux
+thermal zones and Registry/Inferencer/Sorter RSS every 0.5 seconds. It aborts
+the active replay at 65 C by default (override with
+`--maximum-temperature-c`), reports memory growth per hour, and records the
+sorter's collection counts, pauses, unsafe deferrals and feeder-pressure flag.
+
 After upgrading code that changes the registry command contract, stop all
 components and restart BeanRegistry before restarting its clients. For the
 current performance reference, confirm that the selected source is
 `20260816T134132.801241Z-beans`; the launcher remembers only the path supplied
 when it was started or subsequently chosen in BeanoFlight.
+
+Registry startup also creates per-bean revision indexes for sorting decisions
+and actuation results. These are safe in-place additions to an existing schema
+3 database. They prevent historical runs from making `list` reconstruction
+progressively slower; without them, the endurance workload became
+unresponsive after roughly 50 repeated runs.
 
 ## Registry ownership recovery
 

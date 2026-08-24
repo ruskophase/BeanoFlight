@@ -55,6 +55,22 @@ from .sorting_context_transport import (
     SortingContextBatch,
     ZeroMQSortingContextReceiver,
 )
+from .telemetry import current_rss_mib
+
+GC_YOUNG_INTERVAL_SECONDS = 30.0
+GC_GENERATION1_INTERVAL_SECONDS = 300.0
+GC_FULL_INTERVAL_SECONDS = 900.0
+GC_YOUNG_QUIET_PERIOD_MS = 2.0
+GC_GENERATION1_QUIET_PERIOD_MS = 5.0
+GC_FULL_QUIET_PERIOD_MS = 500.0
+GC_YOUNG_DEADLINE_GUARD_MS = 25.0
+GC_GENERATION1_DEADLINE_GUARD_MS = 100.0
+GC_FULL_DEADLINE_GUARD_MS = 1_000.0
+GC_RSS_GROWTH_TRIGGER_MIB = 64.0
+GC_MAINTENANCE_POLL_SECONDS = 0.25
+GC_PRESSURE_WARNING_INTERVAL_SECONDS = 60.0
+PLANNED_BEAN_CACHE_CAPACITY = 16_384
+EXTERNAL_DECISION_CACHE_CAPACITY = 16_384
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +218,30 @@ class SorterService:
         self.settings.validate()
         self.suppress_cyclic_gc = bool(suppress_cyclic_gc)
         self._restore_cyclic_gc = False
+        self._gc_lock = threading.Lock()
+        self._gc_last_activity_ns = time.monotonic_ns()
+        self._gc_last_young_ns = self._gc_last_activity_ns
+        self._gc_last_generation1_ns = self._gc_last_activity_ns
+        self._gc_last_full_ns = self._gc_last_activity_ns
+        self._gc_next_attempt_ns = self._gc_last_activity_ns
+        self._gc_baseline_rss_mib = 0.0
+        self._gc_rss_reference_mib = 0.0
+        self._gc_current_rss_mib = 0.0
+        self._gc_peak_rss_mib = 0.0
+        self._gc_last_pressure_warning_ns = 0
+        self.gc_pressure_active = False
+        self.gc_pressure_warnings = 0
+        self.gc_generation0_collections = 0
+        self.gc_generation1_collections = 0
+        self.gc_full_collections = 0
+        self.gc_collected_objects = 0
+        self.gc_unsafe_deferrals = 0
+        self.gc_total_pause_ms = 0.0
+        self.gc_max_pause_ms = 0.0
+        self._gc_generation_pause_total_ms = [0.0, 0.0, 0.0]
+        self._gc_generation_pause_max_ms = [0.0, 0.0, 0.0]
+        self.gc_shutdown_collections = 0
+        self.gc_shutdown_pause_ms = 0.0
         self.activity = activity
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -213,7 +253,7 @@ class SorterService:
         self._pending_registry_recovery: dict[
             BeanRef, _PendingRegistryRecovery
         ] = {}
-        self._planned: set[BeanRef] = set()
+        self._planned: OrderedDict[BeanRef, None] = OrderedDict()
         self._audit_queue: queue.Queue[_DecisionAudit] = queue.Queue()
         self._actuation_audit_queue: queue.Queue[_ActuationAudit] = queue.Queue()
         self._sessions: dict[str, RunSession] = {}
@@ -236,7 +276,7 @@ class SorterService:
         self._external_actuation_queue: queue.Queue[_ExternalActuation] = (
             queue.Queue(maxsize=256)
         )
-        self._externally_scheduled: set[str] = set()
+        self._externally_scheduled: OrderedDict[str, None] = OrderedDict()
         self._gate_counts: dict[int, int] = {}
         self._cursor = 0
         self.decisions = 0
@@ -274,12 +314,24 @@ class SorterService:
         if self._threads:
             return
         if self.suppress_cyclic_gc and gc.isenabled():
-            # The sorter creates no intentional reference cycles on its hot
-            # path. Reference counting remains active; only unpredictable
-            # stop-the-world cyclic collections are deferred until shutdown.
+            # Reference counting remains active. Cyclic collections are moved
+            # out of Python's arbitrary allocation-triggered schedule and into
+            # deadline-aware maintenance windows below.
             gc.collect()
             gc.disable()
             self._restore_cyclic_gc = True
+        if self.suppress_cyclic_gc:
+            now_ns = time.monotonic_ns()
+            rss_mib = current_rss_mib()
+            self._gc_last_activity_ns = now_ns
+            self._gc_last_young_ns = now_ns
+            self._gc_last_generation1_ns = now_ns
+            self._gc_last_full_ns = now_ns
+            self._gc_next_attempt_ns = now_ns
+            self._gc_baseline_rss_mib = rss_mib
+            self._gc_rss_reference_mib = rss_mib
+            self._gc_current_rss_mib = rss_mib
+            self._gc_peak_rss_mib = rss_mib
         workers = []
         if self.classification_endpoint:
             workers.append(
@@ -304,6 +356,8 @@ class SorterService:
             )
         else:
             workers.append(("beano-virtual-actuator", self._actuator_loop))
+        if self.suppress_cyclic_gc:
+            workers.append(("beano-sorter-gc-maintenance", self._gc_maintenance_loop))
         for name, target in workers:
             thread = threading.Thread(target=target, name=name, daemon=True)
             self._threads.append(thread)
@@ -317,8 +371,230 @@ class SorterService:
             thread.join(2.0)
         self._threads.clear()
         if self._restore_cyclic_gc:
+            # Shutdown is the one unconditionally safe full-maintenance window.
+            self._run_gc_collection(2, shutdown=True)
             gc.enable()
             self._restore_cyclic_gc = False
+
+    def garbage_collection_statistics(self) -> dict[str, object]:
+        """Return bounded maintenance and resident-memory telemetry."""
+
+        rss_mib = current_rss_mib()
+        with self._gc_lock:
+            self._gc_current_rss_mib = rss_mib
+            self._gc_peak_rss_mib = max(self._gc_peak_rss_mib, rss_mib)
+            return {
+                "managed": self.suppress_cyclic_gc,
+                "automatic_collection_enabled": gc.isenabled(),
+                "generation0_collections": self.gc_generation0_collections,
+                "generation1_collections": self.gc_generation1_collections,
+                "full_collections": self.gc_full_collections,
+                "collected_objects": self.gc_collected_objects,
+                "unsafe_deferrals": self.gc_unsafe_deferrals,
+                "feeder_slowdown_requested": self.gc_pressure_active,
+                "pressure_warnings": self.gc_pressure_warnings,
+                "total_pause_ms": self.gc_total_pause_ms,
+                "max_pause_ms": self.gc_max_pause_ms,
+                "pause_by_generation": {
+                    str(generation): {
+                        "total_ms": self._gc_generation_pause_total_ms[generation],
+                        "max_ms": self._gc_generation_pause_max_ms[generation],
+                    }
+                    for generation in range(3)
+                },
+                "shutdown_collections": self.gc_shutdown_collections,
+                "shutdown_pause_ms": self.gc_shutdown_pause_ms,
+                "planned_cache_entries": len(self._planned),
+                "external_decision_cache_entries": len(
+                    self._externally_scheduled
+                ),
+                "baseline_rss_mib": self._gc_baseline_rss_mib,
+                "current_rss_mib": self._gc_current_rss_mib,
+                "peak_rss_mib": self._gc_peak_rss_mib,
+                "rss_growth_mib": max(
+                    0.0,
+                    self._gc_current_rss_mib - self._gc_baseline_rss_mib,
+                ),
+            }
+
+    def _mark_gc_activity(self) -> None:
+        self._gc_last_activity_ns = time.monotonic_ns()
+
+    def _gc_maintenance_loop(self) -> None:
+        """Collect cycles only during a verified decision/actuation quiet window."""
+
+        while not self._stop.wait(GC_MAINTENANCE_POLL_SECONDS):
+            now_ns = time.monotonic_ns()
+            if now_ns < self._gc_next_attempt_ns:
+                continue
+            rss_mib = current_rss_mib()
+            with self._gc_lock:
+                self._gc_current_rss_mib = rss_mib
+                self._gc_peak_rss_mib = max(self._gc_peak_rss_mib, rss_mib)
+                rss_reference_mib = self._gc_rss_reference_mib
+            rss_growth_mib = rss_mib - rss_reference_mib
+            memory_pressure = rss_growth_mib >= GC_RSS_GROWTH_TRIGGER_MIB
+            full_due = (
+                now_ns - self._gc_last_full_ns
+                >= round(GC_FULL_INTERVAL_SECONDS * 1_000_000_000)
+                or memory_pressure
+            )
+            young_due = (
+                now_ns - self._gc_last_young_ns
+                >= round(GC_YOUNG_INTERVAL_SECONDS * 1_000_000_000)
+            )
+            generation1_due = (
+                now_ns - self._gc_last_generation1_ns
+                >= round(GC_GENERATION1_INTERVAL_SECONDS * 1_000_000_000)
+            )
+            if not full_due and not generation1_due and not young_due:
+                continue
+            generation = 2 if full_due else (1 if generation1_due else 0)
+            if not self._gc_window_is_safe(now_ns, generation=generation):
+                with self._gc_lock:
+                    self.gc_unsafe_deferrals += 1
+                if generation >= 2 and memory_pressure:
+                    self._raise_gc_pressure_warning(now_ns, rss_growth_mib)
+                self._gc_next_attempt_ns = now_ns + 1_000_000_000
+                continue
+            self._run_gc_collection(generation)
+
+    def _raise_gc_pressure_warning(
+        self, now_ns: int, rss_growth_mib: float
+    ) -> None:
+        with self._gc_lock:
+            self.gc_pressure_active = True
+            warning_due = (
+                now_ns - self._gc_last_pressure_warning_ns
+                >= round(GC_PRESSURE_WARNING_INTERVAL_SECONDS * 1_000_000_000)
+            )
+            if not warning_due:
+                return
+            self._gc_last_pressure_warning_ns = now_ns
+            self.gc_pressure_warnings += 1
+        print(
+            "WARNING BeanSorter: feeder slowdown requested; cyclic garbage "
+            f"requires a full collection (RSS growth {rss_growth_mib:.1f} MiB) "
+            "but no deadline-safe maintenance window is available.",
+            flush=True,
+        )
+
+    def _gc_window_is_safe(self, now_ns: int, *, generation: int) -> bool:
+        quiet_ms = (
+            GC_FULL_QUIET_PERIOD_MS
+            if generation >= 2
+            else (
+                GC_GENERATION1_QUIET_PERIOD_MS
+                if generation == 1
+                else GC_YOUNG_QUIET_PERIOD_MS
+            )
+        )
+        if now_ns - self._gc_last_activity_ns < round(quiet_ms * 1_000_000):
+            return False
+        if any(
+            not work_queue.empty()
+            for work_queue in (
+                self._direct_ingress,
+                self._recovery_queue,
+                self._external_actuation_queue,
+            )
+        ):
+            return False
+        guard_ms = (
+            GC_FULL_DEADLINE_GUARD_MS
+            if generation >= 2
+            else (
+                GC_GENERATION1_DEADLINE_GUARD_MS
+                if generation == 1
+                else GC_YOUNG_DEADLINE_GUARD_MS
+            )
+        )
+        guard_ns = round(guard_ms * 1_000_000)
+        try:
+            awaiting_ensemble = tuple(self._awaiting_ensemble.values())
+            registry_recoveries = tuple(
+                self._pending_registry_recovery.values()
+            )
+            sorting_contexts = tuple(self._sorting_contexts.values())
+            sessions = dict(self._sessions)
+        except RuntimeError:
+            # A concurrent mutation means this is not demonstrably a quiet
+            # window. Try again on a later maintenance poll.
+            return False
+        deadlines = [
+            item.deadline_monotonic_ns for item in awaiting_ensemble
+        ]
+        deadlines.extend(
+            item.due_monotonic_ns
+            for item in registry_recoveries
+        )
+        # A trajectory may precede its first inference result. Preserve the
+        # opportunity to classify it by treating its anticipated fallback as
+        # a real deadline even though no ensemble is pending yet.
+        reserve_ns = round(
+            (
+                self.settings.open_lead_ms
+                + self.settings.minimum_notice_ms
+                + self.settings.ensemble_deadline_reserve_ms
+            )
+            * 1_000_000
+        )
+        for cached in sorting_contexts:
+            prediction = cached.record.prediction
+            session = sessions.get(cached.record.bean_ref.run_id)
+            if prediction is None or session is None:
+                continue
+            deadline = session.source_to_monotonic_ns(
+                prediction.crossing_timestamp_ns - reserve_ns
+            )
+            if deadline is not None and deadline > now_ns:
+                deadlines.append(deadline)
+        with self._pending_lock:
+            for pending in self._pending.values():
+                if pending.opened_source_ns is not None:
+                    return False
+                deadlines.extend(
+                    deadline
+                    for deadline in (
+                        pending.open_monotonic_ns,
+                        pending.close_monotonic_ns,
+                    )
+                    if deadline is not None
+                )
+        return not any(deadline - now_ns <= guard_ns for deadline in deadlines)
+
+    def _run_gc_collection(self, generation: int, *, shutdown: bool = False) -> None:
+        started = time.perf_counter_ns()
+        collected = gc.collect(generation)
+        pause_ms = (time.perf_counter_ns() - started) / 1_000_000.0
+        completed_ns = time.monotonic_ns()
+        rss_mib = current_rss_mib()
+        with self._gc_lock:
+            if generation >= 2:
+                self.gc_full_collections += 1
+                self.gc_pressure_active = False
+                self._gc_last_full_ns = completed_ns
+                self._gc_last_generation1_ns = completed_ns
+                self._gc_rss_reference_mib = rss_mib
+            elif generation == 1:
+                self.gc_generation1_collections += 1
+                self._gc_last_generation1_ns = completed_ns
+            else:
+                self.gc_generation0_collections += 1
+            self._gc_last_young_ns = completed_ns
+            self._gc_next_attempt_ns = completed_ns
+            self.gc_collected_objects += int(collected)
+            self.gc_total_pause_ms += pause_ms
+            self.gc_max_pause_ms = max(self.gc_max_pause_ms, pause_ms)
+            self._gc_generation_pause_total_ms[generation] += pause_ms
+            self._gc_generation_pause_max_ms[generation] = max(
+                self._gc_generation_pause_max_ms[generation], pause_ms
+            )
+            if shutdown:
+                self.gc_shutdown_collections += 1
+                self.gc_shutdown_pause_ms += pause_ms
+            self._gc_current_rss_mib = rss_mib
+            self._gc_peak_rss_mib = max(self._gc_peak_rss_mib, rss_mib)
 
     def _decision_loop(self) -> None:
         contexts = None
@@ -443,6 +719,7 @@ class SorterService:
         batch: DirectEvidenceBatch,
         received_monotonic_ns: int,
     ) -> bool:
+        self._mark_gc_activity()
         # A missing ACK makes the publisher's transport worker resend the
         # identical batch. Acknowledge that retry without consuming ingress
         # capacity or processing its evidence twice.
@@ -545,6 +822,7 @@ class SorterService:
             registry.close()
 
     def _put_recovery(self, item: RunSession | _RecoveredRecord) -> None:
+        self._mark_gc_activity()
         while not self._stop.is_set():
             try:
                 self._recovery_queue.put(item, timeout=0.05)
@@ -806,6 +1084,7 @@ class SorterService:
         *,
         received_monotonic_ns: int,
     ) -> None:
+        self._mark_gc_activity()
         self.context_batches_received += 1
         self.contexts_received += len(batch.items)
         incoming_session = RunSession(
@@ -1074,10 +1353,11 @@ class SorterService:
         context_received_monotonic_ns: int | None = None,
         context_embedded_with_evidence: bool = False,
     ) -> None:
+        self._mark_gc_activity()
         decision_started_ns = time.monotonic_ns()
         arrival_monotonic_ns = arrival_monotonic_ns or decision_started_ns
         if record.decision is not None:
-            self._planned.add(record.bean_ref)
+            self._remember_planned(record.bean_ref)
             self._awaiting_prediction.discard(record.bean_ref)
             self._awaiting_ensemble.pop(record.bean_ref, None)
             self._pending_registry_recovery.pop(record.bean_ref, None)
@@ -1345,7 +1625,7 @@ class SorterService:
             },
         )
         planned = replace(record, decision=decision)
-        self._planned.add(record.bean_ref)
+        self._remember_planned(record.bean_ref)
         self._pending_registry_recovery.pop(record.bean_ref, None)
         self._registry_recovery_timing.pop(record.bean_ref, None)
         self._clear_direct_evidence(record.bean_ref)
@@ -1581,7 +1861,7 @@ class SorterService:
                 "sorter_decision_request_monotonic_ns": time.monotonic_ns(),
             },
         )
-        self._planned.add(record.bean_ref)
+        self._remember_planned(record.bean_ref)
         self._registry_recovery_timing.pop(record.bean_ref, None)
         self._clear_direct_evidence(record.bean_ref)
         self._sorting_contexts.pop(record.bean_ref, None)
@@ -1629,7 +1909,7 @@ class SorterService:
                             replace(audit, attempts=audit.attempts + 1)
                         )
                     else:
-                        self._planned.discard(record.bean_ref)
+                        self._planned.pop(record.bean_ref, None)
                         with self._pending_lock:
                             pending = (
                                 None
@@ -1761,6 +2041,7 @@ class SorterService:
         *,
         session: RunSession | None = None,
     ) -> None:
+        self._mark_gc_activity()
         decision = record.decision
         if decision is None or not decision.gate_indices:
             return
@@ -1771,13 +2052,13 @@ class SorterService:
                 session = self._session(record.bean_ref.run_id, registry)
             pending = _pending_actuation(record, session, time.monotonic_ns())
             plan = _external_actuation_plan(pending)
-            self._externally_scheduled.add(decision.decision_id)
+            self._remember_external_decision(decision.decision_id)
             try:
                 self._external_actuation_queue.put_nowait(
                     _ExternalActuation(record, session, plan)
                 )
             except queue.Full:
-                self._externally_scheduled.discard(decision.decision_id)
+                self._externally_scheduled.pop(decision.decision_id, None)
                 self.external_plans_rejected += 1
                 self._queue_external_failure(
                     record,
@@ -1794,6 +2075,18 @@ class SorterService:
         with self._actuator_condition:
             self._pending.setdefault(decision.decision_id, pending)
             self._actuator_condition.notify()
+
+    def _remember_planned(self, bean_ref: BeanRef) -> None:
+        self._planned[bean_ref] = None
+        self._planned.move_to_end(bean_ref)
+        while len(self._planned) > PLANNED_BEAN_CACHE_CAPACITY:
+            self._planned.popitem(last=False)
+
+    def _remember_external_decision(self, decision_id: str) -> None:
+        self._externally_scheduled[decision_id] = None
+        self._externally_scheduled.move_to_end(decision_id)
+        while len(self._externally_scheduled) > EXTERNAL_DECISION_CACHE_CAPACITY:
+            self._externally_scheduled.popitem(last=False)
 
     def _external_actuator_loop(self) -> None:
         publisher = ZeroMQActuationPlanPublisher(self.actuation_endpoint)

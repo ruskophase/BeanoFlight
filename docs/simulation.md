@@ -255,6 +255,26 @@ The report preserves every run summary and adds per-scenario distributions.
 `all_within_one_fps_of_target`; a one-FPS tolerance allows normal
 operating-system scheduling jitter without hiding sustained under-performance.
 
+For long-lived GC, memory and thermal validation, keep all three services alive
+for a time-bounded run:
+
+```bash
+beano-performance-benchmark \
+  /path/to/20260816T134132.801241Z-beans \
+  --background-frames 43,222,347 \
+  --crops-per-bean 3 \
+  --endurance-minutes 60 \
+  --maximum-temperature-c 65 \
+  --inference-backend tensorrt \
+  --output ./endurance-report.json
+```
+
+The endurance report compacts per-bean nanosecond marks but retains timing
+distributions and inference sample counts. Its `system_telemetry` section gives
+temperature histories and per-process RSS growth; `sorter_gc_statistics`
+records managed collections, pause maxima, unsafe-window deferrals and whether
+memory pressure requested a feeder slowdown.
+
 `--optimized-raw` selects the performance path. It mmaps native RG10, derives
 an sRGB-encoded green plane directly from the two green Bayer sites, and avoids
 full-frame colour conversion. Its default `--crop-processing ml-fast` profile

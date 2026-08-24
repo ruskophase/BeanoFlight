@@ -21,13 +21,13 @@ from .classification import (
 from .esp32_actuator import DEFAULT_ESP32_PORT, ESP32ActuatorService
 from .mock_inference import MockInferencerService, MockInferenceSettings
 from .registry_models import InferenceStatus
-from .registry_zmq import ZeroMQRegistryClient
+from .registry_zmq import RegistryTransportError, ZeroMQRegistryClient
 from .runtime_priority import (
     apply_latency_thread_profile,
     apply_performance_affinity,
 )
 from .sorter import SorterService
-from .telemetry import summarize_samples
+from .telemetry import SystemTelemetrySampler, summarize_samples
 from .tensorrt_inference import DEFAULT_TENSORRT_ENGINE
 from .timing_ledger import summarize_timing_ledgers
 
@@ -37,6 +37,10 @@ def _scenarios(value: str) -> tuple[str, ...]:
     if not result or any(item not in {"core", "full"} for item in result):
         raise argparse.ArgumentTypeError("scenarios must contain core and/or full")
     return tuple(dict.fromkeys(result))
+
+
+class ThermalSafetyAbort(RuntimeError):
+    """Raised after an endurance run crosses its configured thermal limit."""
 
 
 def parser() -> argparse.ArgumentParser:
@@ -104,6 +108,25 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     result.add_argument(
+        "--endurance-minutes",
+        type=float,
+        default=0.0,
+        metavar="MINUTES",
+        help="continuously repeat the full pipeline for this wall-clock duration",
+    )
+    result.add_argument(
+        "--maximum-temperature-c",
+        type=float,
+        default=65.0,
+        help="stop an endurance test immediately if any thermal zone reaches this",
+    )
+    result.add_argument(
+        "--telemetry-interval-seconds",
+        type=float,
+        default=0.5,
+        help="temperature and resident-memory sampling interval",
+    )
+    result.add_argument(
         "--minimum-three-sample-rate",
         type=float,
         default=0.95,
@@ -133,17 +156,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("clock timing limits must be positive")
     if arguments.soak_runs < 0:
         raise SystemExit("--soak-runs cannot be negative")
+    if arguments.endurance_minutes < 0:
+        raise SystemExit("--endurance-minutes cannot be negative")
+    if arguments.soak_runs and arguments.endurance_minutes:
+        raise SystemExit("--soak-runs and --endurance-minutes are mutually exclusive")
+    if arguments.maximum_temperature_c <= 0:
+        raise SystemExit("--maximum-temperature-c must be positive")
+    if arguments.telemetry_interval_seconds < 0.1:
+        raise SystemExit("--telemetry-interval-seconds must be at least 0.1")
     if not 0.0 <= arguments.minimum_three_sample_rate <= 1.0:
         raise SystemExit("--minimum-three-sample-rate must be between zero and one")
     if not 1 <= arguments.minimum_samples_per_bean <= 5:
         raise SystemExit("--minimum-samples-per-bean must be between one and five")
     if arguments.expected_beans is not None and arguments.expected_beans <= 0:
         raise SystemExit("--expected-beans must be positive")
-    if arguments.soak_runs:
+    if arguments.soak_runs or arguments.endurance_minutes:
         if arguments.crops_per_bean < 3:
-            raise SystemExit("soak acceptance requires --crops-per-bean 3 or more")
+            raise SystemExit(
+                "soak/endurance acceptance requires --crops-per-bean 3 or more"
+            )
         arguments.scenarios = ("full",)
-        arguments.repeats = arguments.soak_runs
+        if arguments.soak_runs:
+            arguments.repeats = arguments.soak_runs
 
     temporary = tempfile.TemporaryDirectory(prefix="beanoflight-benchmark-")
     root = Path(temporary.name)
@@ -160,6 +194,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     inference_ready = context.Event()
     sorter_ready = context.Event()
     actuator_ready = context.Event()
+    sorter_metrics_receiver, sorter_metrics_sender = context.Pipe(duplex=False)
     inferencer = context.Process(
         target=_run_inferencer,
         args=(
@@ -183,6 +218,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             actuation_plans if arguments.esp32_actuator else "",
             service_stop,
             sorter_ready,
+            sorter_metrics_sender,
         ),
         name="beano-benchmark-sorter",
     )
@@ -201,6 +237,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.esp32_actuator
         else None
     )
+    telemetry = None
+    telemetry_report = None
+    sorter_gc_statistics = None
+    registry_service_metrics = None
+    services_stopped = False
+    thermal_abort_detail = ""
+    endurance_started = None
+    endurance_elapsed_seconds = 0.0
     try:
         registry_process = subprocess.Popen(
             [
@@ -228,27 +272,75 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "benchmark ESP32 actuator did not connect and synchronize"
                 )
         sorter.start()
+        sorter_metrics_sender.close()
         if not sorter_ready.wait(5.0):
             raise RuntimeError("benchmark sorter did not become ready")
         inferencer.start()
         if not inference_ready.wait(5.0):
             raise RuntimeError("benchmark inferencer did not become ready")
 
+        watched_pids = {
+            "registry": registry_process.pid,
+            "sorter": sorter.pid,
+            "inferencer": inferencer.pid,
+        }
+        if actuator is not None and actuator.pid is not None:
+            watched_pids["actuator"] = actuator.pid
+        telemetry = SystemTelemetrySampler(
+            interval_seconds=arguments.telemetry_interval_seconds,
+            watched_pids=watched_pids,
+            maximum_temperature_c=(
+                arguments.maximum_temperature_c
+                if arguments.endurance_minutes
+                else None
+            ),
+        )
+        telemetry.start()
+
         runs: list[dict[str, object]] = []
+        endurance_started = time.monotonic()
+        endurance_deadline = (
+            endurance_started + arguments.endurance_minutes * 60.0
+            if arguments.endurance_minutes
+            else None
+        )
+        stop_runs = False
         for scenario in arguments.scenarios:
-            for repeat in range(1, arguments.repeats + 1):
-                summary = _run_replay(
-                    arguments,
-                    commands,
-                    crops,
-                    sorting_contexts,
-                    scenario,
-                )
+            repeat = 0
+            while not stop_runs and (
+                (endurance_deadline is not None and time.monotonic() < endurance_deadline)
+                or (endurance_deadline is None and repeat < arguments.repeats)
+            ):
+                repeat += 1
+                if telemetry.thermal_abort.is_set():
+                    thermal_abort_detail = telemetry.thermal_abort_detail
+                    stop_runs = True
+                    break
+                try:
+                    summary = _run_replay(
+                        arguments,
+                        commands,
+                        crops,
+                        sorting_contexts,
+                        scenario,
+                        abort_event=telemetry.thermal_abort,
+                        abort_detail=lambda: telemetry.thermal_abort_detail,
+                    )
+                except ThermalSafetyAbort as exc:
+                    thermal_abort_detail = str(exc)
+                    stop_runs = True
+                    break
                 outcome = _wait_for_outcome(
                     commands,
                     str(summary["run_id"]),
                     int(summary["crops_submitted"]),
+                    abort_event=telemetry.thermal_abort,
                 )
+                if telemetry.thermal_abort.is_set():
+                    thermal_abort_detail = telemetry.thermal_abort_detail
+                    stop_runs = True
+                if arguments.endurance_minutes:
+                    outcome = _compact_endurance_outcome(outcome)
                 run = {
                     "scenario": scenario,
                     "repeat": repeat,
@@ -257,7 +349,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
                 runs.append(run)
                 print(
-                    f"{scenario} {repeat}/{arguments.repeats}: "
+                    f"{scenario} {repeat}"
+                    + (
+                        f" · {((time.monotonic() - endurance_started) / 60.0):.1f}/"
+                        f"{arguments.endurance_minutes:.1f} min"
+                        if arguments.endurance_minutes
+                        else f"/{arguments.repeats}"
+                    )
+                    + ": "
                     f"{float(summary['achieved_fps']):.2f} FPS · "
                     f"analysis {float(summary['mean_processing_ms']):.2f} ms · "
                     f"skipped {int(summary.get('frames_skipped', 0))} · "
@@ -266,6 +365,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"clock {float(summary.get('clock_start_offset_ms', 0.0)):+.3f} ms",
                     flush=True,
                 )
+        endurance_elapsed_seconds = time.monotonic() - endurance_started
+
+        registry_service_metrics = _read_registry_service_metrics(commands)
+        service_stop.set()
+        for process in (sorter, inferencer, actuator):
+            if process is not None and process.pid is not None:
+                process.join(5.0)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(2.0)
+        services_stopped = True
+        if sorter_metrics_receiver.poll(1.0):
+            sorter_gc_statistics = sorter_metrics_receiver.recv()
+        telemetry_report = telemetry.stop()
         acceptance = (
             _soak_acceptance(
                 runs,
@@ -274,20 +387,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                 minimum_samples_per_bean=arguments.minimum_samples_per_bean,
                 expected_beans=arguments.expected_beans,
             )
-            if arguments.soak_runs
+            if arguments.soak_runs or arguments.endurance_minutes
             else None
         )
+        if acceptance is not None and thermal_abort_detail:
+            acceptance["checks"]["thermal_limit_not_reached"] = False
+            acceptance["passed"] = False
         report = {
-            "schema": "beanoflight-performance-benchmark/v2",
+            "schema": "beanoflight-performance-benchmark/v3",
             "recording": str(arguments.recording.resolve()),
             "database": str(database.resolve()),
             "target_fps": arguments.target_fps,
             "repeats": arguments.repeats,
+            "endurance": {
+                "requested_minutes": arguments.endurance_minutes,
+                "elapsed_seconds": endurance_elapsed_seconds,
+                "completed_runs": len(runs),
+                "maximum_temperature_c": arguments.maximum_temperature_c,
+                "thermal_abort": bool(thermal_abort_detail),
+                "thermal_abort_detail": thermal_abort_detail,
+            },
             "adaptive_edge_resize": not arguments.no_adaptive_edge_resize,
             "genuine_stereo_crops": not arguments.single_view_inference,
             "emergency_microbatch": not arguments.no_emergency_microbatch,
             "direct_evidence_dedicated_io": True,
-            "sorter_cyclic_gc_suppressed": True,
+            "sorter_deadline_aware_gc": True,
+            "sorter_gc_statistics": sorter_gc_statistics,
+            "registry_service_metrics": registry_service_metrics,
+            "system_telemetry": telemetry_report,
             "process_wide_performance_affinity": True,
             "inference_backend": arguments.inference_backend,
             "inference_engine": str(arguments.inference_engine.resolve()),
@@ -313,17 +440,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 + ("PASS" if acceptance["passed"] else "FAIL"),
                 flush=True,
             )
+        if thermal_abort_detail:
+            return 3
         return 0 if acceptance is None or acceptance["passed"] else 2
     finally:
         service_stop.set()
         for process in (sorter, inferencer, actuator):
             if process is None:
                 continue
-            if process.pid is not None:
+            if process.pid is not None and not services_stopped:
                 process.join(3.0)
                 if process.is_alive():
                     process.terminate()
                     process.join(2.0)
+        if telemetry is not None and telemetry_report is None:
+            telemetry.stop()
+        sorter_metrics_receiver.close()
+        sorter_metrics_sender.close()
         if registry_process is not None and registry_process.poll() is None:
             registry_process.terminate()
             try:
@@ -363,6 +496,7 @@ def _run_sorter(
     actuation_plans,
     stop,
     ready,
+    metrics_sender,
 ) -> None:
     apply_performance_affinity("sorter")
     apply_latency_thread_profile()
@@ -375,11 +509,17 @@ def _run_sorter(
         suppress_cyclic_gc=True,
         activity=None,
     )
-    service.start()
-    if service.ready.wait(5.0) and not service.startup_error:
-        ready.set()
-    stop.wait()
-    service.close()
+    try:
+        service.start()
+        if service.ready.wait(5.0) and not service.startup_error:
+            ready.set()
+        stop.wait()
+    finally:
+        service.close()
+        try:
+            metrics_sender.send(service.garbage_collection_statistics())
+        finally:
+            metrics_sender.close()
 
 
 def _run_actuator(commands, plans, serial_port, stop, ready) -> None:
@@ -430,6 +570,9 @@ def _run_replay(
     crops: str,
     sorting_contexts: str,
     scenario: str,
+    *,
+    abort_event=None,
+    abort_detail=None,
 ) -> dict:
     command = [
         sys.executable,
@@ -480,7 +623,21 @@ def _run_replay(
         env=dict(os.environ),
     )
     apply_performance_affinity("general", pid=replay.pid)
-    stdout, stderr = replay.communicate()
+    while True:
+        try:
+            stdout, stderr = replay.communicate(timeout=0.25)
+            break
+        except subprocess.TimeoutExpired:
+            if abort_event is None or not abort_event.is_set():
+                continue
+            replay.terminate()
+            try:
+                replay.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                replay.kill()
+                replay.communicate(timeout=2.0)
+            detail = abort_detail() if abort_detail is not None else ""
+            raise ThermalSafetyAbort(detail or "thermal safety limit reached")
     if replay.returncode:
         raise RuntimeError(
             f"{scenario} replay failed ({replay.returncode}): {stderr}"
@@ -492,16 +649,30 @@ def _run_replay(
 
 
 def _wait_for_outcome(
-    endpoint: str, run_id: str, expected_jobs: int
+    endpoint: str,
+    run_id: str,
+    expected_jobs: int,
+    *,
+    abort_event=None,
 ) -> dict[str, object]:
     client = ZeroMQRegistryClient(endpoint, timeout_ms=2_000)
     records = ()
     session = None
     settled = False
+    registry_transport_retries = 0
     try:
         deadline = time.monotonic() + 5.0
         while True:
-            records = client.list_records(run_id=run_id)
+            try:
+                records = client.list_records(run_id=run_id)
+            except RegistryTransportError:
+                registry_transport_retries += 1
+                if abort_event is not None and abort_event.is_set():
+                    break
+                if time.monotonic() >= deadline + 10.0:
+                    raise
+                time.sleep(0.02)
+                continue
             jobs = tuple(job for record in records for job in record.inference_jobs)
             decisions = sum(record.decision is not None for record in records)
             expected_decisions = sum(bool(record.inference_jobs) for record in records)
@@ -532,12 +703,22 @@ def _wait_for_outcome(
                 break
             if time.monotonic() >= deadline:
                 break
+            if abort_event is not None and abort_event.is_set():
+                break
             time.sleep(0.02)
-        session = client.get_session(run_id)
-        evicted = client.evict_completed(
-            before_timestamp_ns=(1 << 63) - 1,
-            run_id=run_id,
+        session, session_retries = _retry_registry_call(
+            lambda: client.get_session(run_id),
+            abort_event=abort_event,
         )
+        registry_transport_retries += session_retries
+        evicted, eviction_retries = _retry_registry_call(
+            lambda: client.evict_completed(
+                before_timestamp_ns=(1 << 63) - 1,
+                run_id=run_id,
+            ),
+            abort_event=abort_event,
+        )
+        registry_transport_retries += eviction_retries
     finally:
         client.close()
     jobs = tuple(job for record in records for job in record.inference_jobs)
@@ -663,11 +844,64 @@ def _wait_for_outcome(
             for record in records
         ),
         "hot_records_evicted": evicted,
+        "registry_transport_retries": registry_transport_retries,
         "settled": settled,
         "clock_consistency": _clock_consistency(records, session),
         "identity_continuity": _identity_continuity(records),
         "timing_ledger": summarize_timing_ledgers(records),
     }
+
+
+def _retry_registry_call(operation, *, abort_event=None, attempts: int = 5):
+    retries = 0
+    while True:
+        try:
+            return operation(), retries
+        except RegistryTransportError:
+            retries += 1
+            if retries >= attempts or (
+                abort_event is not None and abort_event.is_set()
+            ):
+                raise
+            time.sleep(0.02)
+
+
+def _read_registry_service_metrics(endpoint: str) -> dict[str, object]:
+    client = ZeroMQRegistryClient(endpoint, timeout_ms=5_000)
+    try:
+        metrics, retries = _retry_registry_call(
+            client.service_metrics,
+            attempts=3,
+        )
+        return {**metrics, "transport_retries": retries}
+    except RegistryTransportError as exc:
+        return {"error": str(exc)}
+    finally:
+        client.close()
+
+
+def _compact_endurance_outcome(outcome: dict[str, object]) -> dict[str, object]:
+    """Discard per-bean nanosecond marks while retaining acceptance evidence."""
+
+    compact = dict(outcome)
+    ledger = dict(compact.get("timing_ledger", {}))
+    ledger["per_bean"] = [
+        {
+            key: bean.get(key)
+            for key in (
+                "bean_id",
+                "sequence",
+                "result",
+                "classification",
+                "emergency_microbatch",
+                "available_notice_ms",
+                "late_by_ms",
+            )
+        }
+        for bean in ledger.get("per_bean", ())
+    ]
+    compact["timing_ledger"] = ledger
+    return compact
 
 
 def _clock_consistency(records, session) -> dict[str, object]:
@@ -894,6 +1128,10 @@ def _soak_acceptance(
             and int(run["outcome"].get("jobs_failed", 0)) == 0
             for run in selected
         ),
+        "zero_registry_transport_retries": all(
+            int(run["outcome"].get("registry_transport_retries", 0)) == 0
+            for run in selected
+        ),
         "genuine_stereo_evidence": all(
             int(run["outcome"].get("stereo_pairs_complete", 0))
             == int(run["outcome"].get("classification_evidence", 0))
@@ -979,6 +1217,10 @@ def _soak_acceptance(
             ],
             "clock_anchor_misses": [
                 int(run["summary"].get("clock_anchor_misses", 0))
+                for run in selected
+            ],
+            "registry_transport_retries": [
+                int(run["outcome"].get("registry_transport_retries", 0))
                 for run in selected
             ],
         },

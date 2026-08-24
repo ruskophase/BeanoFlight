@@ -4,12 +4,15 @@ from types import SimpleNamespace
 
 from beanoflight.models import BeanRef, Detection, Observation
 from beanoflight.performance_benchmark import (
+    _compact_endurance_outcome,
     _identity_continuity,
+    _retry_registry_call,
     _scenario_summaries,
     _scenarios,
     _soak_acceptance,
 )
 from beanoflight.performance_benchmark import parser as benchmark_parser
+from beanoflight.registry_zmq import RegistryTransportError
 from beanoflight.system_test import parser as system_test_parser
 
 
@@ -110,6 +113,61 @@ class PerformanceBenchmarkTests(unittest.TestCase):
         self.assertEqual(benchmark.clock_start_lead_ms, 75)
         self.assertEqual(system_test.clock_start_lead_ms, 75)
         self.assertEqual(system_test.maximum_clock_offset_ms, 1.5)
+
+    def test_endurance_mode_and_thermal_limit_are_configurable(self):
+        arguments = benchmark_parser().parse_args(
+            [
+                "recording",
+                "--background-frames",
+                "1,2,3",
+                "--endurance-minutes",
+                "60",
+                "--maximum-temperature-c",
+                "64",
+            ]
+        )
+        self.assertEqual(arguments.endurance_minutes, 60.0)
+        self.assertEqual(arguments.maximum_temperature_c, 64.0)
+
+    def test_endurance_outcome_discards_large_per_bean_marks(self):
+        outcome = {
+            "beans": 1,
+            "timing_ledger": {
+                "results": {"scheduled": 1},
+                "per_bean": [
+                    {
+                        "bean_id": "run:1",
+                        "sequence": 1,
+                        "result": "scheduled",
+                        "classification": {"sample_count": 3},
+                        "marks_ns": {"large": 123},
+                        "durations_ms": {"path": 4.0},
+                    }
+                ],
+            },
+        }
+
+        compact = _compact_endurance_outcome(outcome)
+
+        self.assertEqual(compact["beans"], 1)
+        bean = compact["timing_ledger"]["per_bean"][0]
+        self.assertEqual(bean["classification"]["sample_count"], 3)
+        self.assertNotIn("marks_ns", bean)
+
+    def test_registry_read_retries_a_transient_transport_timeout(self):
+        calls = 0
+
+        def operation():
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise RegistryTransportError("temporary pause")
+            return {"healthy": True}
+
+        result, retries = _retry_registry_call(operation)
+
+        self.assertEqual(result, {"healthy": True})
+        self.assertEqual(retries, 2)
 
     def test_scenario_summary_reports_repeat_stability(self):
         runs = [

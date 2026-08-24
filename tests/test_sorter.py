@@ -33,6 +33,7 @@ from beanoflight.sorter import (
     _actuation_timing_result,
     _latest_only_context_batches,
     _pending_actuation,
+    _PendingRegistryRecovery,
     _select_gate_indices,
 )
 from beanoflight.sorting_context_transport import SortingContext, SortingContextBatch
@@ -57,9 +58,102 @@ class SorterTimingTests(unittest.TestCase):
             service.start()
             service.close()
 
-        collect.assert_called_once_with()
+        self.assertEqual(collect.call_args_list[0].args, ())
+        self.assertEqual(collect.call_args_list[-1].args, (2,))
+        self.assertEqual(collect.call_count, 2)
         disable.assert_called_once_with()
         enable.assert_called_once_with()
+
+    def test_managed_gc_requires_queue_and_deadline_slack(self):
+        service = SorterService(
+            classification_endpoint="",
+            sorting_context_endpoint="",
+            suppress_cyclic_gc=True,
+        )
+        now_ns = time.monotonic_ns()
+        service._gc_last_activity_ns = now_ns - 1_000_000_000
+        self.assertTrue(service._gc_window_is_safe(now_ns, generation=0))
+
+        service._direct_ingress.put_nowait(object())
+        self.assertFalse(service._gc_window_is_safe(now_ns, generation=0))
+        service._direct_ingress.get_nowait()
+        service._direct_ingress.task_done()
+
+        service._pending_registry_recovery[BeanRef("gc-run", 1)] = (
+            _PendingRegistryRecovery(
+                record=None,  # type: ignore[arg-type] - deadline-only fixture
+                due_monotonic_ns=now_ns + 5_000_000,
+            )
+        )
+        self.assertFalse(service._gc_window_is_safe(now_ns, generation=0))
+
+    def test_gc_pressure_requests_feeder_slowdown_until_full_collection(self):
+        service = SorterService(
+            classification_endpoint="",
+            sorting_context_endpoint="",
+            suppress_cyclic_gc=True,
+        )
+        service._gc_last_pressure_warning_ns = -1_000_000_000_000
+        with patch("builtins.print") as warning:
+            service._raise_gc_pressure_warning(time.monotonic_ns(), 72.0)
+
+        self.assertTrue(service.gc_pressure_active)
+        self.assertEqual(service.gc_pressure_warnings, 1)
+        warning.assert_called_once()
+        with (
+            patch("beanoflight.sorter.gc.collect", return_value=0),
+            patch("beanoflight.sorter.current_rss_mib", return_value=100.0),
+        ):
+            service._run_gc_collection(2)
+        self.assertFalse(service.gc_pressure_active)
+
+    def test_full_collection_requires_a_one_second_deadline_gap(self):
+        service = SorterService(
+            classification_endpoint="",
+            sorting_context_endpoint="",
+            suppress_cyclic_gc=True,
+        )
+        now_ns = time.monotonic_ns()
+        service._gc_last_activity_ns = now_ns - 1_000_000_000
+        service._pending_registry_recovery[BeanRef("full-gc-run", 1)] = (
+            _PendingRegistryRecovery(
+                record=None,  # type: ignore[arg-type] - deadline-only fixture
+                due_monotonic_ns=now_ns + 500_000_000,
+            )
+        )
+
+        self.assertTrue(service._gc_window_is_safe(now_ns, generation=0))
+        self.assertFalse(service._gc_window_is_safe(now_ns, generation=2))
+
+    def test_full_collection_requires_a_real_ingress_lull(self):
+        service = SorterService(
+            classification_endpoint="",
+            sorting_context_endpoint="",
+            suppress_cyclic_gc=True,
+        )
+        now_ns = time.monotonic_ns()
+        service._gc_last_activity_ns = now_ns - 100_000_000
+
+        self.assertTrue(service._gc_window_is_safe(now_ns, generation=0))
+        self.assertFalse(service._gc_window_is_safe(now_ns, generation=2))
+
+    def test_long_lived_deduplication_caches_are_bounded(self):
+        service = SorterService(
+            classification_endpoint="",
+            sorting_context_endpoint="",
+        )
+        with (
+            patch("beanoflight.sorter.PLANNED_BEAN_CACHE_CAPACITY", 2),
+            patch("beanoflight.sorter.EXTERNAL_DECISION_CACHE_CAPACITY", 2),
+        ):
+            for sequence in range(1, 4):
+                service._remember_planned(BeanRef("bounded-run", sequence))
+                service._remember_external_decision(f"decision-{sequence}")
+
+        self.assertNotIn(BeanRef("bounded-run", 1), service._planned)
+        self.assertEqual(len(service._planned), 2)
+        self.assertNotIn("decision-1", service._externally_scheduled)
+        self.assertEqual(len(service._externally_scheduled), 2)
 
     def test_context_burst_retains_only_latest_item_per_bean(self):
         first_ref = BeanRef("context-coalesce-run", 1)

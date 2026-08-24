@@ -988,6 +988,10 @@ class SQLiteBeanRepository:
                 FOREIGN KEY(decision_id) REFERENCES sorting_decisions(decision_id),
                 FOREIGN KEY(run_id, sequence) REFERENCES beans(run_id, sequence)
             );
+            CREATE INDEX IF NOT EXISTS sorting_decisions_bean_revision_index
+                ON sorting_decisions(run_id, sequence, registry_revision DESC);
+            CREATE INDEX IF NOT EXISTS actuation_results_bean_revision_index
+                ON actuation_results(run_id, sequence, registry_revision DESC);
             CREATE TABLE IF NOT EXISTS registry_events(
                 event_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id TEXT NOT NULL UNIQUE,
