@@ -173,7 +173,7 @@ after closing and reopening the launcher, even though its components
 deliberately survive closing the launcher window. Its default **Performance
 mode** suppresses registry event printing and starts with monitor polling, crop
 and activity views, and gate animation disabled. BeanoFlight opens directly in
-Simulation mode with mmap RAW, prebuffering and no live playback. Clear the
+Simulation mode with seekable RAW, prebuffering and no live playback. Clear the
 launcher checkbox for the fully visual profile, or re-enable an individual
 display in its own GUI after startup. For repeatable headless acceptance runs
 against already-running services, use:
@@ -358,7 +358,7 @@ PYTHONPATH=src python3 -m compileall -q src
 The test suite covers metric fitting, every diagnostic detector stage, guided
 background sampling, edge rejection and suppression, exact timestamps, global
 assignment, ID lifecycle, registry revision/idempotency rules, SQLite recovery,
-byte-exact crop IPC, bounded frame prefetch, mmap RAW lifecycle, deferred crop
+byte-exact crop IPC, bounded frame prefetch, seekable RAW lifecycle, deferred crop
 calibration, async mock inference,
 sorting decisions and virtual gate actuation.
 It also covers the persisted per-bean timing ledger, live event-driven sorter,

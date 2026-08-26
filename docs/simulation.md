@@ -5,7 +5,7 @@ sorter. Only small immutable records cross BeanRegistry; each selected 224 x
 224 crop pair crosses a separate bounded image socket.
 
 ```text
-synchronized CamL/CamR mmap RG10 (fast) or CamL calibrated MKV (fallback)
+synchronized CamL/CamR seekable RG10 (fast) or CamL calibrated MKV (fallback)
        |
        v
  BeanoFlight replay -- async audit --------> BeanRegistry --> SQLite WAL
@@ -275,9 +275,10 @@ temperature histories and per-process RSS growth; `sorter_gc_statistics`
 records managed collections, pause maxima, unsafe-window deferrals and whether
 memory pressure requested a feeder slowdown.
 
-`--optimized-raw` selects the performance path. It mmaps native RG10, derives
-an sRGB-encoded green plane directly from the two green Bayer sites, and avoids
-full-frame colour conversion. Its default `--crop-processing ml-fast` profile
+`--optimized-raw` selects the performance path. It memory-maps legacy
+uncompressed RG10 or independently decodes the requested lossless LZ4 block,
+derives an sRGB-encoded green plane directly from the two green Bayer sites,
+and avoids full-frame colour conversion. Its default `--crop-processing ml-fast` profile
 linearly maps sensor values to 8-bit BGR with bilinear demosaic and deliberately
 omits dark/flat/defect correction, white balance, colour matrix and sRGB
 transfer. `--crop-processing calibrated` retains the former crop reference

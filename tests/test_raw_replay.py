@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import cv2
+import lz4.block
 import numpy as np
 
 from beanoflight.detection import DetectorSettings, RawGreenDetector
@@ -134,9 +135,68 @@ class RawReplayTests(unittest.TestCase):
             source = MMapRawVideoSource(root)
             first = source.frame(0)
             second = source.frame(1)
-            self.assertLess(float(first.detection_gray.mean()), float(second.detection_gray.mean()))
+            self.assertLess(
+                float(first.detection_gray.mean()),
+                float(second.detection_gray.mean()),
+            )
             self.assertEqual(first.path, stream_path.resolve())
             self.assertEqual(second.path, stream_path.resolve())
+            source.release_frame(first)
+            source.release_frame(second)
+            source.close()
+
+    def test_replays_independently_compressed_lz4_blocks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_bundle(root)
+            metadata = root / "metadata/CamL.csv"
+            with metadata.open(newline="", encoding="utf-8") as stream:
+                rows = list(csv.DictReader(stream))
+            payloads = [(root / row["raw_path"]).read_bytes() for row in rows]
+            stream_path = root / "raw/CamL/frames.lz4"
+            fields = (
+                "frame_index",
+                "timestamp_ns",
+                "bytes_used",
+                "raw_path",
+                "raw_offset",
+                "stored_bytes",
+                "stored_span_bytes",
+                "raw_codec",
+            )
+            offset = 0
+            output_rows = []
+            with stream_path.open("wb") as encoded:
+                for row, payload in zip(rows, payloads, strict=True):
+                    compressed = lz4.block.compress(payload, store_size=False)
+                    span = ((len(compressed) + 4095) // 4096) * 4096
+                    encoded.write(compressed)
+                    encoded.write(bytes(span - len(compressed)))
+                    output_rows.append(
+                        {
+                            "frame_index": row["frame_index"],
+                            "timestamp_ns": row["timestamp_ns"],
+                            "bytes_used": len(payload),
+                            "raw_path": "raw/CamL/frames.lz4",
+                            "raw_offset": offset,
+                            "stored_bytes": len(compressed),
+                            "stored_span_bytes": span,
+                            "raw_codec": "lz4-block",
+                        }
+                    )
+                    offset += span
+            with metadata.open("w", newline="", encoding="utf-8") as stream:
+                output = csv.DictWriter(stream, fieldnames=fields)
+                output.writeheader()
+                output.writerows(output_rows)
+
+            source = MMapRawVideoSource(root)
+            first = source.frame(0)
+            second = source.frame(1)
+            self.assertLess(float(first.detection_gray.mean()), float(second.detection_gray.mean()))
+            self.assertEqual(first.path, stream_path.resolve())
+            self.assertIsNone(first._mapping)
+            self.assertIsNotNone(first._payload)
             source.release_frame(first)
             source.release_frame(second)
             source.close()

@@ -28,6 +28,7 @@ from .source import (
     SourceMetadata,
     _raw_green_plane,
     _raw_single_green_plane,
+    _RawFrameLocation,
     _RawStereoPair,
     _stored_value_lut,
 )
@@ -332,7 +333,7 @@ class SharedMemoryRawStereoSource(MMapRawVideoSource):
         self.path = root
         self.profile_path = left_profile_path
         self.profile = left_profile
-        self._rows: tuple[tuple[int, Path, int], ...] = ()
+        self._rows: tuple[_RawFrameLocation, ...] = ()
         self._width, self._height, self._stride = left[0:3]
         self._bit_shift = left[3]
         self._expected_bytes = self._height * self._stride
@@ -358,7 +359,7 @@ class SharedMemoryRawStereoSource(MMapRawVideoSource):
         self._stereo_calibration = point_calibration
         self._stereo_pairs: dict[int, _RawStereoPair] = {}
         self._right_profile = right_profile
-        self._right_rows: tuple[tuple[int, Path, int], ...] = ()
+        self._right_rows: tuple[_RawFrameLocation, ...] = ()
         self._right_width, self._right_height, self._right_stride = right[0:3]
         self._right_bit_shift = right[3]
         self._right_expected_bytes = self._right_height * self._right_stride

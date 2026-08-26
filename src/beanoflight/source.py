@@ -55,7 +55,7 @@ class ReplaySource(Protocol):
 
 @dataclass(slots=True)
 class RawReplayFrame:
-    """One mmap-backed Bayer frame plus its compact detection representation."""
+    """One seekable Bayer frame plus its compact detection representation."""
 
     index: int
     path: Path
@@ -63,11 +63,13 @@ class RawReplayFrame:
     native_size_px: tuple[int, int]
     _mapping: mmap.mmap | None
     _mosaic: np.ndarray | None
+    _payload: bytes | None = None
     right_frame_index: int | None = None
     right_timestamp_ns: int | None = None
     right_path: Path | None = None
     _right_mapping: mmap.mmap | None = None
     _right_mosaic: np.ndarray | None = None
+    _right_payload: bytes | None = None
     _right_detection_gray: np.ndarray | None = None
 
     @property
@@ -84,12 +86,14 @@ class RawReplayFrame:
 
     def close(self) -> None:
         self._mosaic = None
+        self._payload = None
         mapping = self._mapping
         self._mapping = None
         if mapping is not None:
             mapping.close()
         self._right_detection_gray = None
         self._right_mosaic = None
+        self._right_payload = None
         right_mapping = self._right_mapping
         self._right_mapping = None
         if right_mapping is not None:
@@ -106,6 +110,15 @@ class _RawStereoPair:
     right_path: Path
     left_offset: int = 0
     right_offset: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _RawFrameLocation:
+    timestamp_ns: int
+    path: Path
+    raw_offset: int = 0
+    stored_bytes: int = 0
+    raw_codec: str = "raw"
 
 
 def resolve_caml_video(path: Path) -> Path:
@@ -266,12 +279,14 @@ class RawBundleVideoSource:
             fps = float(plan.get("frame_rate_hz", 0.0))
             width = int(capture["width"])
             height = int(capture["height"])
+            stride = int(capture["bytes_per_line"])
         except (OSError, ValueError, KeyError, RuntimeError) as exc:
             raise SourceError(f"cannot open calibrated RAW bundle: {exc}") from exc
         if not rows or fps <= 0:
             raise SourceError("RAW bundle reports no CamL frames or invalid FPS")
         self.path = root
         self._rows = rows
+        self._expected_bytes = height * stride
         self._cache_limit = max(1, int(cache_frames))
         self._cache: OrderedDict[int, object] = OrderedDict()
         self.metadata = SourceMetadata(
@@ -284,19 +299,28 @@ class RawBundleVideoSource:
         )
 
     def timestamp_ns(self, index: int) -> int:
-        return self._row(index)[0]
+        return self._row(index).timestamp_ns
 
     def frame(self, index: int):
         cached = self._cache.get(index)
         if cached is not None:
             self._cache.move_to_end(index)
             return cached
-        _timestamp, relative = self._row(index)
-        path = (self.path / relative).resolve()
+        location = self._row(index)
+        path = (self.path / location.path).resolve()
         if self.path not in path.parents:
-            raise SourceError(f"RAW frame path escapes recording bundle: {relative}")
+            raise SourceError(
+                f"RAW frame path escapes recording bundle: {location.path}"
+            )
         try:
-            rgb = self._processor.process_file_srgb8(path)
+            payload = _read_raw_payload(
+                self.path,
+                location,
+                expected_bytes=self._expected_bytes,
+                frame_index=index,
+                camera_id="CamL",
+            )
+            rgb = self._processor.process_payload_srgb8(payload)
         except (OSError, ValueError, RuntimeError) as exc:
             raise SourceError(f"cannot decode RAW frame {index + 1}: {exc}") from exc
         frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -322,18 +346,19 @@ class RawBundleVideoSource:
     def __exit__(self, _exc_type, _exc, _traceback) -> None:
         self.close()
 
-    def _row(self, index: int) -> tuple[int, Path]:
+    def _row(self, index: int) -> _RawFrameLocation:
         if not 0 <= index < len(self._rows):
             raise SourceError(f"frame {index} is outside the RAW bundle")
         return self._rows[index]
 
 
 class MMapRawVideoSource:
-    """Fast CamL replay from mmap-backed RG10 frames.
+    """Fast CamL replay from independently seekable RG10 frames.
 
     Detection uses the two native green samples in every 2x2 Bayer cell.  The
-    full mosaic remains mapped only until crop selection for that frame has
-    completed, so buffering does not expand RAW frames into full BGR images.
+    full mosaic remains mapped for legacy RAW or holds one decoded lossless LZ4
+    block only until crop selection has completed. Buffering never expands RAW
+    frames into full BGR images.
     """
 
     source_kind = "raw-mmap-green"
@@ -357,7 +382,7 @@ class MMapRawVideoSource:
             fps = float(recording.get("plan", {}).get("frame_rate_hz", 0.0))
             cfa = str(capture["cfa"])
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise SourceError(f"cannot open memory-mapped RAW bundle: {exc}") from exc
+            raise SourceError(f"cannot open seekable RAW bundle: {exc}") from exc
         if not rows or fps <= 0:
             raise SourceError("RAW bundle reports no CamL frames or invalid FPS")
         if width <= 0 or height <= 0 or stride < width * 2 or stride % 2:
@@ -408,7 +433,7 @@ class MMapRawVideoSource:
         self._stereo_calibration: StereoPointCalibration | None = None
         self._stereo_pairs: dict[int, _RawStereoPair] = {}
         self._right_profile: dict[str, object] | None = None
-        self._right_rows: tuple[tuple[int, Path, int], ...] = ()
+        self._right_rows: tuple[_RawFrameLocation, ...] = ()
         self._right_width = 0
         self._right_height = 0
         self._right_stride = 0
@@ -434,8 +459,14 @@ class MMapRawVideoSource:
         self._stereo_refinement_fallbacks = 0
         self.crop_processing_profile = self._crop_processor.processing_profile
         self.metadata = SourceMetadata(root, width, height, len(rows), fps, True)
+        codecs = sorted({location.raw_codec for location in rows})
         self.pipeline_metadata = {
-            "input": "memory-mapped RG10",
+            "input": (
+                "independently compressed LZ4 RG10"
+                if codecs == ["lz4-block"]
+                else "memory-mapped RG10"
+            ),
+            "raw_codecs": codecs,
             "detection": f"{width // 2}x{height // 2} sRGB green plane",
             "colour": (
                 "linear sensor BGR inference crops"
@@ -527,15 +558,15 @@ class MMapRawVideoSource:
                 raise SourceError("pairs.csv refers to an invalid CamL frame")
             if not 0 <= pair.right_frame_index < len(right_rows):
                 raise SourceError("pairs.csv refers to an invalid CamR frame")
-            left_timestamp, left_path, left_offset = self._rows[pair.left_frame_index]
-            right_timestamp, right_path, right_offset = right_rows[pair.right_frame_index]
+            left_location = self._rows[pair.left_frame_index]
+            right_location = right_rows[pair.right_frame_index]
             if (
-                left_timestamp != pair.left_timestamp_ns
-                or right_timestamp != pair.right_timestamp_ns
-                or left_path != pair.left_path
-                or right_path != pair.right_path
-                or left_offset != pair.left_offset
-                or right_offset != pair.right_offset
+                left_location.timestamp_ns != pair.left_timestamp_ns
+                or right_location.timestamp_ns != pair.right_timestamp_ns
+                or left_location.path != pair.left_path
+                or right_location.path != pair.right_path
+                or left_location.raw_offset != pair.left_offset
+                or right_location.raw_offset != pair.right_offset
             ):
                 raise SourceError("pairs.csv disagrees with RAW camera metadata")
         if not all(index in pair_by_left for index in range(len(self._rows))):
@@ -607,14 +638,13 @@ class MMapRawVideoSource:
         }
 
     def timestamp_ns(self, index: int) -> int:
-        return self._row(index)[0]
+        return self._row(index).timestamp_ns
 
     def frame(self, index: int) -> RawReplayFrame:
-        _timestamp, relative, raw_offset = self._row(index)
-        mapping, mosaic, path = _mmap_raw_mosaic(
+        location = self._row(index)
+        mapping, mosaic, path, payload = _open_raw_mosaic(
             self.path,
-            relative,
-            raw_offset=raw_offset,
+            location,
             width=self._width,
             height=self._height,
             stride=self._stride,
@@ -632,11 +662,17 @@ class MMapRawVideoSource:
             pair = self._stereo_pairs.get(index)
             right_mapping = None
             right_mosaic = None
+            right_payload = None
             if pair is not None:
-                right_mapping, right_mosaic, right_path = _mmap_raw_mosaic(
+                right_location = self._right_rows[pair.right_frame_index]
+                (
+                    right_mapping,
+                    right_mosaic,
+                    right_path,
+                    right_payload,
+                ) = _open_raw_mosaic(
                     self.path,
-                    pair.right_path,
-                    raw_offset=pair.right_offset,
+                    right_location,
                     width=self._right_width,
                     height=self._right_height,
                     stride=self._right_stride,
@@ -653,14 +689,17 @@ class MMapRawVideoSource:
                 native_size_px=(self._width, self._height),
                 _mapping=mapping,
                 _mosaic=mosaic,
+                _payload=payload,
                 right_frame_index=(None if pair is None else pair.right_frame_index),
                 right_timestamp_ns=(None if pair is None else pair.right_timestamp_ns),
                 right_path=right_path,
                 _right_mapping=right_mapping,
                 _right_mosaic=right_mosaic,
+                _right_payload=right_payload,
             )
         except Exception:
-            mapping.close()
+            if mapping is not None:
+                mapping.close()
             right_mapping = locals().get("right_mapping")
             if right_mapping is not None:
                 right_mapping.close()
@@ -837,10 +876,10 @@ class MMapRawVideoSource:
             pair = self._stereo_pairs.get(index)
             if pair is None:
                 raise SourceError(f"background frame {index} has no CamR pair")
-            mapping, mosaic, _path = _mmap_raw_mosaic(
+            right_location = self._right_rows[pair.right_frame_index]
+            mapping, mosaic, _path, _payload = _open_raw_mosaic(
                 self.path,
-                pair.right_path,
-                raw_offset=pair.right_offset,
+                right_location,
                 width=self._right_width,
                 height=self._right_height,
                 stride=self._right_stride,
@@ -854,7 +893,8 @@ class MMapRawVideoSource:
                     _raw_green_plane(mosaic, stored_lut).copy()
                 )
             finally:
-                mapping.close()
+                if mapping is not None:
+                    mapping.close()
         return (
             np.median(np.stack(frames, axis=0), axis=0).astype(np.uint8),
             np.median(np.stack(fallback_frames, axis=0), axis=0).astype(np.uint8),
@@ -1055,7 +1095,7 @@ class MMapRawVideoSource:
     def __exit__(self, _exc_type, _exc, _traceback) -> None:
         self.close()
 
-    def _row(self, index: int) -> tuple[int, Path, int]:
+    def _row(self, index: int) -> _RawFrameLocation:
         if not 0 <= index < len(self._rows):
             raise SourceError(f"frame {index} is outside the RAW bundle")
         return self._rows[index]
@@ -1346,21 +1386,88 @@ def _raw_green_plane(
     return np.ascontiguousarray(stored_lut[green_stored])
 
 
-def _mmap_raw_mosaic(
+def _read_raw_payload(
     root: Path,
-    relative: Path,
+    location: _RawFrameLocation,
     *,
-    raw_offset: int,
+    expected_bytes: int,
+    frame_index: int,
+    camera_id: str,
+) -> bytes:
+    path = (root / location.path).resolve()
+    if root not in path.parents:
+        raise SourceError(
+            f"{camera_id} RAW path escapes recording bundle: {location.path}"
+        )
+    stored_bytes = location.stored_bytes or expected_bytes
+    if location.raw_offset < 0 or stored_bytes <= 0:
+        raise SourceError(
+            f"{camera_id} RAW frame {frame_index + 1} has invalid storage metadata"
+        )
+    try:
+        with path.open("rb") as stream:
+            stream.seek(location.raw_offset)
+            stored = stream.read(stored_bytes)
+    except OSError as exc:
+        raise SourceError(
+            f"cannot read {camera_id} RAW frame {frame_index + 1}: {exc}"
+        ) from exc
+    if len(stored) != stored_bytes:
+        raise SourceError(
+            f"{camera_id} RAW frame {frame_index + 1} is short: "
+            f"read {len(stored)} of {stored_bytes} stored bytes"
+        )
+    if location.raw_codec == "raw":
+        payload = stored
+    elif location.raw_codec == "lz4-block":
+        try:
+            import lz4.block
+
+            payload = lz4.block.decompress(stored, uncompressed_size=expected_bytes)
+        except Exception as exc:
+            raise SourceError(
+                f"cannot decompress {camera_id} RAW frame {frame_index + 1}"
+            ) from exc
+    else:
+        raise SourceError(
+            f"{camera_id} RAW frame {frame_index + 1} uses unsupported codec "
+            f"{location.raw_codec!r}"
+        )
+    if len(payload) != expected_bytes:
+        raise SourceError(
+            f"{camera_id} RAW frame {frame_index + 1} decoded to "
+            f"{len(payload)} bytes; expected {expected_bytes}"
+        )
+    return payload
+
+
+def _open_raw_mosaic(
+    root: Path,
+    location: _RawFrameLocation,
+    *,
     width: int,
     height: int,
     stride: int,
     expected_bytes: int,
     frame_index: int,
     camera_id: str,
-) -> tuple[mmap.mmap, np.ndarray, Path]:
-    path = (root / relative).resolve()
+) -> tuple[mmap.mmap | None, np.ndarray, Path, bytes | None]:
+    path = (root / location.path).resolve()
     if root not in path.parents:
-        raise SourceError(f"{camera_id} RAW path escapes recording bundle: {relative}")
+        raise SourceError(
+            f"{camera_id} RAW path escapes recording bundle: {location.path}"
+        )
+    if location.raw_codec != "raw":
+        payload = _read_raw_payload(
+            root,
+            location,
+            expected_bytes=expected_bytes,
+            frame_index=frame_index,
+            camera_id=camera_id,
+        )
+        words = np.ndarray((height, stride // 2), dtype="<u2", buffer=payload)
+        return None, words[:, :width], path, payload
+    raw_offset = location.raw_offset
     try:
         descriptor = path.stat()
     except OSError as exc:
@@ -1399,7 +1506,7 @@ def _mmap_raw_mosaic(
     except Exception:
         mapping.close()
         raise
-    return mapping, mosaic, path
+    return mapping, mosaic, path, None
 
 
 def resolve_raw_bundle(path: Path) -> Path:
@@ -1481,21 +1588,35 @@ def _read_stereo_pairs(path: Path) -> tuple[_RawStereoPair, ...]:
     return tuple(rows)
 
 
-def _read_raw_metadata(path: Path) -> tuple[tuple[int, Path, int], ...]:
-    rows: list[tuple[int, Path, int]] = []
+def _read_raw_metadata(path: Path) -> tuple[_RawFrameLocation, ...]:
+    rows: list[_RawFrameLocation] = []
     with path.open(newline="", encoding="utf-8") as stream:
         for expected_index, row in enumerate(csv.DictReader(stream)):
             index = int(row["frame_index"])
             timestamp = int(row["timestamp_ns"])
             relative = Path(row["raw_path"])
             raw_offset = int(row.get("raw_offset") or 0)
+            stored_bytes = int(
+                row.get("stored_bytes") or row.get("bytes_used") or 0
+            )
+            raw_codec = row.get("raw_codec") or "raw"
             if index != expected_index:
                 raise ValueError("CamL RAW metadata frame indices are not contiguous")
-            if rows and timestamp <= rows[-1][0]:
+            if rows and timestamp <= rows[-1].timestamp_ns:
                 raise ValueError("CamL RAW timestamps are not strictly increasing")
             if raw_offset < 0:
                 raise ValueError("RAW metadata offsets must be non-negative")
-            rows.append((timestamp, relative, raw_offset))
+            if raw_codec == "lz4-block" and stored_bytes <= 0:
+                raise ValueError("compressed RAW metadata requires stored_bytes")
+            rows.append(
+                _RawFrameLocation(
+                    timestamp,
+                    relative,
+                    raw_offset,
+                    stored_bytes,
+                    raw_codec,
+                )
+            )
     return tuple(rows)
 
 
