@@ -122,7 +122,7 @@ live playback, inference crop display, activity logs, registry live updates and
 virtual-gate animation when measuring throughput. These controls affect GUI
 work only and do not stop the corresponding service.
 
-The headless `beano-system-test` requires exactly 3 explicit, visually
+For replay, headless `beano-system-test` requires exactly 3 explicit, visually
 confirmed empty-frame indices and prints a JSON performance summary on
 completion. Add `--optimized-raw` to use the same fast path as the GUI. Add
 `--no-adaptive-edge-resize` for a controlled comparison in which inference is
@@ -130,6 +130,29 @@ deferred until the full requested-size crop fits within the frame. The
 deadline-aware emergency microbatch path is enabled by default; add
 `--no-emergency-microbatch` for a controlled A/B run which retains each busy
 frame as one inference batch.
+
+For live cameras, use `--live --prebuffer-frames 0` and omit both the recording
+path and `--background-frames`. The command starts headless FastCap, defaults to
+the newest valid tuner bundle, captures 15 initial empty pairs, prints
+`LIVE_BACKGROUND_READY`, waits five seconds for bean flow, and then consumes
+camera-paced frames. It creates no video or RAW recording. A current bound
+FastCap witness is still mandatory.
+
+For an attended live run, keep the conveyor and vibration motor off while
+FastCap readiness, the witness and the empty background are confirmed. Ask the
+operator to confirm that the machine is ready before taking control of either
+flow motor. After that confirmation, acquire and maintain the controller lease,
+configure the conveyor for reverse at 80 steps/s, preserve its configured
+acceleration, and configure the vibration motor for 25% duty while preserving
+its frequency and direction. Start the conveyor and then the vibration motor.
+Maintain the controller heartbeat throughout the run. At the bounded endpoint
+stop and verify both motors. Continue heartbeats throughout conveyor
+deceleration until `current_speed_sps` is zero and `driver_enabled` is false;
+at the standard 10 steps/s² acceleration, stopping from 80 steps/s takes about
+eight seconds. Release the controller lease only after capture is finished
+because lease release issues `STOPALL` and also disables camera trigger and
+strobe outputs. Any error or loss of supervision requires the same motor-stop
+sequence, with `STOPALL` as the fail-safe fallback.
 
 Every completed session stores its achieved FPS, source-read and analysis
 stage distributions, Registry/SQLite operation timings, crop-dispatch queue
@@ -219,6 +242,25 @@ beano-performance-benchmark /path/to/recording-bundle \
   --inference-backend tensorrt \
   --output ./performance-report.json
 ```
+
+The equivalent single direct-camera full-pipeline validation is:
+
+```bash
+beano-performance-benchmark \
+  --live --scenarios full --repeats 1 \
+  --target-fps 60 --maximum-frames 601 --prebuffer-frames 0 \
+  --crops-per-bean 2 --inference-backend tensorrt \
+  --state-root /home/doceave/Beano \
+  --output ./live-performance-report.json
+```
+
+Keep the field empty until `LIVE_BACKGROUND_READY` appears, then begin bean
+flow. An empty tail is not required. The result reports native sequence gaps,
+unmatched frames, maximum pair skew, real capture-to-analysis age and the full
+Registry/Inferencer/Sorter outcome.
+At the end of a bounded validation, tracks still inside the field are marked
+right-censored and receive terminal no-action decisions; this prevents the
+artificial test boundary from being reported as an incomplete pipeline outcome.
 
 Add `--esp32-actuator` to include the connected ESP32-S2 in an isolated
 hardware-backed run. The benchmark then starts its own BeanoActuator service,

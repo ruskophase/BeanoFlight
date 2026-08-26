@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
+import time
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -43,10 +45,9 @@ def parser() -> argparse.ArgumentParser:
             "crop inference with a bounded prepared-frame buffer."
         ),
     )
-    result.add_argument("recording", type=Path)
+    result.add_argument("recording", type=Path, nargs="?")
     result.add_argument(
         "--background-frames",
-        required=True,
         type=_background_indices,
         metavar="I0,I1,I2",
         help="3 human-confirmed empty zero-based frame indices",
@@ -62,6 +63,37 @@ def parser() -> argparse.ArgumentParser:
             "colour-process only inference crops"
         ),
     )
+    input_mode.add_argument(
+        "--live",
+        action="store_true",
+        help="consume synchronized cameras directly through headless FastCap",
+    )
+    result.add_argument(
+        "--calibration-pack",
+        type=Path,
+        help="Camera Tuner final product (default: newest valid bundle)",
+    )
+    result.add_argument(
+        "--state-root",
+        type=Path,
+        default=Path(__file__).resolve().parents[3],
+        help="FastCap witness-cache root",
+    )
+    result.add_argument("--controller-url")
+    result.add_argument("--witness-result", type=Path)
+    result.add_argument(
+        "--background-samples",
+        type=int,
+        default=15,
+        help="initial synchronized empty pairs used for the live background",
+    )
+    result.add_argument(
+        "--bean-start-delay",
+        type=float,
+        default=5.0,
+        help="seconds between live background completion and pipeline frame zero",
+    )
+    result.add_argument("--pair-threshold-us", type=float, default=5.0)
     result.add_argument(
         "--target-fps",
         type=float,
@@ -158,54 +190,151 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit("--progress-every must be positive")
     if arguments.hole_pitch_mm <= 0 or arguments.sorting_offset_mm <= 0:
         raise SystemExit("metric dimensions must be positive")
+    if arguments.live:
+        if arguments.recording is not None:
+            raise SystemExit("recording must be omitted with --live")
+        if arguments.target_fps <= 0:
+            raise SystemExit("--live requires a positive --target-fps")
+        if arguments.prebuffer_frames:
+            raise SystemExit("--live requires --prebuffer-frames 0")
+        if arguments.background_frames is not None:
+            raise SystemExit("--background-frames is only valid for replay")
+        if arguments.background_samples < 3:
+            raise SystemExit("--background-samples must be at least 3")
+        if arguments.bean_start_delay < 0 or arguments.pair_threshold_us < 0:
+            raise SystemExit("live timing values cannot be negative")
+    elif arguments.recording is None or arguments.background_frames is None:
+        raise SystemExit("replay requires recording and --background-frames")
 
     source = None
+    producer = None
+    live_temporary = None
     registry = None
     try:
-        source = (
-            MMapRawVideoSource(
-                arguments.recording,
+        if arguments.live:
+            from .live_source import (
+                FastCapLiveProducer,
+                SharedMemoryRawStereoSource,
+                resolve_live_calibration_pack,
+            )
+
+            calibration_pack = resolve_live_calibration_pack(
+                arguments.calibration_pack
+            )
+            state_root = arguments.state_root.expanduser().resolve()
+            state_root.mkdir(parents=True, exist_ok=True)
+            live_temporary = tempfile.TemporaryDirectory(
+                prefix=".beanoflight-live-", dir=state_root
+            )
+            live_root = Path(live_temporary.name)
+            preview_paths = {
+                "CamL": live_root / "CamL.shm",
+                "CamR": live_root / "CamR.shm",
+            }
+            run_seconds = arguments.maximum_frames / arguments.target_fps
+            capture_seconds = (
+                run_seconds
+                + arguments.bean_start_delay
+                + arguments.background_samples / arguments.target_fps
+                + 10.0
+            )
+
+            def fastcap_event(event) -> None:
+                name = event.get("event")
+                if name in {"controls_configured", "synchronized", "warning"}:
+                    print(json.dumps(event), flush=True)
+
+            producer = FastCapLiveProducer(
+                calibration_pack,
+                state_root,
+                preview_paths,
+                duration_seconds=capture_seconds,
+                controller_url=arguments.controller_url,
+                witness_result=arguments.witness_result,
+                event_callback=fastcap_event,
+            )
+            producer.start()
+            source = SharedMemoryRawStereoSource(
+                calibration_pack,
+                preview_paths,
+                frame_count=arguments.maximum_frames,
+                fps=arguments.target_fps,
+                clock_source_timestamp_ns=producer.clock_source_timestamp_ns,
+                clock_monotonic_ns=producer.clock_monotonic_ns,
+                pair_threshold_us=arguments.pair_threshold_us,
                 crop_processing=arguments.crop_processing,
+                producer_check=producer.check_running,
             )
-            if arguments.optimized_raw
-            else open_replay_source(
-                arguments.recording,
-                prefer_raw=arguments.prefer_raw,
-                cache_frames=3,
+            print(
+                f"Acquiring {arguments.background_samples} empty live frame pairs...",
+                flush=True,
             )
-        )
-        invalid = tuple(
-            index
-            for index in arguments.background_frames
-            if index >= source.metadata.frame_count
-        )
-        if invalid:
-            raise SourceError(f"background frames outside recording: {invalid}")
-        if arguments.optimized_raw:
-            background = source.build_background(arguments.background_frames)
+            background = source.acquire_background(
+                arguments.background_samples,
+                on_progress=lambda count, total: print(
+                    f"live background {count}/{total}", flush=True
+                )
+                if count == total
+                else None,
+            )
+            print(
+                "LIVE_BACKGROUND_READY: begin bean flow now; "
+                f"processing starts in {arguments.bean_start_delay:g} seconds",
+                flush=True,
+            )
+            if arguments.bean_start_delay:
+                time.sleep(arguments.bean_start_delay)
             detector = RawGreenDetector(DetectorSettings())
             deferred_crop_extractor = source.prepare_crop
-        else:
-            background = temporal_median_background(
-                source.frame(index) for index in arguments.background_frames
+            calibration_path = arguments.homography or (
+                calibration_pack / "geometry/homography.json"
             )
-            detector = BeanDetector(DetectorSettings())
-            deferred_crop_extractor = None
-        calibration_path = arguments.homography or find_pinkplane_homography(
-            source.path
-        )
+        else:
+            source = (
+                MMapRawVideoSource(
+                    arguments.recording,
+                    crop_processing=arguments.crop_processing,
+                )
+                if arguments.optimized_raw
+                else open_replay_source(
+                    arguments.recording,
+                    prefer_raw=arguments.prefer_raw,
+                    cache_frames=3,
+                )
+            )
+            invalid = tuple(
+                index
+                for index in arguments.background_frames
+                if index >= source.metadata.frame_count
+            )
+            if invalid:
+                raise SourceError(f"background frames outside recording: {invalid}")
+            if arguments.optimized_raw:
+                background = source.build_background(arguments.background_frames)
+                detector = RawGreenDetector(DetectorSettings())
+                deferred_crop_extractor = source.prepare_crop
+            else:
+                background = temporal_median_background(
+                    source.frame(index) for index in arguments.background_frames
+                )
+                detector = BeanDetector(DetectorSettings())
+                deferred_crop_extractor = None
+            calibration_path = arguments.homography or find_pinkplane_homography(
+                source.path
+            )
         if calibration_path is None:
             raise SourceError("could not locate a PinkPlane homography")
         stereo_crop_extractor = None
         if (
-            arguments.optimized_raw
+            (arguments.optimized_raw or arguments.live)
             and not arguments.no_crops
             and not arguments.single_view_inference
         ):
-            source.configure_stereo(
-                calibration_path,
-                arguments.background_frames,
-            )
+            if not arguments.live:
+                source.configure_stereo(
+                    calibration_path,
+                    arguments.background_frames,
+                )
             stereo_crop_extractor = source.prepare_stereo_crop
             deferred_crop_extractor = None
         calibration = MetricPlaneCalibration.from_pinkplane(
@@ -228,7 +357,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 calibration.sorting_line_y(arguments.sorting_offset_mm)
             ),
             registry=registry,
-            positions_mapper=positions_mapper if arguments.optimized_raw else None,
+            positions_mapper=(
+                positions_mapper
+                if arguments.optimized_raw or arguments.live
+                else None
+            ),
         )
         selector = None
         dispatcher = None
@@ -271,7 +404,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             sorting_context_endpoint=arguments.sorting_contexts,
             profile_metadata={
                 "name": "headless-system-test",
-                "optimized_raw": arguments.optimized_raw,
+                "optimized_raw": arguments.optimized_raw or arguments.live,
+                "live_camera_input": arguments.live,
                 "crops_enabled": not arguments.no_crops,
                 "stereo_crops": stereo_crop_extractor is not None,
                 "adaptive_edge_resize": not arguments.no_adaptive_edge_resize,
@@ -280,12 +414,23 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 "crop_processing": (
                     arguments.crop_processing
-                    if arguments.optimized_raw
+                    if arguments.optimized_raw or arguments.live
                     else "calibrated-video"
                 ),
                 "background": {
-                    "method": "explicit human-confirmed frames",
-                    "frame_indices": list(arguments.background_frames),
+                    "method": (
+                        "initial synchronized live temporal median"
+                        if arguments.live
+                        else "explicit human-confirmed frames"
+                    ),
+                    "frame_indices": (
+                        []
+                        if arguments.live
+                        else list(arguments.background_frames)
+                    ),
+                    "sample_count": (
+                        arguments.background_samples if arguments.live else None
+                    ),
                 },
             },
         )
@@ -317,6 +462,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             registry.close()
         if source is not None:
             source.close()
+        if producer is not None:
+            producer.close()
+        if live_temporary is not None:
+            live_temporary.cleanup()
 
 
 if __name__ == "__main__":

@@ -1847,7 +1847,11 @@ class SorterService:
             actuation_timestamp_ns=decision_timestamp,
             gate_indices=(),
             policy_version=self.settings.policy_version,
-            reason="tentative track cancelled before trajectory confirmation",
+            reason=(
+                "track cancelled at bounded run boundary (right-censored)"
+                if record.track.hits >= 2
+                else "tentative track cancelled before trajectory confirmation"
+            ),
             close_timestamp_ns=decision_timestamp,
             crossing_timestamp_ns=None,
             based_on_revision=record.revision,

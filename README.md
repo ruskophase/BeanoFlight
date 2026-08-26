@@ -35,8 +35,9 @@ inventing pixels; the crop size and resize flag are retained for audit. The defa
 demosaic without brightness or colour calibration; the former calibrated sRGB
 path remains selectable as a reference. All newly eligible crops from one
 source frame are transported as one explicit batch. Source preparation and
-detector/tracker latency are reported separately. This is the recorded-source
-stand-in for future synchronized live camera sources.
+detector/tracker latency are reported separately. The same RAW detection,
+metric, and stereo-crop path can consume FastCap's bounded shared-memory stream
+directly, without recording or video playback.
 
 ## BeanRegistry
 
@@ -205,6 +206,24 @@ gate deadlines leave no safe window, the sorter prints a rate-limited
 **feeder slowdown requested** warning instead of risking a missed bean.
 Pass `--esp32-actuator` to include the connected indicator board and require
 observed hardware cycles in the acceptance result.
+
+For one isolated 60 FPS direct-camera acceptance run, first stop bean flow for
+the short background acquisition and run:
+
+```bash
+beano-performance-benchmark \
+  --live --scenarios full --repeats 1 \
+  --target-fps 60 --maximum-frames 601 --prebuffer-frames 0 \
+  --crops-per-bean 2 --inference-backend tensorrt \
+  --state-root /home/doceave/Beano \
+  --output ./live-performance-report.json
+```
+
+The newest complete, hash-valid Camera Tuner bundle is used unless
+`--calibration-pack` pins one. After the initial empty-frame median is captured,
+the command prints `LIVE_BACKGROUND_READY`; bean flow may then continue for the
+whole run. No empty tail is required. Sequence gaps and stereo skew are included
+in the JSON source statistics.
 
 See [simulation.md](docs/simulation.md) for the data flow, crop policy, clock
 contract and operating sequence.

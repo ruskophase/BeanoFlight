@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -48,12 +49,31 @@ def parser() -> argparse.ArgumentParser:
         prog="beano-performance-benchmark",
         description="Run repeatable core and full-pipeline BeanoFlight replays",
     )
-    result.add_argument("recording", type=Path)
+    result.add_argument("recording", type=Path, nargs="?")
     result.add_argument(
         "--background-frames",
-        required=True,
         help="3 human-confirmed empty zero-based frame indices",
     )
+    result.add_argument(
+        "--live",
+        action="store_true",
+        help="benchmark real synchronized camera frames without recording",
+    )
+    result.add_argument(
+        "--calibration-pack",
+        type=Path,
+        help="Camera Tuner final product (default: newest valid bundle)",
+    )
+    result.add_argument(
+        "--state-root",
+        type=Path,
+        default=Path(__file__).resolve().parents[3],
+    )
+    result.add_argument("--controller-url")
+    result.add_argument("--witness-result", type=Path)
+    result.add_argument("--background-samples", type=int, default=15)
+    result.add_argument("--bean-start-delay", type=float, default=5.0)
+    result.add_argument("--pair-threshold-us", type=float, default=5.0)
     result.add_argument("--scenarios", type=_scenarios, default=("core", "full"))
     result.add_argument("--repeats", type=int, default=5)
     result.add_argument("--target-fps", type=float, default=60.0)
@@ -170,6 +190,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--minimum-samples-per-bean must be between one and five")
     if arguments.expected_beans is not None and arguments.expected_beans <= 0:
         raise SystemExit("--expected-beans must be positive")
+    if arguments.live:
+        if arguments.recording is not None or arguments.background_frames is not None:
+            raise SystemExit(
+                "recording and --background-frames must be omitted with --live"
+            )
+        if arguments.scenarios != ("full",) or arguments.repeats != 1:
+            raise SystemExit("live validation requires --scenarios full --repeats 1")
+        if arguments.prebuffer_frames:
+            raise SystemExit("live validation requires --prebuffer-frames 0")
+        if arguments.target_fps <= 0 or arguments.background_samples < 3:
+            raise SystemExit("live FPS must be positive and background samples at least 3")
+        if arguments.bean_start_delay < 0 or arguments.pair_threshold_us < 0:
+            raise SystemExit("live timing values cannot be negative")
+        from .live_source import resolve_live_calibration_pack
+
+        arguments.calibration_pack = resolve_live_calibration_pack(
+            arguments.calibration_pack
+        )
+    elif arguments.recording is None or arguments.background_frames is None:
+        raise SystemExit("replay requires recording and --background-frames")
     if arguments.soak_runs or arguments.endurance_minutes:
         if arguments.crops_per_bean < 3:
             raise SystemExit(
@@ -395,7 +435,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             acceptance["passed"] = False
         report = {
             "schema": "beanoflight-performance-benchmark/v3",
-            "recording": str(arguments.recording.resolve()),
+            "recording": (
+                None if arguments.recording is None else str(arguments.recording.resolve())
+            ),
+            "live_camera_input": arguments.live,
+            "calibration_pack": (
+                None
+                if arguments.calibration_pack is None
+                else str(arguments.calibration_pack.resolve())
+            ),
             "database": str(database.resolve()),
             "target_fps": arguments.target_fps,
             "repeats": arguments.repeats,
@@ -578,10 +626,6 @@ def _run_replay(
         sys.executable,
         "-m",
         "beanoflight.system_test",
-        str(arguments.recording),
-        "--background-frames",
-        arguments.background_frames,
-        "--optimized-raw",
         "--target-fps",
         str(arguments.target_fps),
         "--prebuffer-frames",
@@ -607,6 +651,35 @@ def _run_replay(
         "--progress-every",
         str(arguments.maximum_frames + 1),
     ]
+    if arguments.live:
+        command.extend(
+            (
+                "--live",
+                "--state-root",
+                str(arguments.state_root),
+                "--background-samples",
+                str(arguments.background_samples),
+                "--bean-start-delay",
+                str(arguments.bean_start_delay),
+                "--pair-threshold-us",
+                str(arguments.pair_threshold_us),
+            )
+        )
+        if arguments.calibration_pack is not None:
+            command.extend(("--calibration-pack", str(arguments.calibration_pack)))
+        if arguments.controller_url:
+            command.extend(("--controller-url", arguments.controller_url))
+        if arguments.witness_result is not None:
+            command.extend(("--witness-result", str(arguments.witness_result)))
+    else:
+        command.extend(
+            (
+                str(arguments.recording),
+                "--background-frames",
+                arguments.background_frames,
+                "--optimized-raw",
+            )
+        )
     if scenario == "core":
         command.append("--no-crops")
     if arguments.no_adaptive_edge_resize:
@@ -623,21 +696,39 @@ def _run_replay(
         env=dict(os.environ),
     )
     apply_performance_affinity("general", pid=replay.pid)
-    while True:
-        try:
-            stdout, stderr = replay.communicate(timeout=0.25)
-            break
-        except subprocess.TimeoutExpired:
-            if abort_event is None or not abort_event.is_set():
-                continue
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    def read_stdout() -> None:
+        assert replay.stdout is not None
+        for line in replay.stdout:
+            stdout_lines.append(line)
+            if line.startswith("LIVE_BACKGROUND_READY:"):
+                print(line, end="", flush=True)
+
+    def read_stderr() -> None:
+        assert replay.stderr is not None
+        stderr_lines.extend(replay.stderr)
+
+    stdout_reader = threading.Thread(target=read_stdout, daemon=True)
+    stderr_reader = threading.Thread(target=read_stderr, daemon=True)
+    stdout_reader.start()
+    stderr_reader.start()
+    while replay.poll() is None:
+        if abort_event is not None and abort_event.is_set():
             replay.terminate()
             try:
-                replay.communicate(timeout=2.0)
+                replay.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
                 replay.kill()
-                replay.communicate(timeout=2.0)
+                replay.wait(timeout=2.0)
             detail = abort_detail() if abort_detail is not None else ""
             raise ThermalSafetyAbort(detail or "thermal safety limit reached")
+        time.sleep(0.05)
+    stdout_reader.join(timeout=2.0)
+    stderr_reader.join(timeout=2.0)
+    stdout = "".join(stdout_lines)
+    stderr = "".join(stderr_lines)
     if replay.returncode:
         raise RuntimeError(
             f"{scenario} replay failed ({replay.returncode}): {stderr}"

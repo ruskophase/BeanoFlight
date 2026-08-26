@@ -43,6 +43,26 @@ class FakeSequentialSource:
         self.released.append(int(frame[0, 0, 0]))
 
 
+class FakeLiveSource(FakeSequentialSource):
+    live = True
+    source_kind = "test-live"
+
+    def __init__(self, frame_count=3):
+        super().__init__(frame_count)
+        self.clock_source_timestamp_ns = 1_000_000_000
+        self.clock_monotonic_ns = time.monotonic_ns()
+        self._timestamps = tuple(
+            self.clock_source_timestamp_ns + index * 16_666_667
+            for index in range(frame_count)
+        )
+
+    def timestamp_ns(self, index):
+        return self._timestamps[index]
+
+    def stereo_statistics(self):
+        return {"sequence_drops": {"CamL": 0, "CamR": 0}}
+
+
 class FakeEngine:
     def __init__(self):
         self.tracker = type("Tracker", (), {"run_id": "buffered-run"})()
@@ -366,6 +386,31 @@ class ReplayBufferTests(unittest.TestCase):
         finally:
             if not gc_was_enabled:
                 gc.disable()
+
+    def test_live_runner_uses_capture_clock_without_replay_pacing(self):
+        source = FakeLiveSource(frame_count=3)
+        registry = FakeRegistry(source)
+        started = time.monotonic()
+        summary = ReplayRunner(
+            source,
+            FakeEngine(),
+            registry,
+            settings=ReplaySettings(
+                target_fps=60,
+                prebuffer_frames=0,
+                maximum_frames=3,
+            ),
+        ).run()
+
+        self.assertLess(time.monotonic() - started, 0.04)
+        self.assertTrue(summary.clock_synchronized)
+        self.assertEqual(summary.frames_processed, 3)
+        running = next(
+            session for session in registry.sessions if session.state == RunState.RUNNING
+        )
+        self.assertEqual(
+            running.settings["clock_contract"]["version"], "fastcap-live-v1"
+        )
 
     def test_registry_startup_stall_cannot_consume_the_run_clock_budget(self):
         source = FakeSequentialSource(frame_count=1)

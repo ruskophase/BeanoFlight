@@ -1385,11 +1385,13 @@ def _validate_status_transition(previous: TrackStatus, incoming: TrackStatus) ->
             TrackStatus.CONFIRMED,
             TrackStatus.OCCLUDED,
             TrackStatus.EXITED,
+            TrackStatus.CANCELLED,
         },
         TrackStatus.OCCLUDED: {
             TrackStatus.OCCLUDED,
             TrackStatus.CONFIRMED,
             TrackStatus.EXITED,
+            TrackStatus.CANCELLED,
         },
         TrackStatus.EXITED: set(),
         TrackStatus.CANCELLED: set(),

@@ -350,6 +350,22 @@ class TrackManager:
         active_snapshots = [track.snapshot() for track in self._active.values()]
         return tuple(sorted((*active_snapshots, *emitted), key=lambda value: value.bean_ref))
 
+    def cancel_active_at_boundary(
+        self, timestamp_ns: int
+    ) -> tuple[TrackSnapshot, ...]:
+        """Right-censor public tracks when a bounded live observation ends."""
+
+        snapshots: list[TrackSnapshot] = []
+        for track in self._active.values():
+            track.predict(max(timestamp_ns, track.timestamp_ns), self.settings)
+            track.status = TrackStatus.CANCELLED
+            snapshots.append(track.snapshot())
+            self._publish("cancelled", track, track.timestamp_ns)
+        self._active.clear()
+        self._suppressed.clear()
+        self._pending_births.clear()
+        return tuple(sorted(snapshots, key=lambda value: value.bean_ref))
+
     def _continue_pending_birth(
         self,
         candidate: _Track,

@@ -102,13 +102,14 @@ full-video time bands; three further passes provide replacements for rejected
 frames. This gives coverage across the recording without silently including
 moving beans. The accepted indices and selection seed are analysis provenance.
 
-The later live source should begin with an explicit background-acquisition
-period while bean feed is stopped. Continuous adaptation can then use a slow
-per-pixel model only where a dilated foreground mask and every active or
-recently missed track agree that the scene is clear. Updates should freeze
-during a busy scene, exposure/illumination change, or camera movement. This
-prevents a stationary or slow bean from being learned into the background and
-keeps live adaptation separable from the version 0.1 recorded-video model.
+The live source begins with an explicit, short background-acquisition period
+while bean feed is stopped. It takes the temporal median of synchronized CamL
+and CamR RAW green planes, then freezes that background for the bounded run.
+FastCap publishes only the newest complete frame per camera; BeanoFlight pairs
+hardware timestamps within 5 us and reports overwritten or unmatched sequence
+numbers instead of allowing latency to grow. Continuous background adaptation
+is deliberately deferred because it could learn stationary or slow beans into
+the scene model.
 
 ## Asynchronous extension points
 

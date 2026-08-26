@@ -119,6 +119,7 @@ class ReplaySummary:
     source_timeline_fps: float = 0.0
     mean_frame_age_ms: float = 0.0
     max_frame_age_ms: float = 0.0
+    right_censored_tracks: int = 0
     clock_start_offset_ms: float = 0.0
     clock_anchor_attempts: int = 0
     clock_anchor_misses: int = 0
@@ -901,10 +902,19 @@ class ReplayRunner:
         cancellation = stop or threading.Event()
         pause = paused or threading.Event()
         metadata = self.source.metadata
+        is_live = bool(getattr(self.source, "live", False))
+        if is_live and self.settings.prebuffer_frames:
+            raise ValueError("live camera input does not support replay prebuffering")
         frame_limit = min(metadata.frame_count, self.settings.maximum_frames)
         run_id = self.engine.tracker.run_id
         created_ns = time.time_ns()
-        start_source_ns = self.source.timestamp_ns(0)
+        start_source_ns = (
+            int(getattr(self.source, "clock_source_timestamp_ns", 0))
+            if is_live
+            else self.source.timestamp_ns(0)
+        )
+        if is_live and start_source_ns <= 0:
+            raise SourceError("source supplied an invalid initial timestamp")
         session = RunSession(
             run_id=run_id,
             revision=0,
@@ -996,6 +1006,7 @@ class ReplayRunner:
         }
         gc_was_enabled = False
         sorting_context_publisher = None
+        right_censored_tracks = 0
         try:
             if self.settings.prebuffer_frames > 0:
                 frame_buffer = DecodedFrameBuffer(
@@ -1022,10 +1033,19 @@ class ReplayRunner:
             if self.settings.suppress_cyclic_gc and gc_was_enabled:
                 gc.collect()
                 gc.disable()
-            clock_start = self._arm_run_clock(
-                session,
-                start_source_ns=start_source_ns,
-                cancellation=cancellation,
+            if is_live:
+                prime = getattr(self.source, "prime", None)
+                if prime is not None:
+                    prime()
+                start_source_ns = self.source.timestamp_ns(0)
+            clock_start = (
+                self._arm_live_clock(session, start_source_ns=start_source_ns)
+                if is_live
+                else self._arm_run_clock(
+                    session,
+                    start_source_ns=start_source_ns,
+                    cancellation=cancellation,
+                )
             )
             session = clock_start.session
             clock_metrics = clock_start.metrics
@@ -1037,6 +1057,8 @@ class ReplayRunner:
             while index < frame_limit:
                 if cancellation.is_set():
                     break
+                if is_live and pause.is_set():
+                    raise SourceError("live camera runs cannot be paused")
                 if pause.is_set():
                     session = self.registry.put_session(
                         replace(
@@ -1073,7 +1095,8 @@ class ReplayRunner:
                     )
                     was_paused = False
                 if (
-                    self.settings.target_fps > 0
+                    not is_live
+                    and self.settings.target_fps > 0
                     and self.settings.drop_stale_frames
                 ):
                     interval = 1.0 / self.settings.target_fps
@@ -1092,12 +1115,14 @@ class ReplayRunner:
                         index += skip_count
                         next_deadline += interval * skip_count
                         continue
-                frame_age_ms = max(
-                    0.0, (time.perf_counter() - next_deadline) * 1_000.0
-                )
-                frame_age_total += frame_age_ms
-                frame_age_max = max(frame_age_max, frame_age_ms)
-                timing_samples["frame_age_ms"].append(frame_age_ms)
+                frame_age_ms = 0.0
+                if not is_live:
+                    frame_age_ms = max(
+                        0.0, (time.perf_counter() - next_deadline) * 1_000.0
+                    )
+                    frame_age_total += frame_age_ms
+                    frame_age_max = max(frame_age_max, frame_age_ms)
+                    timing_samples["frame_age_ms"].append(frame_age_ms)
                 read_started = time.perf_counter_ns()
                 frame_work_started = read_started
                 frame = None
@@ -1116,6 +1141,20 @@ class ReplayRunner:
                     source_read_max = max(source_read_max, source_read_ms)
                     timing_samples["source_read_ms"].append(source_read_ms)
                     source_timestamp = self.source.timestamp_ns(index)
+                    if is_live:
+                        capture_monotonic_ns = session.source_to_monotonic_ns(
+                            source_timestamp
+                        )
+                        if capture_monotonic_ns is None:
+                            raise SourceError("live run clock is not armed")
+                        frame_age_ms = max(
+                            0.0,
+                            (time.monotonic_ns() - capture_monotonic_ns)
+                            / 1_000_000.0,
+                        )
+                        frame_age_total += frame_age_ms
+                        frame_age_max = max(frame_age_max, frame_age_ms)
+                        timing_samples["frame_age_ms"].append(frame_age_ms)
                     selected_crops: tuple[CropPayload, ...] = ()
                     crop_select_ms = 0.0
 
@@ -1291,14 +1330,67 @@ class ReplayRunner:
                             (frame_count + frames_skipped) / elapsed,
                         )
                     )
-                if self.settings.target_fps > 0:
+                if self.settings.target_fps > 0 and not is_live:
                     next_deadline += 1.0 / self.settings.target_fps
                     remaining = next_deadline - time.perf_counter()
                     if remaining > 0:
                         cancellation.wait(remaining)
                     else:
                         missed += 1
+                elif is_live and self.settings.target_fps > 0:
+                    work_without_wait_ms = max(0.0, frame_work_ms - source_read_ms)
+                    if work_without_wait_ms > 1_000.0 / self.settings.target_fps:
+                        missed += 1
                 index += 1
+            if is_live and frame_count:
+                cancel_at_boundary = getattr(
+                    self.engine.tracker, "cancel_active_at_boundary", None
+                )
+                censored = (
+                    ()
+                    if cancel_at_boundary is None
+                    else cancel_at_boundary(source_timestamp)
+                )
+                right_censored_tracks = len(censored)
+                if censored:
+                    updates = tuple(
+                        (
+                            track,
+                            None,
+                            ":".join(
+                                (
+                                    "track",
+                                    track.bean_ref.run_id,
+                                    str(track.bean_ref.sequence),
+                                    str(frame_count - 1),
+                                    "run-boundary-cancelled",
+                                )
+                            ),
+                        )
+                        for track in censored
+                    )
+                    if self.crop_dispatcher is not None:
+                        if not self.crop_dispatcher.enqueue_frame(updates, ()):
+                            raise RuntimeError(
+                                "could not persist live run-boundary track state"
+                            )
+                    else:
+                        self.registry.update_tracks(updates)
+                    if sorting_context_publisher is not None:
+                        sorting_context_publisher.send_batch(
+                            run_id=run_id,
+                            frame_index=frame_count - 1,
+                            source_fps=session.source_fps,
+                            target_fps=session.target_fps,
+                            clock_source_timestamp_ns=(
+                                session.clock_source_timestamp_ns
+                            ),
+                            clock_monotonic_ns=session.clock_monotonic_ns,
+                            clock_epoch=session.revision,
+                            items=tuple(
+                                SortingContext(track, None) for track in censored
+                            ),
+                        )
             playback_elapsed = max(time.perf_counter() - started, 1e-9)
         except Exception as exc:
             failure = exc
@@ -1322,6 +1414,14 @@ class ReplayRunner:
             source_statistics = getattr(self.source, "stereo_statistics", None)
             if callable(source_statistics):
                 source_metrics = source_statistics()
+            if is_live:
+                live_drops = source_metrics.get("sequence_drops", {})
+                if isinstance(live_drops, Mapping):
+                    frames_skipped = max(
+                        (int(value) for value in live_drops.values()),
+                        default=0,
+                    )
+                missed = max(missed, frames_skipped)
             if sorting_context_publisher is not None:
                 sorting_context_metrics = {
                     "enabled": True,
@@ -1374,6 +1474,7 @@ class ReplayRunner:
                             "prebuffer_seconds": prebuffer_seconds,
                             "missed_deadlines": missed,
                             "frames_skipped": frames_skipped,
+                            "right_censored_tracks": right_censored_tracks,
                             "mean_frame_age_ms": mean_frame_age_ms,
                             "max_frame_age_ms": frame_age_max,
                             "crops_submitted": crops_submitted,
@@ -1419,6 +1520,7 @@ class ReplayRunner:
             source_timeline_fps=source_timeline_fps,
             mean_frame_age_ms=mean_frame_age_ms,
             max_frame_age_ms=frame_age_max,
+            right_censored_tracks=right_censored_tracks,
             clock_start_offset_ms=float(clock_metrics["start_offset_ms"]),
             clock_anchor_attempts=int(clock_metrics["anchor_attempts"]),
             clock_anchor_misses=int(clock_metrics["anchor_misses"]),
@@ -1566,6 +1668,89 @@ class ReplayRunner:
                 "anchor_attempts": maximum_attempts,
                 "anchor_misses": misses,
                 "attempts": attempts,
+            },
+        )
+
+    def _arm_live_clock(
+        self,
+        session: RunSession,
+        *,
+        start_source_ns: int,
+    ) -> _RunClockStart:
+        """Persist FastCap's camera-timestamp to monotonic-clock anchor."""
+
+        source_anchor_ns = int(
+            getattr(self.source, "clock_source_timestamp_ns", 0)
+        )
+        monotonic_anchor_ns = int(getattr(self.source, "clock_monotonic_ns", 0))
+        if source_anchor_ns <= 0 or monotonic_anchor_ns <= 0:
+            return _RunClockStart(
+                session,
+                time.perf_counter_ns(),
+                {
+                    "synchronized": False,
+                    "failure": "live source supplied no FastCap clock anchor",
+                    "start_offset_ms": 0.0,
+                    "anchor_attempts": 1,
+                    "anchor_misses": 1,
+                },
+            )
+        expected_epoch = session.revision + 1
+        contract = {
+            "version": "fastcap-live-v1",
+            "epoch": expected_epoch,
+            "source_timestamp_ns": source_anchor_ns,
+            "monotonic_ns": monotonic_anchor_ns,
+            "playback_scale_ppb": round(
+                session.playback_scale * 1_000_000_000
+            ),
+        }
+        current = self.registry.put_session(
+            replace(
+                session,
+                state=RunState.RUNNING,
+                clock_source_timestamp_ns=source_anchor_ns,
+                clock_monotonic_ns=monotonic_anchor_ns,
+                updated_timestamp_ns=time.time_ns(),
+                settings={
+                    **session.settings,
+                    "clock_contract": contract,
+                    "clock_contracts": [contract],
+                },
+            ),
+            expected_revision=session.revision,
+        )
+        if current.revision != expected_epoch:
+            return _RunClockStart(
+                current,
+                time.perf_counter_ns(),
+                {
+                    "synchronized": False,
+                    "failure": "registry did not persist the expected live clock epoch",
+                    "start_offset_ms": 0.0,
+                    "anchor_attempts": 1,
+                    "anchor_misses": 1,
+                },
+            )
+        mapped_start_ns = current.source_to_monotonic_ns(start_source_ns)
+        if mapped_start_ns is None:
+            raise RuntimeError("persisted live run clock is not usable")
+        now_monotonic_ns = time.monotonic_ns()
+        start_age_ms = (now_monotonic_ns - mapped_start_ns) / 1_000_000.0
+        return _RunClockStart(
+            current,
+            time.perf_counter_ns(),
+            {
+                "contract": "fastcap-live-v1",
+                "epoch": current.revision,
+                "anchor_source_ns": source_anchor_ns,
+                "anchor_monotonic_ns": monotonic_anchor_ns,
+                "first_frame_source_ns": start_source_ns,
+                "actual_start_monotonic_ns": now_monotonic_ns,
+                "start_offset_ms": start_age_ms,
+                "anchor_attempts": 1,
+                "anchor_misses": 0,
+                "synchronized": True,
             },
         )
 

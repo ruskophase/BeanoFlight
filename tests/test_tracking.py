@@ -152,6 +152,22 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(ended[0].status, TrackStatus.EXITED)
         self.assertEqual(manager.active_count, 0)
 
+    def test_bounded_live_boundary_right_censors_active_tracks(self):
+        manager = TrackManager(
+            top_y_mm=-37.0,
+            bottom_y_mm=37.0,
+            settings=TrackerSettings(confirmation_hits=1),
+            run_id="bounded-live",
+        )
+        active = manager.update((observation(0, 10, 0.0, -20.0),), 10)
+
+        censored = manager.cancel_active_at_boundary(20)
+
+        self.assertEqual(censored[0].bean_ref, active[0].bean_ref)
+        self.assertEqual(censored[0].status, TrackStatus.CANCELLED)
+        self.assertEqual(censored[0].timestamp_ns, 20)
+        self.assertEqual(manager.active_count, 0)
+
     def test_new_detection_touching_left_margin_is_explicitly_rejected(self):
         settings = TrackerSettings(
             confirmation_hits=1,
