@@ -105,6 +105,42 @@ class RawReplayTests(unittest.TestCase):
             )
             source.close()
 
+    def test_mmaps_offset_frames_from_contiguous_raw_stream(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_bundle(root)
+            metadata = root / "metadata/CamL.csv"
+            with metadata.open(newline="", encoding="utf-8") as stream:
+                rows = list(csv.DictReader(stream))
+            payloads = [(root / row["raw_path"]).read_bytes() for row in rows]
+            stream_path = root / "raw/CamL/frames.raw"
+            stream_path.write_bytes(b"".join(payloads))
+            fields = ("frame_index", "timestamp_ns", "raw_path", "raw_offset")
+            with metadata.open("w", newline="", encoding="utf-8") as stream:
+                output = csv.DictWriter(stream, fieldnames=fields)
+                output.writeheader()
+                offset = 0
+                for row, payload in zip(rows, payloads, strict=True):
+                    output.writerow(
+                        {
+                            "frame_index": row["frame_index"],
+                            "timestamp_ns": row["timestamp_ns"],
+                            "raw_path": "raw/CamL/frames.raw",
+                            "raw_offset": offset,
+                        }
+                    )
+                    offset += len(payload)
+
+            source = MMapRawVideoSource(root)
+            first = source.frame(0)
+            second = source.frame(1)
+            self.assertLess(float(first.detection_gray.mean()), float(second.detection_gray.mean()))
+            self.assertEqual(first.path, stream_path.resolve())
+            self.assertEqual(second.path, stream_path.resolve())
+            source.release_frame(first)
+            source.release_frame(second)
+            source.close()
+
     def test_ml_fast_crop_is_linear_and_calibrated_reference_remains_available(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

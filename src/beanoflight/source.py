@@ -104,6 +104,8 @@ class _RawStereoPair:
     right_timestamp_ns: int
     left_path: Path
     right_path: Path
+    left_offset: int = 0
+    right_offset: int = 0
 
 
 def resolve_caml_video(path: Path) -> Path:
@@ -406,7 +408,7 @@ class MMapRawVideoSource:
         self._stereo_calibration: StereoPointCalibration | None = None
         self._stereo_pairs: dict[int, _RawStereoPair] = {}
         self._right_profile: dict[str, object] | None = None
-        self._right_rows: tuple[tuple[int, Path], ...] = ()
+        self._right_rows: tuple[tuple[int, Path, int], ...] = ()
         self._right_width = 0
         self._right_height = 0
         self._right_stride = 0
@@ -525,13 +527,15 @@ class MMapRawVideoSource:
                 raise SourceError("pairs.csv refers to an invalid CamL frame")
             if not 0 <= pair.right_frame_index < len(right_rows):
                 raise SourceError("pairs.csv refers to an invalid CamR frame")
-            left_timestamp, left_path = self._rows[pair.left_frame_index]
-            right_timestamp, right_path = right_rows[pair.right_frame_index]
+            left_timestamp, left_path, left_offset = self._rows[pair.left_frame_index]
+            right_timestamp, right_path, right_offset = right_rows[pair.right_frame_index]
             if (
                 left_timestamp != pair.left_timestamp_ns
                 or right_timestamp != pair.right_timestamp_ns
                 or left_path != pair.left_path
                 or right_path != pair.right_path
+                or left_offset != pair.left_offset
+                or right_offset != pair.right_offset
             ):
                 raise SourceError("pairs.csv disagrees with RAW camera metadata")
         if not all(index in pair_by_left for index in range(len(self._rows))):
@@ -606,33 +610,19 @@ class MMapRawVideoSource:
         return self._row(index)[0]
 
     def frame(self, index: int) -> RawReplayFrame:
-        _timestamp, relative = self._row(index)
-        path = (self.path / relative).resolve()
-        if self.path not in path.parents:
-            raise SourceError(f"RAW frame path escapes recording bundle: {relative}")
+        _timestamp, relative, raw_offset = self._row(index)
+        mapping, mosaic, path = _mmap_raw_mosaic(
+            self.path,
+            relative,
+            raw_offset=raw_offset,
+            width=self._width,
+            height=self._height,
+            stride=self._stride,
+            expected_bytes=self._expected_bytes,
+            frame_index=index,
+            camera_id="CamL",
+        )
         try:
-            descriptor = path.stat()
-        except OSError as exc:
-            raise SourceError(f"cannot stat RAW frame {index + 1}: {exc}") from exc
-        if descriptor.st_size != self._expected_bytes:
-            raise SourceError(
-                f"RAW frame {index + 1} has {descriptor.st_size} bytes; "
-                f"expected {self._expected_bytes}"
-            )
-        descriptor_fd = os.open(path, os.O_RDONLY)
-        try:
-            mapping = mmap.mmap(
-                descriptor_fd, self._expected_bytes, access=mmap.ACCESS_READ
-            )
-        except Exception:
-            os.close(descriptor_fd)
-            raise
-        os.close(descriptor_fd)
-        try:
-            words = np.ndarray(
-                (self._height, self._stride // 2), dtype="<u2", buffer=mapping
-            )
-            mosaic = words[:, : self._width]
             green_stored = cv2.addWeighted(
                 mosaic[0::2, 1::2], 0.5, mosaic[1::2, 0::2], 0.5, 0.0
             )
@@ -646,6 +636,7 @@ class MMapRawVideoSource:
                 right_mapping, right_mosaic, right_path = _mmap_raw_mosaic(
                     self.path,
                     pair.right_path,
+                    raw_offset=pair.right_offset,
                     width=self._right_width,
                     height=self._right_height,
                     stride=self._right_stride,
@@ -849,6 +840,7 @@ class MMapRawVideoSource:
             mapping, mosaic, _path = _mmap_raw_mosaic(
                 self.path,
                 pair.right_path,
+                raw_offset=pair.right_offset,
                 width=self._right_width,
                 height=self._right_height,
                 stride=self._right_stride,
@@ -1063,7 +1055,7 @@ class MMapRawVideoSource:
     def __exit__(self, _exc_type, _exc, _traceback) -> None:
         self.close()
 
-    def _row(self, index: int) -> tuple[int, Path]:
+    def _row(self, index: int) -> tuple[int, Path, int]:
         if not 0 <= index < len(self._rows):
             raise SourceError(f"frame {index} is outside the RAW bundle")
         return self._rows[index]
@@ -1358,6 +1350,7 @@ def _mmap_raw_mosaic(
     root: Path,
     relative: Path,
     *,
+    raw_offset: int,
     width: int,
     height: int,
     stride: int,
@@ -1374,18 +1367,34 @@ def _mmap_raw_mosaic(
         raise SourceError(
             f"cannot stat {camera_id} RAW frame {frame_index + 1}: {exc}"
         ) from exc
-    if descriptor.st_size != expected_bytes:
+    if raw_offset < 0:
         raise SourceError(
-            f"{camera_id} RAW frame {frame_index + 1} has "
-            f"{descriptor.st_size} bytes; expected {expected_bytes}"
+            f"{camera_id} RAW frame {frame_index + 1} has invalid offset {raw_offset}"
+        )
+    if descriptor.st_size < raw_offset + expected_bytes:
+        raise SourceError(
+            f"{camera_id} RAW frame {frame_index + 1} exceeds its "
+            f"{descriptor.st_size}-byte source at offset {raw_offset}"
         )
     descriptor_fd = os.open(path, os.O_RDONLY)
+    mapping_offset = raw_offset - raw_offset % mmap.ALLOCATIONGRANULARITY
+    buffer_offset = raw_offset - mapping_offset
     try:
-        mapping = mmap.mmap(descriptor_fd, expected_bytes, access=mmap.ACCESS_READ)
+        mapping = mmap.mmap(
+            descriptor_fd,
+            buffer_offset + expected_bytes,
+            access=mmap.ACCESS_READ,
+            offset=mapping_offset,
+        )
     finally:
         os.close(descriptor_fd)
     try:
-        words = np.ndarray((height, stride // 2), dtype="<u2", buffer=mapping)
+        words = np.ndarray(
+            (height, stride // 2),
+            dtype="<u2",
+            buffer=mapping,
+            offset=buffer_offset,
+        )
         mosaic = words[:, :width]
     except Exception:
         mapping.close()
@@ -1461,6 +1470,8 @@ def _read_stereo_pairs(path: Path) -> tuple[_RawStereoPair, ...]:
                         right_timestamp_ns=int(row["right_timestamp_ns"]),
                         left_path=Path(row["left_raw_path"]),
                         right_path=Path(row["right_raw_path"]),
+                        left_offset=int(row.get("left_raw_offset") or 0),
+                        right_offset=int(row.get("right_raw_offset") or 0),
                     )
                 )
     except (OSError, ValueError, KeyError):
@@ -1470,18 +1481,21 @@ def _read_stereo_pairs(path: Path) -> tuple[_RawStereoPair, ...]:
     return tuple(rows)
 
 
-def _read_raw_metadata(path: Path) -> tuple[tuple[int, Path], ...]:
-    rows: list[tuple[int, Path]] = []
+def _read_raw_metadata(path: Path) -> tuple[tuple[int, Path, int], ...]:
+    rows: list[tuple[int, Path, int]] = []
     with path.open(newline="", encoding="utf-8") as stream:
         for expected_index, row in enumerate(csv.DictReader(stream)):
             index = int(row["frame_index"])
             timestamp = int(row["timestamp_ns"])
             relative = Path(row["raw_path"])
+            raw_offset = int(row.get("raw_offset") or 0)
             if index != expected_index:
                 raise ValueError("CamL RAW metadata frame indices are not contiguous")
             if rows and timestamp <= rows[-1][0]:
                 raise ValueError("CamL RAW timestamps are not strictly increasing")
-            rows.append((timestamp, relative))
+            if raw_offset < 0:
+                raise ValueError("RAW metadata offsets must be non-negative")
+            rows.append((timestamp, relative, raw_offset))
     return tuple(rows)
 
 
