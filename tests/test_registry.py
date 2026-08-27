@@ -481,6 +481,26 @@ class BeanRegistryTests(unittest.TestCase):
         self.assertEqual(registry.hot_state_metrics()["records"], 1)
         self.assertEqual(registry.get(second).bean_ref, second)
 
+    def test_record_pages_advance_by_run_sequence(self):
+        registry = BeanRegistry()
+        for sequence in range(1, 5):
+            registry.update_track(
+                track(BeanRef("paged-run", sequence), 0, 100 + sequence, -25.0)
+            )
+        registry.update_track(track(BeanRef("another-run", 3), 0, 200, -25.0))
+
+        first = registry.list_records_page(
+            run_id="paged-run", after_sequence=0, limit=2
+        )
+        second = registry.list_records_page(
+            run_id="paged-run",
+            after_sequence=first[-1].bean_ref.sequence,
+            limit=2,
+        )
+
+        self.assertEqual([item.bean_ref.sequence for item in first], [1, 2])
+        self.assertEqual([item.bean_ref.sequence for item in second], [3, 4])
+
     def test_durable_record_cache_is_bounded_without_evicting_active_beans(self):
         with tempfile.TemporaryDirectory() as temporary:
             repository = SQLiteBeanRepository(Path(temporary) / "registry.db")

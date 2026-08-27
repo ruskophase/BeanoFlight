@@ -90,6 +90,15 @@ class RegistryRepository(Protocol):
         statuses: Sequence[TrackStatus] | None = None,
     ) -> tuple[BeanRecord, ...]: ...
 
+    def list_records_page(
+        self,
+        *,
+        run_id: str,
+        after_sequence: int,
+        limit: int,
+        statuses: Sequence[TrackStatus] | None = None,
+    ) -> tuple[BeanRecord, ...]: ...
+
     def event_identity(self, event_id: str) -> tuple[BeanRef, str] | None: ...
 
     def events_since(
@@ -975,6 +984,40 @@ class BeanRegistry:
                 and (allowed is None or record.status in allowed)
             )
             return tuple(sorted(records, key=lambda item: item.bean_ref))
+
+    def list_records_page(
+        self,
+        *,
+        run_id: str,
+        after_sequence: int = 0,
+        limit: int = 100,
+        statuses: Sequence[TrackStatus] | None = None,
+    ) -> tuple[BeanRecord, ...]:
+        if not run_id:
+            raise ValueError("run_id is required for paginated record queries")
+        if after_sequence < 0:
+            raise ValueError("record page cursor cannot be negative")
+        if not 1 <= limit <= 100:
+            raise ValueError("record page limit must be between 1 and 100")
+        with self._lock:
+            if self.repository is not None:
+                return self.repository.list_records_page(
+                    run_id=run_id,
+                    after_sequence=after_sequence,
+                    limit=limit,
+                    statuses=statuses,
+                )
+            allowed = None if statuses is None else frozenset(statuses)
+            records = (
+                record
+                for bean_ref, record in self._records.items()
+                if bean_ref.run_id == run_id
+                and bean_ref.sequence > after_sequence
+                and (allowed is None or record.status in allowed)
+            )
+            return tuple(
+                sorted(records, key=lambda item: item.bean_ref.sequence)[:limit]
+            )
 
     def list_active(self, *, run_id: str | None = None) -> tuple[BeanRecord, ...]:
         return self.list_records(

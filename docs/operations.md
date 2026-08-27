@@ -221,6 +221,9 @@ For real-time runs, inspect `source_timeline_fps`, `frames_skipped`, and
 `frame_age_ms` together. Processed FPS intentionally falls when an old replay
 frame is discarded; source-timeline FPS shows whether the input clock was kept,
 while frame-age telemetry proves that latency remained bounded.
+`stale_skip_events` records the first zero-based frame index, number of frames,
+and accumulated age for up to 128 discard events so an isolated scheduling
+spike can be distinguished from sustained overload.
 
 An isolated full-pipeline benchmark also reports `outcome.timing_ledger`.
 Inspect `late_by_ms`, `equivalent_line_extension_mm`,

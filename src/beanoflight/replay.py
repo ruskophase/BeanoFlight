@@ -29,6 +29,8 @@ from .telemetry import SystemTelemetrySampler, TimingAccumulator, summarize_samp
 DEFAULT_EMERGENCY_MICROBATCH_WINDOW_MS = 35.0
 DEFAULT_DECISION_SAFETY_RESERVE_MS = 17.0
 DEFAULT_EMERGENCY_MICROBATCH_MINIMUM_BEANS = 5
+MAXIMUM_REPLAY_FRAMES = 100_000
+MAXIMUM_STALE_SKIP_EVENTS = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,8 +55,11 @@ class ReplaySettings:
             raise ValueError("target FPS must be finite and non-negative")
         if not 0 <= self.prebuffer_frames <= 120:
             raise ValueError("prebuffer frames must be between zero and 120")
-        if not 1 <= self.maximum_frames <= 1_000:
-            raise ValueError("maximum replay frames must be between 1 and 1000")
+        if not 1 <= self.maximum_frames <= MAXIMUM_REPLAY_FRAMES:
+            raise ValueError(
+                "maximum replay frames must be between 1 and "
+                f"{MAXIMUM_REPLAY_FRAMES}"
+            )
         if self.crop_queue_capacity <= 0:
             raise ValueError("crop queue capacity must be positive")
         if (
@@ -116,6 +121,7 @@ class ReplaySummary:
     crops_dropped: int
     stopped: bool
     frames_skipped: int = 0
+    stale_skip_events: tuple[dict[str, float | int], ...] = ()
     source_timeline_fps: float = 0.0
     mean_frame_age_ms: float = 0.0
     max_frame_age_ms: float = 0.0
@@ -986,6 +992,7 @@ class ReplayRunner:
         source_read_max = 0.0
         missed = 0
         frames_skipped = 0
+        stale_skip_events: list[dict[str, float | int]] = []
         frame_age_total = 0.0
         frame_age_max = 0.0
         was_paused = False
@@ -1107,6 +1114,14 @@ class ReplayRunner:
                             frame_limit - index,
                             max(1, math.ceil((age_seconds - maximum_age) / interval)),
                         )
+                        if len(stale_skip_events) < MAXIMUM_STALE_SKIP_EVENTS:
+                            stale_skip_events.append(
+                                {
+                                    "first_frame_index": index,
+                                    "frame_count": skip_count,
+                                    "age_ms": age_seconds * 1_000.0,
+                                }
+                            )
                         for skipped_index in range(index, index + skip_count):
                             if frame_buffer is not None:
                                 skipped_frame = frame_buffer.frame(skipped_index)
@@ -1342,7 +1357,12 @@ class ReplayRunner:
                     if work_without_wait_ms > 1_000.0 / self.settings.target_fps:
                         missed += 1
                 index += 1
-            if is_live and frame_count:
+            # Any natural bounded observation can end while a bean is still in
+            # view. Recorded prefixes and complete recordings need the same
+            # explicit right-censoring as live validation runs, otherwise a
+            # last-frame crop can leave the Sorter waiting forever for another
+            # sample that cannot exist.
+            if frame_count and not cancellation.is_set():
                 cancel_at_boundary = getattr(
                     self.engine.tracker, "cancel_active_at_boundary", None
                 )
@@ -1474,6 +1494,16 @@ class ReplayRunner:
                             "prebuffer_seconds": prebuffer_seconds,
                             "missed_deadlines": missed,
                             "frames_skipped": frames_skipped,
+                            "stale_skip_events": tuple(stale_skip_events),
+                            "stale_skip_events_truncated": (
+                                len(stale_skip_events)
+                                >= MAXIMUM_STALE_SKIP_EVENTS
+                                and frames_skipped
+                                > sum(
+                                    int(item["frame_count"])
+                                    for item in stale_skip_events
+                                )
+                            ),
                             "right_censored_tracks": right_censored_tracks,
                             "mean_frame_age_ms": mean_frame_age_ms,
                             "max_frame_age_ms": frame_age_max,
@@ -1517,6 +1547,7 @@ class ReplayRunner:
             crops_dropped=crops_dropped,
             stopped=cancellation.is_set(),
             frames_skipped=frames_skipped,
+            stale_skip_events=tuple(stale_skip_events),
             source_timeline_fps=source_timeline_fps,
             mean_frame_age_ms=mean_frame_age_ms,
             max_frame_age_ms=frame_age_max,
@@ -1527,6 +1558,7 @@ class ReplayRunner:
             clock_synchronized=bool(clock_metrics["synchronized"]),
             timings={
                 "timings_ms": timing_summary,
+                "stale_skip_events": tuple(stale_skip_events),
                 "registry": {
                     "hot_start": registry_hot_start,
                     "service": registry_metrics,

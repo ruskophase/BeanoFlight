@@ -39,7 +39,12 @@ from .models import FrameAnalysis, PipelineStage
 from .prediction import GateLayout
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
 from .registry_zmq import ZeroMQRegistryClient
-from .replay import CropDispatcher, ReplayRunner, ReplaySettings
+from .replay import (
+    MAXIMUM_REPLAY_FRAMES,
+    CropDispatcher,
+    ReplayRunner,
+    ReplaySettings,
+)
 from .sorting_context_transport import DEFAULT_SORTING_CONTEXT_ENDPOINT
 from .source import (
     MMapRawVideoSource,
@@ -841,7 +846,7 @@ class BeanoFlightApp(tk.Tk):
             parent,
             textvariable=self.maximum_frames_var,
             from_=1,
-            to=1000,
+            to=MAXIMUM_REPLAY_FRAMES,
             width=18,
         ).grid(row=7, column=1, sticky=tk.EW, pady=3)
         ttk.Label(parent, text="Square crop size (px)").grid(

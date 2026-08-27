@@ -143,6 +143,7 @@ class ZeroMQRegistryTests(unittest.TestCase):
             self.assertGreaterEqual(ping["api_version"], 2)
             self.assertIn("complete_inference_jobs_ack", ping["capabilities"])
             self.assertIn("record_actuation_ack", ping["capabilities"])
+            self.assertIn("record_pages", ping["capabilities"])
             self.assertEqual(ping["database"], str(repository.path.resolve()))
             # PUB/SUB subscriptions are asynchronous; allow the local handshake.
             time.sleep(0.1)
@@ -161,6 +162,14 @@ class ZeroMQRegistryTests(unittest.TestCase):
             self.assertEqual(len(queried.track.history), 1)
             self.assertEqual(
                 client.get_many((bean_ref,), include_history=False),
+                (created,),
+            )
+            self.assertEqual(
+                client.list_records_page(
+                    run_id=bean_ref.run_id,
+                    after_sequence=bean_ref.sequence - 1,
+                    limit=1,
+                ),
                 (created,),
             )
 

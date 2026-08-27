@@ -746,16 +746,24 @@ def _wait_for_outcome(
     *,
     abort_event=None,
 ) -> dict[str, object]:
-    client = ZeroMQRegistryClient(endpoint, timeout_ms=2_000)
+    client = ZeroMQRegistryClient(endpoint, timeout_ms=5_000)
     records = ()
     session = None
     settled = False
     registry_transport_retries = 0
     try:
-        deadline = time.monotonic() + 5.0
+        # A full page sweep can itself take several seconds for a multi-minute
+        # run. Keep enough time for a second coherent sweep if early pages were
+        # read while the final inference/audit work was still settling.
+        deadline = time.monotonic() + 30.0
         while True:
             try:
-                records = client.list_records(run_id=run_id)
+                records, page_retries = _list_run_records(
+                    client,
+                    run_id,
+                    abort_event=abort_event,
+                )
+                registry_transport_retries += page_retries
             except RegistryTransportError:
                 registry_transport_retries += 1
                 if abort_event is not None and abort_event.is_set():
@@ -941,6 +949,33 @@ def _wait_for_outcome(
         "identity_continuity": _identity_continuity(records),
         "timing_ledger": summarize_timing_ledgers(records),
     }
+
+
+def _list_run_records(client, run_id: str, *, abort_event=None):
+    """Read one run without exceeding the Registry transport message ceiling."""
+
+    records = []
+    after_sequence = 0
+    retries = 0
+    while True:
+        page, page_retries = _retry_registry_call(
+            lambda: client.list_records_page(
+                run_id=run_id,
+                after_sequence=after_sequence,
+                limit=100,
+            ),
+            abort_event=abort_event,
+        )
+        retries += page_retries
+        if not page:
+            break
+        if any(record.bean_ref.sequence <= after_sequence for record in page):
+            raise RegistryTransportError("Registry record page did not advance")
+        records.extend(page)
+        after_sequence = page[-1].bean_ref.sequence
+        if len(page) < 100:
+            break
+    return tuple(records), retries
 
 
 def _retry_registry_call(operation, *, abort_event=None, attempts: int = 5):

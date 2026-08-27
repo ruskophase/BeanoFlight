@@ -6,6 +6,7 @@ from beanoflight.models import BeanRef, Detection, Observation
 from beanoflight.performance_benchmark import (
     _compact_endurance_outcome,
     _identity_continuity,
+    _list_run_records,
     _retry_registry_call,
     _scenario_summaries,
     _scenarios,
@@ -17,6 +18,40 @@ from beanoflight.system_test import parser as system_test_parser
 
 
 class PerformanceBenchmarkTests(unittest.TestCase):
+    def test_long_outcome_records_are_collected_in_bounded_pages(self):
+        records = tuple(
+            SimpleNamespace(bean_ref=BeanRef("long-run", sequence))
+            for sequence in range(1, 206)
+        )
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def list_records_page(
+                self, *, run_id, after_sequence, limit
+            ):
+                self.calls.append((run_id, after_sequence, limit))
+                return tuple(
+                    record
+                    for record in records
+                    if record.bean_ref.sequence > after_sequence
+                )[:limit]
+
+        client = Client()
+        collected, retries = _list_run_records(client, "long-run")
+
+        self.assertEqual(collected, records)
+        self.assertEqual(retries, 0)
+        self.assertEqual(
+            client.calls,
+            [
+                ("long-run", 0, 100),
+                ("long-run", 100, 100),
+                ("long-run", 200, 100),
+            ],
+        )
+
     def test_hardware_actuator_is_opt_in(self):
         default = benchmark_parser().parse_args(
             ["/recording", "--background-frames", "1,2,3"]

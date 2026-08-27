@@ -185,10 +185,14 @@ beano-system-test /recordings/example \
   --crop-processing ml-fast \
   --crop-size 224 \
   --prebuffer-frames 60 \
-  --maximum-frames 1000 \
+  --maximum-frames 18001 \
   --crops-per-bean 2 \
   --target-fps 60
 ```
+
+Replay accepts up to 100,000 frames, so a complete five-minute 60 fps capture
+can be exercised without splitting it. The conservative 1,000-frame default is
+unchanged for routine smoke tests.
 
 For an isolated multi-run performance test, `beano-performance-benchmark`
 starts a private Registry, Inferencer and Sorter, keeps them alive across

@@ -209,10 +209,14 @@ beano-system-test /path/to/20260816T134132.801241Z-beans \
   --crop-processing ml-fast \
   --crop-size 224 \
   --prebuffer-frames 60 \
-  --maximum-frames 1000 \
+  --maximum-frames 18001 \
   --crops-per-bean 1 \
   --target-fps 60
 ```
+
+The replay ceiling is 100,000 frames; the default remains 1,000 for short smoke
+tests. Set `--maximum-frames 18001` to cover one of the five-minute 60 fps
+recordings in full.
 
 Stale-frame dropping is enabled by default with a 30 ms age ceiling, matching
 the bounded-latency behaviour expected from a live camera. Use
@@ -254,6 +258,9 @@ The report preserves every run summary and adds per-scenario distributions.
 `passed` requires both `all_outcomes_complete` and
 `all_within_one_fps_of_target`; a one-FPS tolerance allows normal
 operating-system scheduling jitter without hiding sustained under-performance.
+The three complete five-minute 60 fps TensorRT validations and the
+duration-dependent fixes they exposed are documented in the
+[2026-08-27 replay report](benchmarks/2026-08-27-five-minute-replays.md).
 
 For long-lived GC, memory and thermal validation, keep all three services alive
 for a time-bounded run:

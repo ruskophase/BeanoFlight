@@ -24,7 +24,12 @@ from .inference_transport import DEFAULT_CROP_ENDPOINT
 from .prediction import GateLayout
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
 from .registry_zmq import ZeroMQRegistryClient
-from .replay import CropDispatcher, ReplayRunner, ReplaySettings
+from .replay import (
+    MAXIMUM_REPLAY_FRAMES,
+    CropDispatcher,
+    ReplayRunner,
+    ReplaySettings,
+)
 from .sorting_context_transport import DEFAULT_SORTING_CONTEXT_ENDPOINT
 from .source import MMapRawVideoSource, SourceError, open_replay_source
 from .tracking import TrackerSettings
@@ -129,7 +134,7 @@ def parser() -> argparse.ArgumentParser:
         "--maximum-frames",
         type=int,
         default=1000,
-        help="maximum frames to replay (1-1000)",
+        help=f"maximum frames to replay (1-{MAXIMUM_REPLAY_FRAMES})",
     )
     result.add_argument(
         "--keep-stale-frames",

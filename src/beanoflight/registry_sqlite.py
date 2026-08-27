@@ -554,6 +554,39 @@ class SQLiteBeanRepository:
                 if (record := self.load(reference)) is not None
             )
 
+    def list_records_page(
+        self,
+        *,
+        run_id: str,
+        after_sequence: int,
+        limit: int,
+        statuses: Sequence[TrackStatus] | None = None,
+    ) -> tuple[BeanRecord, ...]:
+        clauses = ["run_id=?", "sequence>?"]
+        parameters: list[object] = [run_id, after_sequence]
+        if statuses is not None:
+            values = tuple(status.value for status in statuses)
+            if not values:
+                return ()
+            clauses.append(f"status IN ({','.join('?' for _ in values)})")
+            parameters.extend(values)
+        parameters.append(limit)
+        with self._lock:
+            references = tuple(
+                BeanRef(row["run_id"], int(row["sequence"]))
+                for row in self._connection.execute(
+                    "SELECT run_id, sequence FROM beans WHERE "
+                    + " AND ".join(clauses)
+                    + " ORDER BY sequence LIMIT ?",
+                    parameters,
+                )
+            )
+            return tuple(
+                record
+                for reference in references
+                if (record := self.load(reference)) is not None
+            )
+
     def event_identity(self, event_id: str) -> tuple[BeanRef, str] | None:
         if not event_id:
             return None

@@ -50,7 +50,7 @@ from .registry_models import (
 from .telemetry import TimingAccumulator
 
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
-REGISTRY_API_VERSION = 2
+REGISTRY_API_VERSION = 3
 CAPABILITY_COMPLETE_INFERENCE_JOBS_ACK = "complete_inference_jobs_ack"
 CAPABILITY_ADD_ENRICHMENTS = "add_enrichments"
 CAPABILITY_RECORD_ACTUATION_ACK = "record_actuation_ack"
@@ -60,6 +60,7 @@ REGISTRY_CAPABILITIES = (
     CAPABILITY_RECORD_ACTUATION_ACK,
     "event_batches",
     "events_since_compact",
+    "record_pages",
 )
 
 
@@ -231,6 +232,23 @@ class ZeroMQRegistryServer:
                     )
                 )
                 records = self.registry.list_records(run_id=run_id, statuses=statuses)
+            return [record_to_dict(record, include_history=False) for record in records]
+        if operation == "list_page":
+            run_id = str(payload.get("run_id", ""))
+            statuses_value = payload.get("statuses")
+            statuses = (
+                None
+                if statuses_value is None
+                else tuple(
+                    TrackStatus(str(item)) for item in _array(statuses_value)
+                )
+            )
+            records = self.registry.list_records_page(
+                run_id=run_id,
+                after_sequence=int(payload.get("after_sequence", 0)),
+                limit=int(payload.get("limit", 100)),
+                statuses=statuses,
+            )
             return [record_to_dict(record, include_history=False) for record in records]
         if operation == "events_since":
             return [
@@ -616,6 +634,26 @@ class ZeroMQRegistryClient:
         return tuple(
             record_from_dict(_object(item))
             for item in _array(self._request("list", payload))
+        )
+
+    def list_records_page(
+        self,
+        *,
+        run_id: str,
+        after_sequence: int = 0,
+        limit: int = 100,
+        statuses: tuple[TrackStatus, ...] | None = None,
+    ) -> tuple[BeanRecord, ...]:
+        payload: dict[str, object] = {
+            "run_id": run_id,
+            "after_sequence": after_sequence,
+            "limit": limit,
+        }
+        if statuses is not None:
+            payload["statuses"] = [status.value for status in statuses]
+        return tuple(
+            record_from_dict(_object(item))
+            for item in _array(self._request("list_page", payload))
         )
 
     def list_active(self, *, run_id: str | None = None) -> tuple[BeanRecord, ...]:

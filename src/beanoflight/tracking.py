@@ -353,7 +353,7 @@ class TrackManager:
     def cancel_active_at_boundary(
         self, timestamp_ns: int
     ) -> tuple[TrackSnapshot, ...]:
-        """Right-censor public tracks when a bounded live observation ends."""
+        """Right-censor public tracks when a bounded observation ends."""
 
         snapshots: list[TrackSnapshot] = []
         for track in self._active.values():

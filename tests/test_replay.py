@@ -8,9 +8,10 @@ from pathlib import Path
 import numpy as np
 
 from beanoflight.crop import CropPayload
-from beanoflight.models import BeanRef, FrameAnalysis
+from beanoflight.models import BeanRef, FrameAnalysis, TrackSnapshot, TrackStatus
 from beanoflight.registry_models import InferenceJob, InferenceStatus, RunState
 from beanoflight.replay import (
+    MAXIMUM_REPLAY_FRAMES,
     CropDispatcher,
     DecodedFrameBuffer,
     ReplayRunner,
@@ -88,6 +89,29 @@ class GcRecordingEngine(FakeEngine):
         return super().process(_frame, index, timestamp)
 
 
+class BoundaryCensoringEngine(FakeEngine):
+    def __init__(self):
+        super().__init__()
+        self.boundary_timestamps = []
+        self.tracker.cancel_active_at_boundary = self._cancel_active_at_boundary
+
+    def _cancel_active_at_boundary(self, timestamp):
+        self.boundary_timestamps.append(timestamp)
+        return (
+            TrackSnapshot(
+                BeanRef("buffered-run", 1),
+                TrackStatus.CANCELLED,
+                timestamp,
+                (0.0, 0.0, 0.0, 0.0),
+                tuple(tuple(0.0 for _ in range(4)) for _ in range(4)),
+                1,
+                0,
+                (0, 0, 1, 1),
+                (),
+            ),
+        )
+
+
 class FakeRegistry:
     def __init__(self, source):
         self.source = source
@@ -122,12 +146,14 @@ class SlowStartingDispatcher:
 
     def __init__(self):
         self.ready_monotonic_ns = 0
+        self.frames = []
 
     def start(self):
         time.sleep(0.01)
         self.ready_monotonic_ns = time.monotonic_ns()
 
-    def enqueue_frame(self, _updates, _payloads):
+    def enqueue_frame(self, updates, payloads):
+        self.frames.append((updates, payloads))
         return True
 
     def close(self, *, drain=True):
@@ -290,12 +316,13 @@ class ReplayBufferTests(unittest.TestCase):
 
     def test_replay_limits_are_validated(self):
         ReplaySettings(prebuffer_frames=0, maximum_frames=1).validate()
-        ReplaySettings(prebuffer_frames=120, maximum_frames=1000).validate()
+        ReplaySettings(prebuffer_frames=120, maximum_frames=18_001).validate()
+        ReplaySettings(maximum_frames=MAXIMUM_REPLAY_FRAMES).validate()
         for settings in (
             ReplaySettings(prebuffer_frames=-1),
             ReplaySettings(prebuffer_frames=121),
             ReplaySettings(maximum_frames=0),
-            ReplaySettings(maximum_frames=1001),
+            ReplaySettings(maximum_frames=MAXIMUM_REPLAY_FRAMES + 1),
             ReplaySettings(clock_start_lead_ms=0),
             ReplaySettings(maximum_clock_offset_ms=0),
         ):
@@ -362,6 +389,29 @@ class ReplayBufferTests(unittest.TestCase):
             running.clock_monotonic_ns,
             dispatcher.ready_monotonic_ns,
         )
+
+    def test_recorded_run_right_censors_tracks_at_natural_boundary(self):
+        source = FakeSequentialSource(frame_count=2)
+        registry = FakeRegistry(source)
+        engine = BoundaryCensoringEngine()
+        dispatcher = SlowStartingDispatcher()
+
+        summary = ReplayRunner(
+            source,
+            engine,
+            registry,
+            settings=ReplaySettings(
+                target_fps=0,
+                prebuffer_frames=0,
+                maximum_frames=2,
+            ),
+            crop_dispatcher=dispatcher,
+        ).run()
+
+        self.assertEqual(engine.boundary_timestamps, [10])
+        self.assertEqual(summary.right_censored_tracks, 1)
+        self.assertEqual(len(dispatcher.frames[-1][0]), 1)
+        self.assertIn("run-boundary-cancelled", dispatcher.frames[-1][0][0][2])
 
     def test_runner_suppresses_and_restores_cyclic_gc(self):
         source = FakeSequentialSource(frame_count=2)
@@ -458,6 +508,17 @@ class ReplayBufferTests(unittest.TestCase):
 
         self.assertGreater(summary.frames_skipped, 0)
         self.assertEqual(summary.frames_processed + summary.frames_skipped, 6)
+        self.assertEqual(
+            sum(int(item["frame_count"]) for item in summary.stale_skip_events),
+            summary.frames_skipped,
+        )
+        self.assertEqual(
+            [int(item["first_frame_index"]) for item in summary.stale_skip_events],
+            sorted(
+                int(item["first_frame_index"])
+                for item in summary.stale_skip_events
+            ),
+        )
         self.assertGreater(summary.max_frame_age_ms, 0)
         self.assertGreater(summary.source_timeline_fps, summary.achieved_fps)
 
