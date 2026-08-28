@@ -71,7 +71,9 @@ Frames 2, 8 and 14 lie inside the first 300 ms, before the recorded motor start.
 All nine CamL/CamR pairs were visually reviewed as bean-free. Untouched
 scientific PNGs and explicitly labelled display-stretched contact sheets are in
 `/home/doceave/Beano/diagnostics/playback-long-duration-20260827/background-candidates`.
-Human confirmation remains pending.
+The operator confirmed on 2026-08-28 that all nine selected frames contain no
+beans. Frames 2, 8 and 14 are therefore accepted backgrounds for all three
+recordings.
 
 The calibrated images are intrinsically dark (median 5–7/255). Between
 successive candidates, mean absolute pixel difference is 2.39–2.77/255 and p99
@@ -91,6 +93,30 @@ The current minimums should therefore remain unchanged until a track-level A/B
 test demonstrates recovered complete beans without extra fragments or false
 births. Review sheets are in
 `/home/doceave/Beano/diagnostics/playback-long-duration-20260827/min-area-sample`.
+
+## Directional stereo residuals
+
+Every sixth frame from all three recordings was subsequently reprocessed with
+the production detector and CamR localizer, yielding 4,446, 4,657 and 6,138
+successful directional residual measurements. Median CamR correction vectors
+were (+2.13, -12.04), (+2.00, -11.85) and (+4.07, -14.21) px; distance p95 was
+44.54, 43.87 and 48.09 px respectively.
+
+This is not a constant camera-to-camera offset. Horizontal correction changes
+from positive on the left to negative on the right, while vertical correction
+grows from roughly -2 to -5 px at the top to -31 to -38 px at the bottom. A
+diagnostic affine fit explains 72-78% of horizontal and 80-82% of vertical
+variance, reducing median residual distance to 4.6-5.0 px. The fit was not
+installed in the pipeline.
+
+The repeatable field pattern indicates a plane/scale/projective mismatch. It is
+consistent with the falling-bean plane differing from the PinkPlane calibration
+plane, a repeatable PinkPlane placement error, or an upstream coordinate-domain
+mismatch. A constant pixel offset is not an appropriate repair. Confirm the
+physical calibration plane, repeat the homography with an unambiguous
+orientation witness, then rerun the same residual analysis. Full samples,
+4-by-3 field maps and the detailed interpretation are under
+`/home/doceave/Beano/diagnostics/playback-long-duration-20260827/stereo-residuals`.
 
 ## Preserved reports
 
