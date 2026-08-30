@@ -183,7 +183,12 @@ def parser() -> argparse.ArgumentParser:
             "replay and overrides the live default"
         ),
     )
-    result.add_argument("--statistics-crop-size", type=int, default=160)
+    result.add_argument(
+        "--statistics-crop-size",
+        type=int,
+        default=160,
+        help="CamL crop size used only for rare zero-sample recovery",
+    )
     result.add_argument("--statistics-queue-capacity", type=int, default=24)
     result.add_argument("--statistics-primary-reserve", type=int, default=8)
     result.add_argument(
@@ -198,8 +203,8 @@ def parser() -> argparse.ArgumentParser:
         type=float,
         default=10.0,
         help=(
-            "offer statistics work only when the sorting-critical work already "
-            "performed for a frame is within this budget"
+            "legacy independent-crop admission budget; retained for controlled "
+            "A/B compatibility"
         ),
     )
     result.add_argument(
@@ -259,6 +264,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     if statistics_enabled and not (arguments.live or arguments.optimized_raw):
         raise SystemExit(
             "statistics capture requires --live or --optimized-raw input"
+        )
+    if statistics_enabled and (arguments.no_crops or arguments.single_view_inference):
+        raise SystemExit(
+            "inference-attached statistics requires stereo inference crops"
         )
     if arguments.live_test_override and not arguments.live:
         raise SystemExit("--live-test-override requires --live")

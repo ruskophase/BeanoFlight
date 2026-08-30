@@ -1,8 +1,8 @@
 # Live Statistics Capture
 
-The live pipeline captures the numerical evidence needed for later batch
-colour, silhouette, apparent-size and volume-proxy analysis. It deliberately
-does not generate charts during a run and does not retain bean images.
+The live pipeline retains the numerical evidence needed for later batch
+colour, silhouette, apparent-size and volume-proxy analysis. It does not make
+charts during a run and does not retain bean images.
 
 Capture is enabled by default for direct-camera `beano-system-test` and
 `beano-performance-benchmark --live` runs. A capture is written beneath
@@ -12,53 +12,82 @@ baseline or fault-isolation run.
 
 ## Capture contract
 
-Each confirmed bean has a target of two stereo observations and a hard maximum
-of two. A bean that leaves the field of view after one successful observation
-is explicitly retained as a single-sample fallback. Under pressure, optional
-statistics work can produce no sample; it must never delay detection,
-inference, sorting or actuation to obtain one.
+Each confirmed bean targets two observations and has a hard maximum of two.
+The first observation is mandatory; the second is desirable and can be
+omitted under pressure or when the bean has only one valid inference crop.
+
+The normal path is inference-attached. The frame thread adds the existing
+CamL detector component, cached CamR refinement component and native geometry
+to the first two selected inference jobs. After inference has successfully
+received the materialized stereo crop, the statistics worker measures those
+same image arrays. There is no second RAW crop, homography projection, CamR
+foreground search or demosaic on the normal path.
+
+If a confirmed bean never receives stereo inference evidence, one compact
+deferred CamL candidate is retained. After inference drains at batch shutdown,
+that candidate is used only if the bean still has zero observations. A fully
+measurable candidate records CamL colour and silhouette primitives. If the bean
+never becomes fully visible even in CamL, a baseline area/geometry row is still
+written with `feature_enrichment_valid: false`; missing CamR and colour values
+remain explicitly absent rather than being fabricated.
 
 The capture directory contains:
 
-- `observations.jsonl`: one flat numerical row per successful stereo
-  observation, including calibrated CamL and CamR colour, brightness,
-  silhouette, ellipse, projected area and paired volume proxies;
-- `beans.jsonl`: one row per confirmed bean, with a sample count, fallback
-  flag, sampled field-of-view bands and collection failures;
-- `capture.json`: settings, calibration/background provenance, aggregate
-  coverage, performance timings, failure examples and content hashes.
+- `observations.jsonl`: one numerical row per observation;
+- `beans.jsonl`: one row per confirmed bean, including sample count, sampled
+  field-of-view bands and collection failures;
+- `capture.json`: settings, calibration/background provenance, coverage,
+  timings, failure examples and content hashes.
 
-Tracking can begin collection while a track is tentative so that a short-lived
-bean does not lose its first useful view. Consequently, `observations.jsonl`
-can contain a small number of rows for tracks which never confirm. Offline
-batch processing must join observations to bean IDs in `beans.jsonl` and omit
-unmatched rows. `capture.json` separately reports confirmed observations,
-total observations and unconfirmed observations.
+Tracking can attach the first inference sample while a track is tentative.
+Consequently, `observations.jsonl` can contain a small number of rows for tracks
+which never confirm. Offline processing must join observations to bean IDs in
+`beans.jsonl` and omit unmatched rows. `capture.json` reports confirmed, total
+and unconfirmed observation counts separately.
+
+## Stored primitives
+
+For each available view, the online worker stores:
+
+- native detection/refinement pixel areas, centroids, bounding boxes and
+  stereo synchronization/refinement metadata;
+- masked BGR pixel count, sum, sum of squares, mean and standard deviation;
+- silhouette pixel count, crop-edge flag, bounding box, centroid, variance and
+  covariance spatial moments;
+- source/crop scale, capture path, inference job ID and enrichment-validity
+  flags.
+
+The sums, sums of squares and counts preserve the information needed to combine
+two samples without retaining pixels. Colour normalization, white-balance or
+camera-to-camera correction, perceptual colour spaces, ellipse axes, metric
+area conversion and volume proxies are intentionally deferred to the future
+offline batch tool. This keeps expensive or policy-dependent transformations
+out of the sorting path.
+
+The capture schema is `beanoflight-live-statistics-capture/v2`; observations
+use `beanoflight-live-statistics-observation/v2`. Consumers must use
+`measurement_view_count`, `camr_measurement_available` and
+`feature_enrichment_valid` before using paired or colour-derived features.
 
 ## Pressure isolation
 
-The validated defaults are one worker, a 160-pixel calibrated crop, a
-24-element priority queue with eight slots reserved for first observations,
-at most one ROI preparation per camera frame and a 10 ms admission budget. The
-frame thread never waits for the worker or for disk I/O.
+The validated defaults are one worker and a 24-element priority queue with
+eight positions protected from second observations. The common frame-thread
+attachment averages about 0.4 ms on the Jetson and only copies compact masks
+and scalar evidence. It never waits for the statistics worker or disk I/O.
 
-First observations take queue priority over second observations. Work is
-offered only after sorting-critical frame work and only while that work remains
-inside the admission budget. The worker runs at a lower scheduler priority on
-the CPU reserved for the actuator, where the actuator can pre-empt it; it is
-kept away from the general acquisition/detection/inference CPU set. Statistics
-exceptions are counted and isolated from sorting.
+The worker runs at lower scheduler priority on CPU5, where latency-critical
+work can pre-empt it, and is kept away from the general acquisition, detection
+and inference CPU set. Its two small view kernels run sequentially on that CPU
+to avoid scheduler hand-offs. First observations have queue priority; a full
+primary queue falls back synchronously to the already-known geometry row.
+Second observations may be discarded, but the first-record invariant remains
+observable in the bean ledger and benchmark acceptance result.
 
-The implementation also reuses the CamL connected-component labels and the
-CamR refinement component already created by stereo localization. It converts
-only selected crop pixels to Lab/HSV and uses lookup tables for calibrated
-linear-to-sRGB conversion. No full-frame colour image is created for this
-feature.
-
-The 160-pixel crop is an intentional throughput tradeoff. A silhouette touching
-that crop edge is rejected rather than measured partially. Those failures and
-pressure deferrals lower statistics coverage but leave the primary pipeline
-unaffected.
+Online work is limited to masked BGR aggregates and spatial moments. It does
+not calculate Lab/HSV values, percentiles, ellipse fits, calibrated metric
+scales or volume proxies. Exceptions are isolated from inference and sorting;
+an enrichment exception writes the baseline row and records its reason.
 
 ## Live acceptance command
 
@@ -76,28 +105,22 @@ beano-performance-benchmark \
 The newest complete, hash-valid Camera Tuner bundle is selected automatically.
 Keep the field empty until `LIVE_BACKGROUND_READY`, then follow the attended
 motor-control protocol in [operations.md](operations.md). A one-minute run is
-appropriate for each 80, 90, 100 and 110 steps/s acceptance point. Preserve
-the generated capture and report for offline bundle generation and A/B review.
-Stop bean flow as soon as `LIVE_CAPTURE_COMPLETE` appears; outcome settlement
-and detailed Registry audit collection continue after the camera window and do
-not require further beans.
+appropriate for each 80, 90, 100 and 110 steps/s acceptance point. Stop bean
+flow when `LIVE_CAPTURE_COMPLETE` appears; Registry settlement and statistics
+shutdown can finish without further beans.
 
-`--live-test-override` may be used only for an attended workflow test after a
-real witness has been measured but failed its production limits. It never
-changes the witness result. FastCap emits the measured errors, and the run
-profile, statistics provenance and benchmark report are permanently marked
-`classification: test`, `test_override: true` and `production_valid: false`.
-Camera structure, live controller state and stream-integrity checks remain
-mandatory.
+After every run verify:
 
-After every run verify at minimum:
-
-- 60 FPS source timeline and bounded frame age;
-- no inference crop drops or failed inference jobs;
+- the source timeline remains 60 FPS with bounded frame age;
+- inference has no crop drops or failed jobs;
 - statistics `fatal_error` is empty and queue depth remains bounded;
-- first/second/single/zero-sample coverage and the reasons for missed samples;
+- `beans_without_samples` is zero and
+  `all_confirmed_beans_have_statistics` is true;
+- CamL-only and baseline-only fallbacks are reviewed rather than treated as
+  paired measurements;
 - both motors are stopped and the controller lease is safely released.
 
-The statistics fields are not yet sorting inputs. A separate offline command
-will aggregate the two observations (or the single fallback) into the charts
-and batch summaries currently produced by `beano-statistics`.
+The statistics fields are not sorting inputs. The separate offline batch tool
+will aggregate two observations, fall back to one, perform colour/size
+derivations and generate the charts currently prototyped by
+`beano-statistics`.

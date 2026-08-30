@@ -127,7 +127,7 @@ def parser() -> argparse.ArgumentParser:
     statistics.add_argument(
         "--collect-statistics",
         action="store_true",
-        help="exercise best-effort two-sample numerical statistics capture",
+        help="exercise inference-attached two-sample numerical capture",
     )
     statistics.add_argument(
         "--no-statistics",
@@ -139,7 +139,12 @@ def parser() -> argparse.ArgumentParser:
         type=Path,
         help="parent directory for preserved benchmark statistics captures",
     )
-    result.add_argument("--statistics-crop-size", type=int, default=160)
+    result.add_argument(
+        "--statistics-crop-size",
+        type=int,
+        default=160,
+        help="CamL crop size used only for rare zero-sample recovery",
+    )
     result.add_argument("--statistics-queue-capacity", type=int, default=24)
     result.add_argument("--statistics-primary-reserve", type=int, default=8)
     result.add_argument(
@@ -515,16 +520,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     arguments.collect_statistics
                     or (arguments.live and not arguments.no_statistics)
                 ),
+                "capture_path": "inference-attached",
                 "output_root": (
                     None
                     if arguments.statistics_output_root is None
                     else str(arguments.statistics_output_root.resolve())
                 ),
-                "crop_size_px": arguments.statistics_crop_size,
+                "zero_sample_fallback_crop_size_px": (
+                    arguments.statistics_crop_size
+                ),
                 "queue_capacity": arguments.statistics_queue_capacity,
                 "primary_queue_reserve": arguments.statistics_primary_reserve,
                 "worker_count": arguments.statistics_workers,
-                "start_budget_ms": arguments.statistics_start_budget_ms,
+                "legacy_independent_start_budget_ms": (
+                    arguments.statistics_start_budget_ms
+                ),
             },
             "direct_evidence_dedicated_io": True,
             "sorter_deadline_aware_gc": True,
@@ -1423,6 +1433,9 @@ def _soak_acceptance(
         "outcomes_settled": all(
             bool(run["outcome"].get("settled", False)) for run in selected
         ),
+        "all_confirmed_beans_have_statistics": all(
+            _statistics_capture_complete(run) for run in selected
+        ),
     }
     return {
         "schema": "beanoflight-soak-acceptance/v1",
@@ -1495,6 +1508,9 @@ def _scenario_summaries(
             )
             for run in selected
         )
+        statistics_complete = all(
+            _statistics_capture_complete(run) for run in selected
+        )
         scenarios[scenario] = {
             "fps": summarize_samples(fps),
             "source_timeline_fps": summarize_samples(timeline_fps),
@@ -1504,9 +1520,28 @@ def _scenario_summaries(
             "minimum_acceptable_fps": minimum_acceptable_fps,
             "all_within_one_fps_of_target": within_target,
             "all_outcomes_complete": outcomes_complete,
-            "passed": within_target and outcomes_complete,
+            "all_confirmed_beans_have_statistics": statistics_complete,
+            "passed": within_target and outcomes_complete and statistics_complete,
         }
     return scenarios
+
+
+def _statistics_capture_complete(run: dict[str, object]) -> bool:
+    summary = run.get("summary", {})
+    if not isinstance(summary, dict):
+        return True
+    timings = summary.get("timings", {})
+    if not isinstance(timings, dict):
+        return True
+    capture = timings.get("statistics_capture", {})
+    if not isinstance(capture, dict) or not capture.get("enabled", False):
+        return True
+    return (
+        "confirmed_beans" in capture
+        and "beans_without_samples" in capture
+        and not str(capture.get("fatal_error", ""))
+        and int(capture.get("beans_without_samples", 0)) == 0
+    )
 
 
 if __name__ == "__main__":

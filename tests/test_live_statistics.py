@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from beanoflight.calibration import MetricPlaneCalibration
+from beanoflight.crop import CropPayload
 from beanoflight.detection import DetectorSettings, RawGreenDetector
 from beanoflight.live_statistics import (
     LiveStatisticsCollector,
@@ -22,6 +23,7 @@ from beanoflight.models import (
     TrackSnapshot,
     TrackStatus,
 )
+from beanoflight.registry_models import InferenceJob, InferenceStatus
 from beanoflight.source import RawReplayFrame
 from beanoflight.stereo import StereoCropPreparation, StereoPairMetadata
 
@@ -35,6 +37,8 @@ class _IdentityStereo:
 class _StatisticsSource:
     def __init__(self):
         self.stereo_calibration = _IdentityStereo()
+        self.crop_processing_profile = "ml-fast"
+        self.metadata = SimpleNamespace(width=160, height=160)
         self.background = np.zeros((80, 80), dtype=np.uint8)
         self.current = self.background.copy()
         cv2.ellipse(self.current, (40, 40), (14, 10), 0, 0, 360, 180, -1)
@@ -88,6 +92,13 @@ class _StatisticsSource:
             pair,
             self.mask.copy(),
         )
+
+    def inference_statistics_camr_component(self, _frame, _pair):
+        return self.mask.copy(), (0, 0)
+
+    def prepare_crop(self, _frame, _centroid, size, *, allow_padding):
+        self.fallback_assertions = (size, allow_padding)
+        return lambda: self.image.copy(), size, size, False
 
 
 def _calibration() -> MetricPlaneCalibration:
@@ -187,6 +198,187 @@ class LiveStatisticsTests(unittest.TestCase):
         self.assertEqual(mask.shape, (120, 120))
         self.assertGreater(cv2.countNonZero(mask), 1_000)
 
+    def test_inference_attached_collector_reuses_materialized_stereo_crop(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = _StatisticsSource()
+            detector = RawGreenDetector()
+            detector.component_mask_evidence = (
+                lambda *_args, **_kwargs: (source.mask.copy(), (0, 0))
+            )
+            output = Path(temporary) / "capture"
+            collector = LiveStatisticsCollector(
+                source,
+                detector,
+                source.background,
+                _calibration(),
+                output,
+                settings=LiveStatisticsSettings(flush_every=1),
+            )
+            ref = BeanRef("d" * 32, 4)
+            analysis = _analysis(ref, 0, 40.0)
+            pair = StereoPairMetadata(
+                left_frame_index=0,
+                right_frame_index=10,
+                left_timestamp_ns=1_000,
+                right_timestamp_ns=1_200,
+                caml_centroid_px=(80.0, 80.0),
+                camr_projected_centroid_px=(80.0, 80.0),
+                camr_centroid_px=(80.0, 80.0),
+                refinement_distance_px=0.0,
+                refinement_area_px=2_100,
+            )
+            job = InferenceJob(
+                job_id=f"infer:{ref.run_id}:{ref.sequence}:CamL:0:0",
+                bean_ref=ref,
+                status=InferenceStatus.SUBMITTED,
+                camera_id="CamL",
+                frame_index=0,
+                capture_timestamp_ns=1_000,
+                source_registry_revision=1,
+                crop_width_px=160,
+                crop_height_px=160,
+                padded=False,
+                submitted_timestamp_ns=1_000,
+                updated_timestamp_ns=1_000,
+                source_crop_width_px=160,
+                source_crop_height_px=160,
+            )
+            payload = CropPayload(
+                job,
+                source.image.copy(),
+                None,
+                source.image.copy(),
+                None,
+                pair,
+            )
+            collector.start(ref.run_id)
+            attached = collector.attach_to_inference(
+                SimpleNamespace(index=0),
+                analysis,
+                (payload,),
+            )
+            collector.ingest_materialized(attached)
+            self._wait_for_samples(collector, 1)
+            metrics = collector.close()
+
+            observation = json.loads(
+                (output / "observations.jsonl").read_text().strip()
+            )
+            self.assertEqual(metrics["beans_without_samples"], 0)
+            self.assertEqual(metrics["beans_with_one_sample"], 1)
+            self.assertEqual(
+                observation["schema"],
+                "beanoflight-live-statistics-observation/v2",
+            )
+            self.assertEqual(observation["capture_path"], "inference-attached")
+            self.assertEqual(observation["measurement_view_count"], 2)
+            self.assertTrue(observation["camr_measurement_available"])
+            self.assertEqual(observation["caml_detection_area_px"], 2_000)
+            self.assertEqual(observation["camr_refinement_area_px"], 2_100)
+            self.assertIn("caml_b_sum", observation)
+            self.assertIn("camr_mask_variance_x_px2", observation)
+            self.assertNotIn("caml_lab_l_mean", observation)
+
+    def test_inference_attached_collector_recovers_zero_sample_with_caml(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = _StatisticsSource()
+            detector = RawGreenDetector()
+            detector.component_mask_evidence = (
+                lambda *_args, **_kwargs: (source.mask.copy(), (0, 0))
+            )
+            output = Path(temporary) / "capture"
+            collector = LiveStatisticsCollector(
+                source,
+                detector,
+                source.background,
+                _calibration(),
+                output,
+                settings=LiveStatisticsSettings(flush_every=1),
+            )
+            ref = BeanRef("e" * 32, 5)
+            analysis = _analysis(ref, 0, 40.0)
+            collector.start(ref.run_id)
+            collector.attach_to_inference(
+                SimpleNamespace(index=0),
+                analysis,
+                (),
+            )
+            collector.cache_unattached_primary(
+                SimpleNamespace(index=0),
+                analysis,
+                (),
+            )
+            metrics = collector.close()
+
+            observation = json.loads(
+                (output / "observations.jsonl").read_text().strip()
+            )
+            self.assertEqual(metrics["beans_without_samples"], 0)
+            self.assertEqual(metrics["beans_with_one_sample"], 1)
+            self.assertEqual(
+                observation["capture_path"],
+                "caml-only-zero-sample-fallback",
+            )
+            self.assertEqual(observation["measurement_view_count"], 1)
+            self.assertFalse(observation["camr_measurement_available"])
+            self.assertIn("caml_b_sum", observation)
+            self.assertNotIn("camr_b_sum", observation)
+            capture = json.loads((output / "capture.json").read_text())
+            self.assertEqual(
+                capture["schema"],
+                "beanoflight-live-statistics-capture/v2",
+            )
+
+    def test_caml_fallback_upgrades_when_later_frame_has_complete_crop(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = _StatisticsSource()
+            source.metadata = SimpleNamespace(width=160, height=160)
+
+            def prepare(frame, _centroid, size, *, allow_padding):
+                self.assertFalse(allow_padding)
+                if frame.index == 0:
+                    return None
+                return lambda: source.image.copy(), size, size, False
+
+            source.prepare_crop = prepare
+            detector = RawGreenDetector()
+            detector.component_mask_evidence = (
+                lambda *_args, **_kwargs: (source.mask.copy(), (0, 0))
+            )
+            output = Path(temporary) / "capture"
+            collector = LiveStatisticsCollector(
+                source,
+                detector,
+                source.background,
+                _calibration(),
+                output,
+                settings=LiveStatisticsSettings(flush_every=1),
+            )
+            ref = BeanRef("f" * 32, 6)
+            collector.start(ref.run_id)
+            for frame_index in (0, 1):
+                analysis = _analysis(ref, frame_index, 40.0)
+                collector.attach_to_inference(
+                    SimpleNamespace(index=frame_index),
+                    analysis,
+                    (),
+                )
+                collector.cache_unattached_primary(
+                    SimpleNamespace(index=frame_index),
+                    analysis,
+                    (),
+                )
+            metrics = collector.close()
+
+            observation = json.loads(
+                (output / "observations.jsonl").read_text().strip()
+            )
+            self.assertTrue(observation["feature_enrichment_valid"])
+            self.assertEqual(
+                metrics["counts"]["caml_fallback_candidates_upgraded"],
+                1,
+            )
+
     def test_collector_persists_two_numerical_sets_and_no_images(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = _StatisticsSource()
@@ -202,6 +394,7 @@ class LiveStatisticsTests(unittest.TestCase):
                 _calibration(),
                 output,
                 settings=LiveStatisticsSettings(
+                    inference_attached=False,
                     crop_size_px=160,
                     queue_capacity=4,
                     primary_queue_reserve=2,
@@ -259,7 +452,10 @@ class LiveStatisticsTests(unittest.TestCase):
                 source.background,
                 _calibration(),
                 output,
-                settings=LiveStatisticsSettings(flush_every=1),
+                settings=LiveStatisticsSettings(
+                    inference_attached=False,
+                    flush_every=1,
+                ),
             )
             ref = BeanRef("b" * 32, 2)
             collector.start(ref.run_id)
@@ -284,7 +480,10 @@ class LiveStatisticsTests(unittest.TestCase):
                 source.background,
                 _calibration(),
                 output,
-                settings=LiveStatisticsSettings(flush_every=1),
+                settings=LiveStatisticsSettings(
+                    inference_attached=False,
+                    flush_every=1,
+                ),
             )
             ref = BeanRef("c" * 32, 3)
             collector.start(ref.run_id)

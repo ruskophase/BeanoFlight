@@ -27,6 +27,94 @@ class FeatureMeasurement:
     kernel_ms: float
 
 
+@dataclass(frozen=True, slots=True)
+class PrimitiveMeasurement:
+    """Cheap numerical primitives retained for deferred batch processing."""
+
+    values: dict[str, object]
+    kernel_ms: float
+
+
+def extract_view_primitives(
+    image_bgr: np.ndarray,
+    mask: np.ndarray,
+) -> PrimitiveMeasurement:
+    """Capture masked colour aggregates and silhouette moments only.
+
+    White balance, colour matrices, perceptual colour spaces, percentiles,
+    ellipse fitting and volume proxies intentionally remain offline work.
+    """
+
+    started = time.perf_counter_ns()
+    if (
+        image_bgr.dtype != np.uint8
+        or image_bgr.ndim != 3
+        or image_bgr.shape[2] != 3
+    ):
+        raise ValueError("primitive image must be an 8-bit BGR image")
+    if mask.dtype != np.uint8 or mask.shape != image_bgr.shape[:2]:
+        raise ValueError("primitive mask must match the image")
+    binary = np.asarray(mask > 0, dtype=np.uint8) * 255
+    mask_count = cv2.countNonZero(binary)
+    if mask_count < 25:
+        raise ValueError("primitive mask is too small")
+    touches_edge = bool(
+        np.any(binary[0])
+        or np.any(binary[-1])
+        or np.any(binary[:, 0])
+        or np.any(binary[:, -1])
+    )
+    moments = cv2.moments(binary, binaryImage=True)
+    if moments["m00"] <= 0:
+        raise ValueError("primitive mask has no spatial moment")
+    centre_x = moments["m10"] / moments["m00"]
+    centre_y = moments["m01"] / moments["m00"]
+    variance_x = moments["mu20"] / moments["m00"]
+    variance_y = moments["mu02"] / moments["m00"]
+    covariance_xy = moments["mu11"] / moments["m00"]
+    x, y, width, height = cv2.boundingRect(binary)
+
+    colour_mask = cv2.erode(
+        binary,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    colour_count = cv2.countNonZero(colour_mask)
+    if colour_count < max(25, round(mask_count * 0.55)):
+        colour_mask = binary
+        colour_count = mask_count
+    mean, stddev = cv2.meanStdDev(image_bgr, mask=colour_mask)
+    channel_mean = mean.reshape(3)
+    channel_std = stddev.reshape(3)
+    channel_sum = channel_mean * colour_count
+    channel_sum_squares = (
+        channel_std * channel_std + channel_mean * channel_mean
+    ) * colour_count
+    values: dict[str, object] = {
+        "mask_area_px": float(mask_count),
+        "mask_touches_crop_edge": touches_edge,
+        "bbox_x_px": float(x),
+        "bbox_y_px": float(y),
+        "bbox_width_px": float(width),
+        "bbox_height_px": float(height),
+        "mask_centroid_x_px": float(centre_x),
+        "mask_centroid_y_px": float(centre_y),
+        "mask_variance_x_px2": float(variance_x),
+        "mask_variance_y_px2": float(variance_y),
+        "mask_covariance_xy_px2": float(covariance_xy),
+        "colour_pixel_count": float(colour_count),
+    }
+    for index, name in enumerate(("b", "g", "r")):
+        values[f"{name}_sum"] = float(channel_sum[index])
+        values[f"{name}_sum_squares"] = float(channel_sum_squares[index])
+        values[f"{name}_mean"] = float(channel_mean[index])
+        values[f"{name}_std"] = float(channel_std[index])
+    return PrimitiveMeasurement(
+        values,
+        (time.perf_counter_ns() - started) / 1_000_000.0,
+    )
+
+
 def paired_features(
     left: Mapping[str, float],
     right: Mapping[str, float],

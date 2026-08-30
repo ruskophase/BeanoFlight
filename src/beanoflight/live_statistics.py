@@ -1,4 +1,4 @@
-"""Best-effort numerical statistics capture for the live sorting pipeline."""
+"""Inference-attached numerical statistics capture for live sorting."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import time
 from collections import defaultdict
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
@@ -20,27 +20,30 @@ import cv2
 import numpy as np
 
 from .calibration import MetricPlaneCalibration
+from .crop import CropPayload, InferenceStatisticsEvidence
 from .detection import RawGreenDetector
 from .models import BeanRef, FrameAnalysis, TrackSnapshot, TrackStatus
 from .runtime_priority import apply_background_audit_thread_profile
 from .statistics_features import (
     extract_view_features,
+    extract_view_primitives,
     local_area_scale,
     numeric_summary,
     paired_features,
 )
-from .stereo import StereoCropPreparation
+from .stereo import StereoCropPreparation, StereoPairMetadata
 
-CAPTURE_SCHEMA = "beanoflight-live-statistics-capture/v1"
-OBSERVATION_SCHEMA = "beanoflight-statistics-observation/v1"
+CAPTURE_SCHEMA = "beanoflight-live-statistics-capture/v2"
+OBSERVATION_SCHEMA = "beanoflight-live-statistics-observation/v2"
 BEAN_LEDGER_SCHEMA = "beanoflight-live-statistics-bean-ledger/v1"
 MAXIMUM_SAMPLES_PER_BEAN = 2
 
 
 @dataclass(frozen=True, slots=True)
 class LiveStatisticsSettings:
-    """Pressure bounds for optional live numerical evidence collection."""
+    """Pressure bounds for live numerical evidence collection."""
 
+    inference_attached: bool = True
     crop_size_px: int = 160
     target_samples_per_bean: int = MAXIMUM_SAMPLES_PER_BEAN
     queue_capacity: int = 24
@@ -108,15 +111,26 @@ class _StatisticsWork:
     caml_mask: np.ndarray = field(compare=False, repr=False)
     camr_mask: np.ndarray = field(compare=False, repr=False)
     enqueued_monotonic_ns: int
+    caml_detection_area_px: int = 0
+    camr_refinement_area_px: int = 0
+    caml_bbox_px: tuple[int, int, int, int] = (0, 0, 0, 0)
+    caml_solidity: float = 0.0
+    caml_detection_mean_green: float = 0.0
+    inference_job_id: str = ""
+    caml_component_origin_px: tuple[int, int] = (0, 0)
+    camr_component_origin_px: tuple[int, int] = (0, 0)
+    capture_path: str = "inference-attached"
+    camr_measurement_available: bool = True
+    fallback_reason: str = ""
 
 
 class LiveStatisticsCollector:
-    """Capture at most two calibrated stereo measurements per public bean.
+    """Capture at most two stereo measurements per public bean.
 
-    The frame thread only reserves a bounded queue slot, copies two RAW ROIs,
-    copies the existing CamL component mask, and exposes CamR's compact green
-    plane. Calibration, feature extraction and persistence run on a lowered-
-    priority worker. Queue admission never waits.
+    The default path attaches masks and native areas to inference selections,
+    then reuses their already-materialized stereo images.  The historical
+    independent calibrated-crop path remains available for controlled A/B
+    comparisons only.
     """
 
     def __init__(
@@ -135,10 +149,20 @@ class LiveStatisticsCollector:
         if not isinstance(detector, RawGreenDetector):
             raise TypeError("live statistics requires the RAW green detector")
         required = (
-            "prepare_statistics_stereo_crop",
-            "undistort_point",
-            "stereo_calibration",
+            (
+                "inference_statistics_camr_component",
+                "undistort_point",
+                "stereo_calibration",
+            )
+            if self.settings.inference_attached
+            else (
+                "prepare_statistics_stereo_crop",
+                "undistort_point",
+                "stereo_calibration",
+            )
         )
+        if self.settings.inference_attached:
+            required = (*required, "prepare_crop")
         missing = tuple(name for name in required if not hasattr(source, name))
         if missing:
             raise TypeError(f"statistics source is missing: {', '.join(missing)}")
@@ -146,10 +170,14 @@ class LiveStatisticsCollector:
         self.detector = detector
         self.background_gray = background_gray
         self.calibration = calibration
+        processing_profile = str(
+            getattr(source, "crop_processing_profile", "ml-fast")
+        )
+        self._source_colour_domain = f"{processing_profile}-inference-bgr"
         self.output_directory = output_directory.expanduser().resolve()
         self.provenance = dict(provenance or {})
         configure_processing = getattr(source, "configure_statistics_processing", None)
-        if configure_processing is not None:
+        if not self.settings.inference_attached and configure_processing is not None:
             configure_processing()
         self._queue: queue.PriorityQueue[tuple[int, int, _StatisticsWork]] = (
             queue.PriorityQueue(maxsize=self.settings.queue_capacity)
@@ -163,7 +191,8 @@ class LiveStatisticsCollector:
         self._started_utc = ""
         self._sequence = 0
         self._states: dict[BeanRef, _BeanCaptureState] = {}
-        self._primary_pending = 0
+        self._accepted_inference_jobs: set[str] = set()
+        self._unattached_primary_candidates: dict[BeanRef, _StatisticsWork] = {}
         self._metrics: defaultdict[str, int] = defaultdict(int)
         self._failure_examples: list[dict[str, object]] = []
         self._job_wall_ms: list[float] = []
@@ -208,6 +237,9 @@ class LiveStatisticsCollector:
         """Offer current-frame tracks without ever waiting for worker capacity."""
 
         if not self._threads or self._fatal_error:
+            return
+        if self.settings.inference_attached:
+            self.observe_tracks(analysis.tracks, analysis.frame_index)
             return
         primary: list[tuple[TrackSnapshot, int]] = []
         secondary: list[tuple[TrackSnapshot, int]] = []
@@ -257,6 +289,366 @@ class LiveStatisticsCollector:
             if preparations >= self.settings.maximum_preparations_per_frame:
                 return
 
+    def attach_to_inference(
+        self,
+        frame: Any,
+        analysis: FrameAnalysis,
+        payloads: tuple[CropPayload, ...],
+    ) -> tuple[CropPayload, ...]:
+        """Attach masks and native measurements to selected inference crops.
+
+        This method runs while the current RAW frame and detector labels are
+        valid.  It performs no demosaic, calibration, colour conversion, or
+        persistence; those images will be materialized once by inference.
+        """
+
+        self.observe_tracks(analysis.tracks, analysis.frame_index)
+        if not self.settings.inference_attached or not payloads:
+            return payloads
+        tracks = {track.bean_ref: track for track in analysis.tracks}
+        attached: list[CropPayload] = []
+        for payload in payloads:
+            sample_index = _inference_sample_index(payload)
+            if not 1 <= sample_index <= MAXIMUM_SAMPLES_PER_BEAN:
+                attached.append(payload)
+                continue
+            track = tracks.get(payload.job.bean_ref)
+            if track is None and payload.sorting_context is not None:
+                track = payload.sorting_context.track
+            pair = payload.stereo_pair
+            if track is None or not track.history or pair is None:
+                with self._lock:
+                    self._metrics["inference_attachment_unavailable"] += 1
+                attached.append(payload)
+                continue
+            observation = track.history[-1]
+            try:
+                caml_component = self.detector.component_mask_evidence(
+                    observation.detection
+                )
+                camr_component = self.source.inference_statistics_camr_component(
+                    frame,
+                    pair,
+                )
+                caml_mask, caml_origin = (
+                    (None, (0, 0))
+                    if caml_component is None
+                    else caml_component
+                )
+                camr_mask, camr_origin = (
+                    (None, (0, 0))
+                    if camr_component is None
+                    else camr_component
+                )
+            except Exception as exc:  # noqa: BLE001 - baseline remains usable
+                caml_mask = None
+                camr_mask = None
+                caml_origin = (0, 0)
+                camr_origin = (0, 0)
+                with self._lock:
+                    self._metrics["inference_mask_errors"] += 1
+                    self._failure_example(
+                        payload.job.bean_ref,
+                        "inference_mask_error",
+                        str(exc),
+                    )
+            evidence = InferenceStatisticsEvidence(
+                sample_index=sample_index,
+                fov_band=self._fov_band(observation.position_mm[1]),
+                track_status=track.status.value,
+                track_hits=track.hits,
+                caml_detection_area_px=observation.detection.area_px,
+                camr_refinement_area_px=pair.refinement_area_px,
+                caml_bbox_px=observation.detection.bbox_px,
+                caml_solidity=observation.detection.solidity,
+                caml_detection_mean_green=observation.detection.mean_bgr[1],
+                caml_mask=caml_mask,
+                camr_mask=camr_mask,
+                caml_component_origin_px=caml_origin,
+                camr_component_origin_px=camr_origin,
+            )
+            with self._lock:
+                self._metrics["inference_samples_attached"] += 1
+                if caml_mask is None:
+                    self._metrics["inference_caml_mask_unavailable"] += 1
+                if camr_mask is None:
+                    self._metrics["inference_camr_mask_unavailable"] += 1
+            attached.append(payload.with_statistics_evidence(evidence))
+        return tuple(attached)
+
+    def ingest_materialized(
+        self, payloads: tuple[CropPayload, ...]
+    ) -> None:
+        """Accept successfully delivered, already-materialized inference crops."""
+
+        if not self._threads or not self.settings.inference_attached:
+            return
+        for payload in payloads:
+            evidence = payload.statistics_evidence
+            pair = payload.stereo_pair
+            if evidence is None or pair is None:
+                continue
+            if payload.image_bgr is None or payload.camr_image_bgr is None:
+                with self._lock:
+                    self._metrics["inference_images_unavailable"] += 1
+                continue
+            with self._lock:
+                if payload.job.job_id in self._accepted_inference_jobs:
+                    continue
+                state = self._states.get(payload.job.bean_ref)
+                if state is None:
+                    self._metrics["inference_state_unavailable"] += 1
+                    continue
+                reserved = state.successful_samples + state.pending_samples
+                if reserved >= self.settings.target_samples_per_bean:
+                    continue
+                primary = reserved == 0
+                priority = 0 if primary else 1
+                if not primary and not self._has_capacity_locked(priority):
+                    self._metrics["secondary_capacity_drop"] += 1
+                    self._state_failure(state, "secondary_capacity_drop")
+                    continue
+                prepared = StereoCropPreparation(
+                    lambda image=payload.image_bgr: image,
+                    lambda image=payload.camr_image_bgr: image,
+                    payload.job.crop_width_px,
+                    payload.job.crop_height_px,
+                    payload.job.source_crop_width_px,
+                    payload.job.padded,
+                    pair,
+                    evidence.camr_mask,
+                )
+                work = _StatisticsWork(
+                    bean_ref=payload.job.bean_ref,
+                    requested_sample_index=reserved + 1,
+                    fov_band=evidence.fov_band,
+                    frame_index=payload.job.frame_index,
+                    timestamp_ns=payload.job.capture_timestamp_ns,
+                    track_status=evidence.track_status,
+                    track_hits=evidence.track_hits,
+                    prepared=prepared,
+                    caml_mask=(
+                        evidence.caml_mask
+                        if evidence.caml_mask is not None
+                        else np.zeros((0, 0), dtype=np.uint8)
+                    ),
+                    camr_mask=(
+                        evidence.camr_mask
+                        if evidence.camr_mask is not None
+                        else np.zeros((0, 0), dtype=np.uint8)
+                    ),
+                    enqueued_monotonic_ns=time.monotonic_ns(),
+                    caml_detection_area_px=evidence.caml_detection_area_px,
+                    camr_refinement_area_px=evidence.camr_refinement_area_px,
+                    caml_bbox_px=evidence.caml_bbox_px,
+                    caml_solidity=evidence.caml_solidity,
+                    caml_detection_mean_green=(
+                        evidence.caml_detection_mean_green
+                    ),
+                    inference_job_id=payload.job.job_id,
+                    caml_component_origin_px=(
+                        evidence.caml_component_origin_px
+                    ),
+                    camr_component_origin_px=(
+                        evidence.camr_component_origin_px
+                    ),
+                )
+                self._sequence += 1
+                queued = (priority, self._sequence, work)
+                state.pending_samples += 1
+                state.last_reserved_frame = work.frame_index
+                self._accepted_inference_jobs.add(payload.job.job_id)
+            try:
+                self._queue.put_nowait(queued)
+            except queue.Full:
+                if primary:
+                    self._persist_primary_fallback(work, "primary_queue_saturated")
+                else:
+                    self._complete(
+                        work,
+                        succeeded=False,
+                        reason="secondary_capacity_drop",
+                    )
+            else:
+                with self._lock:
+                    key = (
+                        "primary_jobs_queued"
+                        if primary
+                        else "secondary_jobs_queued"
+                    )
+                    self._metrics[key] += 1
+                    self._maximum_queue_depth = max(
+                        self._maximum_queue_depth, self._queue.qsize()
+                    )
+
+    def cache_unattached_primary(
+        self,
+        frame: Any,
+        analysis: FrameAnalysis,
+        payloads: tuple[CropPayload, ...],
+    ) -> None:
+        """Retain one rare CamL fallback for a bean with no stereo sample.
+
+        Normal beans reuse inference crops and never enter this path.  A
+        confirmed bean can nevertheless be fully visible in CamL while CamR
+        local refinement is unavailable for its entire flight.  Preserve one
+        deferred compact CamL crop, then use it at shutdown only if inference
+        still produced no statistics observation for that bean.
+        """
+
+        if (
+            not self._threads
+            or not self.settings.inference_attached
+            or self._fatal_error
+        ):
+            return
+        attached_refs = {
+            payload.job.bean_ref
+            for payload in payloads
+            if payload.statistics_evidence is not None
+        }
+        for track in analysis.tracks:
+            if track.status is not TrackStatus.CONFIRMED or not track.history:
+                continue
+            observation = track.history[-1]
+            if observation.frame_index != analysis.frame_index:
+                continue
+            with self._lock:
+                state = self._states.get(track.bean_ref)
+                if (
+                    state is None
+                    or track.bean_ref in attached_refs
+                    or state.successful_samples + state.pending_samples > 0
+                ):
+                    continue
+                existing = self._unattached_primary_candidates.get(track.bean_ref)
+                if (
+                    existing is not None
+                    and existing.fallback_reason
+                    == "stereo-inference-unavailable"
+                ):
+                    continue
+            prepared_crop = None
+            component = None
+            preparation_error = ""
+            source_size_px = self.settings.crop_size_px
+            try:
+                prepared_crop = self.source.prepare_crop(
+                    frame,
+                    observation.detection.centroid_px,
+                    source_size_px,
+                    allow_padding=False,
+                )
+                if prepared_crop is None:
+                    source_size_px = _largest_complete_component_crop(
+                        observation.detection.centroid_px,
+                        observation.detection.bbox_px,
+                        (
+                            int(self.source.metadata.width),
+                            int(self.source.metadata.height),
+                        ),
+                        self.settings.crop_size_px,
+                    )
+                    if source_size_px:
+                        prepared_crop = self.source.prepare_crop(
+                            frame,
+                            observation.detection.centroid_px,
+                            source_size_px,
+                            allow_padding=False,
+                        )
+                component = self.detector.component_mask_evidence(
+                    observation.detection
+                )
+                if prepared_crop is None:
+                    preparation_error = "caml_crop_unavailable"
+                if component is None:
+                    preparation_error = "caml_mask_unavailable"
+            except Exception as exc:  # noqa: BLE001 - baseline is still useful
+                preparation_error = str(exc)
+            materializer = (
+                _unavailable_materializer
+                if prepared_crop is None
+                else prepared_crop[0]
+            )
+            width_px = (
+                self.settings.crop_size_px
+                if prepared_crop is None
+                else prepared_crop[1]
+            )
+            height_px = (
+                self.settings.crop_size_px
+                if prepared_crop is None
+                else prepared_crop[2]
+            )
+            padded = False if prepared_crop is None else prepared_crop[3]
+            caml_mask, caml_origin = (
+                (np.zeros((0, 0), dtype=np.uint8), (0, 0))
+                if component is None
+                else component
+            )
+            pair = StereoPairMetadata(
+                left_frame_index=observation.frame_index,
+                right_frame_index=observation.frame_index,
+                left_timestamp_ns=observation.timestamp_ns,
+                right_timestamp_ns=observation.timestamp_ns,
+                caml_centroid_px=observation.detection.centroid_px,
+                camr_projected_centroid_px=(0.0, 0.0),
+                camr_centroid_px=(0.0, 0.0),
+                refinement_distance_px=0.0,
+                refinement_area_px=0,
+                coordinate_domain="caml-only-fallback",
+            )
+            work = _StatisticsWork(
+                bean_ref=track.bean_ref,
+                requested_sample_index=1,
+                fov_band=self._fov_band(observation.position_mm[1]),
+                frame_index=observation.frame_index,
+                timestamp_ns=observation.timestamp_ns,
+                track_status=track.status.value,
+                track_hits=track.hits,
+                prepared=StereoCropPreparation(
+                    materializer,
+                    _unavailable_materializer,
+                    width_px,
+                    height_px,
+                    source_size_px or self.settings.crop_size_px,
+                    padded,
+                    pair,
+                    None,
+                ),
+                caml_mask=caml_mask,
+                camr_mask=np.zeros((0, 0), dtype=np.uint8),
+                enqueued_monotonic_ns=0,
+                caml_detection_area_px=observation.detection.area_px,
+                caml_bbox_px=observation.detection.bbox_px,
+                caml_solidity=observation.detection.solidity,
+                caml_detection_mean_green=observation.detection.mean_bgr[1],
+                caml_component_origin_px=caml_origin,
+                capture_path="caml-only-zero-sample-fallback",
+                camr_measurement_available=False,
+                fallback_reason=(
+                    preparation_error or "stereo-inference-unavailable"
+                ),
+            )
+            with self._lock:
+                existing = self._unattached_primary_candidates.get(track.bean_ref)
+                if (
+                    existing is not None
+                    and existing.fallback_reason
+                    == "stereo-inference-unavailable"
+                ):
+                    return
+                self._unattached_primary_candidates[track.bean_ref] = work
+                key = (
+                    "caml_fallback_candidates_cached"
+                    if existing is None
+                    else "caml_fallback_candidates_upgraded"
+                )
+                self._metrics[key] += 1
+            # One preparation per frame is enough. Other candidates remain
+            # visible and can be retained on their next confirmed frame.
+            return
+
     def observe_tracks(
         self, tracks: tuple[TrackSnapshot, ...], frame_index: int
     ) -> None:
@@ -270,6 +662,8 @@ class LiveStatisticsCollector:
         threads = tuple(self._threads)
         if not threads:
             return self.statistics()
+        if drain and self.settings.inference_attached:
+            self._enqueue_zero_sample_fallbacks()
         self._stop.set()
         if not drain:
             while True:
@@ -322,10 +716,10 @@ class LiveStatisticsCollector:
             "performance": {
                 "queue_wait_ms": numeric_summary(self._queue_wait_ms),
                 "job_wall_ms": numeric_summary(self._job_wall_ms),
-                "calibrated_crop_materialization_ms": numeric_summary(
+                "crop_materialization_ms": numeric_summary(
                     self._materialization_ms
                 ),
-                "two_view_feature_kernel_ms": numeric_summary(
+                "feature_kernel_ms": numeric_summary(
                     self._feature_kernel_ms
                 ),
             },
@@ -410,7 +804,6 @@ class LiveStatisticsCollector:
             state.pending_samples += 1
             state.last_reserved_frame = work.frame_index
             if priority == 0:
-                self._primary_pending += 1
                 self._metrics["primary_jobs_queued"] += 1
             else:
                 self._metrics["secondary_jobs_queued"] += 1
@@ -418,6 +811,52 @@ class LiveStatisticsCollector:
                 self._maximum_queue_depth, self._queue.qsize()
             )
         return True
+
+    def _enqueue_zero_sample_fallbacks(self) -> None:
+        """Enqueue cached CamL evidence after inference has fully drained."""
+
+        with self._lock:
+            candidates = tuple(self._unattached_primary_candidates.items())
+        for bean_ref, cached in candidates:
+            with self._lock:
+                state = self._states.get(bean_ref)
+                if (
+                    state is None
+                    or not state.confirmed
+                    or state.successful_samples + state.pending_samples > 0
+                ):
+                    continue
+                work = replace(
+                    cached,
+                    requested_sample_index=1,
+                    enqueued_monotonic_ns=time.monotonic_ns(),
+                )
+                self._sequence += 1
+                queued = (0, self._sequence, work)
+                state.pending_samples += 1
+                state.last_reserved_frame = work.frame_index
+            try:
+                self._queue.put_nowait(queued)
+            except queue.Full:
+                self._persist_primary_fallback(
+                    work,
+                    "caml_fallback_queue_saturated",
+                )
+            else:
+                with self._lock:
+                    self._metrics["caml_fallback_jobs_queued"] += 1
+                    self._maximum_queue_depth = max(
+                        self._maximum_queue_depth,
+                        self._queue.qsize(),
+                    )
+        with self._lock:
+            uncovered = sum(
+                state.confirmed
+                and state.successful_samples + state.pending_samples == 0
+                for state in self._states.values()
+            )
+            if uncovered:
+                self._metrics["beans_without_recoverable_sample"] += uncovered
 
     def _has_capacity_locked(self, priority: int) -> bool:
         depth = self._queue.qsize()
@@ -428,12 +867,16 @@ class LiveStatisticsCollector:
     def _run(self, worker_index: int) -> None:
         cpu_from_end = worker_index + 1
         apply_background_audit_thread_profile(cpu_from_end=cpu_from_end)
-        helper = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="statistics-camr",
-            initializer=lambda: apply_background_audit_thread_profile(
-                cpu_from_end=cpu_from_end
-            ),
+        helper = (
+            None
+            if self.settings.inference_attached
+            else ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="statistics-camr",
+                initializer=lambda: apply_background_audit_thread_profile(
+                    cpu_from_end=cpu_from_end
+                ),
+            )
         )
         try:
             self._warm_feature_kernel()
@@ -447,13 +890,45 @@ class LiveStatisticsCollector:
                     row, timings = self._measure(work, helper)
                     self._persist(row)
                 except Exception as exc:  # noqa: BLE001 - optional worker isolation
-                    self._complete(
-                        work,
-                        succeeded=False,
-                        reason="measurement_error",
-                        detail=str(exc),
-                        primary=priority == 0,
-                    )
+                    if self.settings.inference_attached:
+                        try:
+                            self._persist(
+                                self._baseline_row(
+                                    work,
+                                    enrichment_error=str(exc),
+                                )
+                            )
+                        except Exception as fallback_exc:  # noqa: BLE001
+                            self._complete(
+                                work,
+                                succeeded=False,
+                                reason="measurement_error",
+                                detail=str(fallback_exc),
+                                primary=priority == 0,
+                            )
+                        else:
+                            with self._lock:
+                                self._metrics[
+                                    "feature_enrichment_fallbacks"
+                                ] += 1
+                                self._failure_example(
+                                    work.bean_ref,
+                                    "feature_enrichment_fallback",
+                                    str(exc),
+                                )
+                            self._complete(
+                                work,
+                                succeeded=True,
+                                primary=priority == 0,
+                            )
+                    else:
+                        self._complete(
+                            work,
+                            succeeded=False,
+                            reason="measurement_error",
+                            detail=str(exc),
+                            primary=priority == 0,
+                        )
                 else:
                     wall_ms = (time.perf_counter_ns() - started) / 1_000_000.0
                     self._job_wall_ms.append(wall_ms)
@@ -471,13 +946,20 @@ class LiveStatisticsCollector:
             with self._lock:
                 self._metrics["worker_fatal_errors"] += 1
         finally:
-            helper.shutdown(wait=True, cancel_futures=True)
+            if helper is not None:
+                helper.shutdown(wait=True, cancel_futures=True)
 
     def _measure(
         self,
         work: _StatisticsWork,
-        helper: ThreadPoolExecutor,
+        helper: ThreadPoolExecutor | None,
     ) -> tuple[dict[str, object], dict[str, float]]:
+        if self.settings.inference_attached:
+            if not work.camr_measurement_available:
+                return self._measure_caml_only(work)
+            return self._measure_inference_attached(work)
+        if helper is None:
+            raise RuntimeError("legacy statistics helper is unavailable")
         materialization_started = time.perf_counter_ns()
         right_image_future = helper.submit(work.prepared.camr_materializer)
         try:
@@ -556,6 +1038,26 @@ class LiveStatisticsCollector:
                 left_features.kernel_ms + right_features.kernel_ms
             ),
             "refinement_distance_px": pair.refinement_distance_px,
+            "capture_path": (
+                "inference-attached"
+                if self.settings.inference_attached
+                else "independent-calibrated-crop"
+            ),
+            "source_colour_domain": "calibrated-srgb-bgr",
+            "inference_job_id": work.inference_job_id,
+            "measurement_view_count": 2,
+            "caml_measurement_available": True,
+            "camr_measurement_available": True,
+            "fallback_reason": "",
+            "caml_detection_area_px": work.caml_detection_area_px,
+            "camr_refinement_area_px": work.camr_refinement_area_px,
+            "caml_detection_bbox_px": list(work.caml_bbox_px),
+            "caml_detection_touches_sensor_edge": (
+                self._caml_detection_touches_sensor_edge(work.caml_bbox_px)
+            ),
+            "caml_detection_solidity": work.caml_solidity,
+            "caml_detection_mean_green": work.caml_detection_mean_green,
+            "feature_enrichment_valid": True,
         }
         row.update(
             {f"caml_{key}": value for key, value in left_features.values.items()}
@@ -574,6 +1076,307 @@ class LiveStatisticsCollector:
             "materialization_ms": materialization_ms,
             "feature_kernel_ms": feature_kernel_ms,
         }
+
+    def _measure_caml_only(
+        self,
+        work: _StatisticsWork,
+    ) -> tuple[dict[str, object], dict[str, float]]:
+        """Measure a rare CamL-only fallback without fabricating CamR data."""
+
+        materialization_started = time.perf_counter_ns()
+        left_image = work.prepared.caml_materializer()
+        materialization_ms = (
+            time.perf_counter_ns() - materialization_started
+        ) / 1_000_000.0
+        left_mask = _align_component_mask(
+            work.caml_mask,
+            work.caml_component_origin_px,
+            work.prepared.pair.caml_centroid_px,
+            work.prepared.source_size_px,
+            work.prepared.width_px,
+        )
+        feature_started = time.perf_counter_ns()
+        left = extract_view_primitives(left_image, left_mask)
+        feature_kernel_ms = (
+            time.perf_counter_ns() - feature_started
+        ) / 1_000_000.0
+        queue_wait_ms = (
+            time.monotonic_ns() - work.enqueued_monotonic_ns
+        ) / 1_000_000.0
+        self._queue_wait_ms.append(queue_wait_ms)
+        pair = work.prepared.pair
+        row: dict[str, object] = {
+            "schema": OBSERVATION_SCHEMA,
+            "bean_id": str(work.bean_ref),
+            "run_id": work.bean_ref.run_id,
+            "bean_sequence": work.bean_ref.sequence,
+            "sample_index": work.requested_sample_index,
+            "fov_band": ("top", "middle", "bottom")[work.fov_band],
+            "frame_index": work.frame_index,
+            "timestamp_ns": work.timestamp_ns,
+            "track_status": work.track_status,
+            "track_hits": work.track_hits,
+            "caml_centroid_x_px": pair.caml_centroid_px[0],
+            "caml_centroid_y_px": pair.caml_centroid_px[1],
+            "camr_centroid_x_px": None,
+            "camr_centroid_y_px": None,
+            "camr_projected_x_px": None,
+            "camr_projected_y_px": None,
+            "right_frame_index": None,
+            "synchronization_delta_ns": None,
+            "source_crop_size_px": work.prepared.source_size_px,
+            "inference_crop_width_px": None,
+            "inference_crop_height_px": None,
+            "mask_scale_to_native": (
+                work.prepared.source_size_px
+                / max(float(work.prepared.width_px), 1.0)
+            ),
+            "queue_wait_ms": queue_wait_ms,
+            "materialization_ms": materialization_ms,
+            "feature_kernel_ms": feature_kernel_ms,
+            "feature_kernel_cpu_ms": left.kernel_ms,
+            "refinement_distance_px": None,
+            "capture_path": work.capture_path,
+            "source_colour_domain": self._source_colour_domain,
+            "inference_job_id": "",
+            "measurement_view_count": 1,
+            "caml_measurement_available": True,
+            "camr_measurement_available": False,
+            "fallback_reason": work.fallback_reason,
+            "caml_detection_area_px": work.caml_detection_area_px,
+            "camr_refinement_area_px": None,
+            "projected_area_geomean_px": None,
+            "projected_area_ratio_camr_to_caml": None,
+            "single_view_area_proxy_px": work.caml_detection_area_px,
+            "caml_detection_bbox_px": list(work.caml_bbox_px),
+            "caml_detection_touches_sensor_edge": (
+                self._caml_detection_touches_sensor_edge(work.caml_bbox_px)
+            ),
+            "caml_detection_solidity": work.caml_solidity,
+            "caml_detection_mean_green": work.caml_detection_mean_green,
+            "feature_enrichment_valid": True,
+        }
+        row.update({f"caml_{key}": value for key, value in left.values.items()})
+        return row, {
+            "materialization_ms": materialization_ms,
+            "feature_kernel_ms": feature_kernel_ms,
+        }
+
+    def _measure_inference_attached(
+        self,
+        work: _StatisticsWork,
+    ) -> tuple[dict[str, object], dict[str, float]]:
+        materialization_started = time.perf_counter_ns()
+        left_image = work.prepared.caml_materializer()
+        right_image = work.prepared.camr_materializer()
+        materialization_ms = (
+            time.perf_counter_ns() - materialization_started
+        ) / 1_000_000.0
+        left_mask = _align_component_mask(
+            work.caml_mask,
+            work.caml_component_origin_px,
+            work.prepared.pair.caml_centroid_px,
+            work.prepared.source_size_px,
+            work.prepared.width_px,
+        )
+        right_mask = _align_component_mask(
+            work.camr_mask,
+            work.camr_component_origin_px,
+            work.prepared.pair.camr_centroid_px,
+            work.prepared.source_size_px,
+            work.prepared.width_px,
+        )
+        feature_started = time.perf_counter_ns()
+        # Both audit threads deliberately share the same low-priority safety
+        # CPU. Running the two tiny kernels sequentially avoids scheduler
+        # ping-pong without consuming a sorting/general-purpose core.
+        left = extract_view_primitives(left_image, left_mask)
+        right = extract_view_primitives(right_image, right_mask)
+        feature_kernel_ms = (
+            time.perf_counter_ns() - feature_started
+        ) / 1_000_000.0
+        queue_wait_ms = (
+            time.monotonic_ns() - work.enqueued_monotonic_ns
+        ) / 1_000_000.0
+        self._queue_wait_ms.append(queue_wait_ms)
+        pair = work.prepared.pair
+        left_area = float(work.caml_detection_area_px)
+        right_area = float(work.camr_refinement_area_px)
+        area_geomean = math.sqrt(max(0.0, left_area * right_area))
+        row: dict[str, object] = {
+            "schema": OBSERVATION_SCHEMA,
+            "bean_id": str(work.bean_ref),
+            "run_id": work.bean_ref.run_id,
+            "bean_sequence": work.bean_ref.sequence,
+            "sample_index": work.requested_sample_index,
+            "fov_band": ("top", "middle", "bottom")[work.fov_band],
+            "frame_index": work.frame_index,
+            "timestamp_ns": work.timestamp_ns,
+            "track_status": work.track_status,
+            "track_hits": work.track_hits,
+            "caml_centroid_x_px": pair.caml_centroid_px[0],
+            "caml_centroid_y_px": pair.caml_centroid_px[1],
+            "camr_centroid_x_px": pair.camr_centroid_px[0],
+            "camr_centroid_y_px": pair.camr_centroid_px[1],
+            "camr_projected_x_px": pair.camr_projected_centroid_px[0],
+            "camr_projected_y_px": pair.camr_projected_centroid_px[1],
+            "right_frame_index": pair.right_frame_index,
+            "synchronization_delta_ns": pair.synchronization_delta_ns,
+            "source_crop_size_px": work.prepared.source_size_px,
+            "inference_crop_width_px": work.prepared.width_px,
+            "inference_crop_height_px": work.prepared.height_px,
+            "mask_scale_to_native": (
+                work.prepared.source_size_px
+                / max(float(work.prepared.width_px), 1.0)
+            ),
+            "queue_wait_ms": queue_wait_ms,
+            "materialization_ms": materialization_ms,
+            "feature_kernel_ms": feature_kernel_ms,
+            "feature_kernel_cpu_ms": left.kernel_ms + right.kernel_ms,
+            "refinement_distance_px": pair.refinement_distance_px,
+            "capture_path": "inference-attached",
+            "source_colour_domain": self._source_colour_domain,
+            "inference_job_id": work.inference_job_id,
+            "measurement_view_count": 2,
+            "caml_measurement_available": True,
+            "camr_measurement_available": True,
+            "fallback_reason": "",
+            "caml_detection_area_px": work.caml_detection_area_px,
+            "camr_refinement_area_px": work.camr_refinement_area_px,
+            "projected_area_geomean_px": area_geomean,
+            "projected_area_ratio_camr_to_caml": (
+                right_area / max(left_area, 1.0)
+            ),
+            "caml_detection_bbox_px": list(work.caml_bbox_px),
+            "caml_detection_touches_sensor_edge": (
+                self._caml_detection_touches_sensor_edge(work.caml_bbox_px)
+            ),
+            "caml_detection_solidity": work.caml_solidity,
+            "caml_detection_mean_green": work.caml_detection_mean_green,
+            "feature_enrichment_valid": True,
+        }
+        row.update({f"caml_{key}": value for key, value in left.values.items()})
+        row.update({f"camr_{key}": value for key, value in right.values.items()})
+        return row, {
+            "materialization_ms": materialization_ms,
+            "feature_kernel_ms": feature_kernel_ms,
+        }
+
+    def _baseline_row(
+        self,
+        work: _StatisticsWork,
+        *,
+        enrichment_error: str,
+    ) -> dict[str, object]:
+        """Preserve the mandatory per-inference sample when enrichment fails."""
+
+        pair = work.prepared.pair
+        area_geomean = (
+            math.sqrt(
+                max(0, work.caml_detection_area_px)
+                * max(0, work.camr_refinement_area_px)
+            )
+            if work.camr_measurement_available
+            else None
+        )
+        return {
+            "schema": OBSERVATION_SCHEMA,
+            "bean_id": str(work.bean_ref),
+            "run_id": work.bean_ref.run_id,
+            "bean_sequence": work.bean_ref.sequence,
+            "sample_index": work.requested_sample_index,
+            "fov_band": ("top", "middle", "bottom")[work.fov_band],
+            "frame_index": work.frame_index,
+            "timestamp_ns": work.timestamp_ns,
+            "track_status": work.track_status,
+            "track_hits": work.track_hits,
+            "caml_centroid_x_px": pair.caml_centroid_px[0],
+            "caml_centroid_y_px": pair.caml_centroid_px[1],
+            "camr_centroid_x_px": (
+                pair.camr_centroid_px[0]
+                if work.camr_measurement_available
+                else None
+            ),
+            "camr_centroid_y_px": (
+                pair.camr_centroid_px[1]
+                if work.camr_measurement_available
+                else None
+            ),
+            "camr_projected_x_px": (
+                pair.camr_projected_centroid_px[0]
+                if work.camr_measurement_available
+                else None
+            ),
+            "camr_projected_y_px": (
+                pair.camr_projected_centroid_px[1]
+                if work.camr_measurement_available
+                else None
+            ),
+            "right_frame_index": (
+                pair.right_frame_index
+                if work.camr_measurement_available
+                else None
+            ),
+            "synchronization_delta_ns": (
+                pair.synchronization_delta_ns
+                if work.camr_measurement_available
+                else None
+            ),
+            "source_crop_size_px": work.prepared.source_size_px,
+            "refinement_distance_px": (
+                pair.refinement_distance_px
+                if work.camr_measurement_available
+                else None
+            ),
+            "capture_path": work.capture_path,
+            "source_colour_domain": self._source_colour_domain,
+            "inference_job_id": work.inference_job_id,
+            "measurement_view_count": (
+                2 if work.camr_measurement_available else 1
+            ),
+            "caml_measurement_available": True,
+            "camr_measurement_available": work.camr_measurement_available,
+            "fallback_reason": work.fallback_reason,
+            "caml_detection_area_px": work.caml_detection_area_px,
+            "camr_refinement_area_px": work.camr_refinement_area_px,
+            "projected_area_geomean_px": area_geomean,
+            "single_view_area_proxy_px": (
+                None
+                if work.camr_measurement_available
+                else work.caml_detection_area_px
+            ),
+            "caml_detection_bbox_px": list(work.caml_bbox_px),
+            "caml_detection_touches_sensor_edge": (
+                self._caml_detection_touches_sensor_edge(work.caml_bbox_px)
+            ),
+            "caml_detection_solidity": work.caml_solidity,
+            "caml_detection_mean_green": work.caml_detection_mean_green,
+            "feature_enrichment_valid": False,
+            "feature_enrichment_error": enrichment_error,
+        }
+
+    def _persist_primary_fallback(
+        self,
+        work: _StatisticsWork,
+        reason: str,
+    ) -> None:
+        """Synchronously preserve sample one if the bounded worker is full."""
+
+        try:
+            self._persist(self._baseline_row(work, enrichment_error=reason))
+        except Exception as exc:  # noqa: BLE001 - converted to collector failure
+            self._complete(
+                work,
+                succeeded=False,
+                reason=reason,
+                detail=str(exc),
+                primary=True,
+            )
+            return
+        with self._lock:
+            self._metrics["primary_synchronous_fallbacks"] += 1
+            self._failure_example(work.bean_ref, reason, "")
+        self._complete(work, succeeded=True, primary=True)
 
     def _persist(self, row: Mapping[str, object]) -> None:
         stream = self._stream
@@ -598,12 +1401,12 @@ class LiveStatisticsCollector:
         with self._lock:
             state = self._states[work.bean_ref]
             state.pending_samples = max(0, state.pending_samples - 1)
-            if primary:
-                self._primary_pending = max(0, self._primary_pending - 1)
             if succeeded and state.successful_samples < MAXIMUM_SAMPLES_PER_BEAN:
                 state.successful_samples += 1
                 state.successful_bands.append(work.fov_band)
                 self._metrics["observations_written"] += 1
+                if not work.camr_measurement_available:
+                    self._metrics["caml_fallback_observations_written"] += 1
             elif not succeeded:
                 self._state_failure(state, reason)
                 self._metrics[reason] += 1
@@ -660,6 +1463,19 @@ class LiveStatisticsCollector:
         normalized = (y_mm - self.calibration.top_y_mm) / span
         return min(2, max(0, int(normalized * 3.0)))
 
+    def _caml_detection_touches_sensor_edge(
+        self,
+        bbox_px: tuple[int, int, int, int],
+    ) -> bool:
+        x, y, width, height = bbox_px
+        metadata = self.source.metadata
+        return (
+            x <= 0
+            or y <= 0
+            or x + width >= int(metadata.width)
+            or y + height >= int(metadata.height)
+        )
+
     def _write_bean_ledger(self) -> None:
         path = self.output_directory / "beans.jsonl"
         with path.open("x", encoding="utf-8") as stream:
@@ -706,6 +1522,11 @@ class LiveStatisticsCollector:
             "started_utc": self._started_utc,
             "updated_utc": datetime.now(timezone.utc).isoformat(),
             "settings": {
+                "capture_path": (
+                    "inference-attached"
+                    if self.settings.inference_attached
+                    else "independent-calibrated-crop"
+                ),
                 "crop_size_px": self.settings.crop_size_px,
                 "target_samples_per_bean": self.settings.target_samples_per_bean,
                 "hard_maximum_samples_per_bean": MAXIMUM_SAMPLES_PER_BEAN,
@@ -720,6 +1541,14 @@ class LiveStatisticsCollector:
                 ),
                 "minimum_sample_frame_gap": self.settings.minimum_sample_frame_gap,
                 "persistence": "numerical JSON/JSONL only; no bean images",
+                "online_features": (
+                    "masked BGR sums/sums-of-squares, pixel counts and "
+                    "silhouette spatial moments"
+                ),
+                "offline_features": (
+                    "colour normalization, perceptual spaces, ellipse "
+                    "dimensions and volume proxies"
+                ),
             },
             "provenance": self.provenance,
             "statistics": self.statistics(),
@@ -727,13 +1556,15 @@ class LiveStatisticsCollector:
         }
         _write_json_atomic(self.output_directory / "capture.json", payload)
 
-    @staticmethod
-    def _warm_feature_kernel() -> None:
+    def _warm_feature_kernel(self) -> None:
         image = np.zeros((64, 64, 3), dtype=np.uint8)
         mask = np.zeros((64, 64), dtype=np.uint8)
         cv2.ellipse(mask, (32, 32), (12, 8), 0, 0, 360, 255, -1)
         image[mask > 0] = (60, 110, 180)
-        extract_view_features(image, mask, area_scale_mm2_per_px=0.01)
+        if self.settings.inference_attached:
+            extract_view_primitives(image, mask)
+        else:
+            extract_view_features(image, mask, area_scale_mm2_per_px=0.01)
 
 
 def _json_safe(value: Any) -> Any:
@@ -749,6 +1580,97 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     return value
+
+
+def _unavailable_materializer() -> np.ndarray:
+    raise ValueError("fallback image materialization is unavailable")
+
+
+def _largest_complete_component_crop(
+    centroid_px: tuple[float, float],
+    bbox_px: tuple[int, int, int, int],
+    frame_size_px: tuple[int, int],
+    target_size_px: int,
+) -> int | None:
+    """Return a complete even crop that still contains the whole component."""
+
+    centre_x, centre_y = centroid_px
+    frame_width, frame_height = frame_size_px
+    radius = math.floor(
+        min(
+            centre_x,
+            centre_y,
+            frame_width - centre_x,
+            frame_height - centre_y,
+        )
+    )
+    available = min(target_size_px, max(0, radius * 2))
+    available -= available % 2
+    x, y, width, height = bbox_px
+    required_radius = max(
+        centre_x - x,
+        x + width - centre_x,
+        centre_y - y,
+        y + height - centre_y,
+    )
+    required = math.ceil(required_radius * 2)
+    required += required % 2
+    return available if available >= max(32, required) else None
+
+
+def _inference_sample_index(payload: CropPayload) -> int:
+    try:
+        return int(payload.job.job_id.rsplit(":", 1)[1]) + 1
+    except (IndexError, ValueError):
+        return 1
+
+
+def _align_component_mask(
+    component: np.ndarray,
+    component_origin_px: tuple[int, int],
+    crop_centroid_px: tuple[float, float],
+    source_size_px: int,
+    target_size_px: int,
+) -> np.ndarray:
+    if (
+        component.dtype != np.uint8
+        or component.ndim != 2
+        or component.size == 0
+        or source_size_px <= 0
+        or target_size_px <= 0
+    ):
+        raise ValueError("statistics component mask is unavailable")
+    crop_left = round(crop_centroid_px[0]) - source_size_px // 2
+    crop_top = round(crop_centroid_px[1]) - source_size_px // 2
+    component_left, component_top = component_origin_px
+    component_height, component_width = component.shape
+    source_left = max(component_left, crop_left)
+    source_top = max(component_top, crop_top)
+    source_right = min(
+        component_left + component_width,
+        crop_left + source_size_px,
+    )
+    source_bottom = min(
+        component_top + component_height,
+        crop_top + source_size_px,
+    )
+    if source_left >= source_right or source_top >= source_bottom:
+        raise ValueError("statistics component does not intersect inference crop")
+    mask = np.zeros((source_size_px, source_size_px), dtype=np.uint8)
+    mask[
+        source_top - crop_top : source_bottom - crop_top,
+        source_left - crop_left : source_right - crop_left,
+    ] = component[
+        source_top - component_top : source_bottom - component_top,
+        source_left - component_left : source_right - component_left,
+    ]
+    if target_size_px != source_size_px:
+        mask = cv2.resize(
+            mask,
+            (target_size_px, target_size_px),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    return np.ascontiguousarray(mask)
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:

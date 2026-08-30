@@ -38,6 +38,31 @@ class CropSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class InferenceStatisticsEvidence:
+    """Local-only numerical evidence attached to an inference sample.
+
+    The images themselves already belong to :class:`CropPayload`.  This
+    record carries the two segmentation masks and the native measurements
+    that produced the crop so the statistics worker can reuse inference
+    materialization without another RAW crop or stereo search.
+    """
+
+    sample_index: int
+    fov_band: int
+    track_status: str
+    track_hits: int
+    caml_detection_area_px: int
+    camr_refinement_area_px: int
+    caml_bbox_px: tuple[int, int, int, int]
+    caml_solidity: float
+    caml_detection_mean_green: float
+    caml_mask: np.ndarray | None = field(compare=False, repr=False)
+    camr_mask: np.ndarray | None = field(compare=False, repr=False)
+    caml_component_origin_px: tuple[int, int] = (0, 0)
+    camr_component_origin_px: tuple[int, int] = (0, 0)
+
+
+@dataclass(frozen=True, slots=True)
 class CropPayload:
     job: InferenceJob
     image_bgr: np.ndarray | None = field(compare=False, repr=False)
@@ -50,6 +75,9 @@ class CropPayload:
     )
     stereo_pair: StereoPairMetadata | None = None
     sorting_context: SortingContext | None = None
+    statistics_evidence: InferenceStatisticsEvidence | None = field(
+        default=None, compare=False, repr=False
+    )
 
     @property
     def stereo_pair_complete(self) -> bool:
@@ -107,6 +135,7 @@ class CropPayload:
             None,
             self.stereo_pair,
             self.sorting_context,
+            self.statistics_evidence,
         )
 
     def with_job(self, job: InferenceJob) -> CropPayload:
@@ -118,6 +147,7 @@ class CropPayload:
             self.camr_materializer,
             self.stereo_pair,
             self.sorting_context,
+            self.statistics_evidence,
         )
 
     def with_sorting_context(self, context: SortingContext) -> CropPayload:
@@ -131,6 +161,21 @@ class CropPayload:
             self.camr_materializer,
             self.stereo_pair,
             context,
+            self.statistics_evidence,
+        )
+
+    def with_statistics_evidence(
+        self, evidence: InferenceStatisticsEvidence
+    ) -> CropPayload:
+        return CropPayload(
+            self.job,
+            self.image_bgr,
+            self.materializer,
+            self.camr_image_bgr,
+            self.camr_materializer,
+            self.stereo_pair,
+            self.sorting_context,
+            evidence,
         )
 
 

@@ -872,6 +872,30 @@ class MMapRawVideoSource:
             include_camr_mask=True,
         )
 
+    def inference_statistics_camr_component(
+        self,
+        frame: RawReplayFrame,
+        pair: StereoPairMetadata,
+    ) -> tuple[np.ndarray, tuple[int, int]] | None:
+        """Expose the compact cached CamR component without crop allocation."""
+
+        if self._stereo_geometry_cache_frame != frame.index:
+            return None
+        key = (
+            round(pair.caml_centroid_px[0] * 1_000),
+            round(pair.caml_centroid_px[1] * 1_000),
+        )
+        geometry = self._stereo_geometry_cache.get(key)
+        if geometry is None:
+            return None
+        _projected, refined = geometry
+        if (
+            abs(refined.centroid_px[0] - pair.camr_centroid_px[0]) > 1e-6
+            or abs(refined.centroid_px[1] - pair.camr_centroid_px[1]) > 1e-6
+        ):
+            return None
+        return refined.component_mask, refined.component_origin_px
+
     def configure_statistics_processing(
         self,
     ) -> tuple[RawCropProcessor, RawCropProcessor]:

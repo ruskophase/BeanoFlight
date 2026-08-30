@@ -540,6 +540,39 @@ class RawGreenDetector:
         np.clip(ys, 0, labels.shape[0] - 1, out=ys)
         return np.ascontiguousarray(labels[np.ix_(ys, xs)] == label, dtype=np.uint8) * 255
 
+    def component_mask_evidence(
+        self,
+        detection: Detection,
+    ) -> tuple[np.ndarray, tuple[int, int]] | None:
+        """Copy only the compact native component needed after frame release."""
+
+        labels = self._last_labels
+        native_size = self._last_native_size
+        label = self._last_detection_labels.get(id(detection))
+        if labels is None or native_size is None or label is None:
+            return None
+        native_width, native_height = native_size
+        x, y, width, height = detection.bbox_px
+        left = max(0, x - 2)
+        top = max(0, y - 2)
+        right = min(native_width, x + width + 2)
+        bottom = min(native_height, y + height + 2)
+        if left >= right or top >= bottom:
+            return None
+        scale_x = labels.shape[1] / native_width
+        scale_y = labels.shape[0] / native_height
+        xs = np.floor(np.arange(left, right) * scale_x).astype(np.intp)
+        ys = np.floor(np.arange(top, bottom) * scale_y).astype(np.intp)
+        np.clip(xs, 0, labels.shape[1] - 1, out=xs)
+        np.clip(ys, 0, labels.shape[0] - 1, out=ys)
+        mask = np.ascontiguousarray(
+            labels[np.ix_(ys, xs)] == label,
+            dtype=np.uint8,
+        )
+        if not np.any(mask):
+            return None
+        return mask * 255, (left, top)
+
 
 def temporal_median_background(frames: Iterable[np.ndarray]) -> np.ndarray:
     selected = tuple(frames)

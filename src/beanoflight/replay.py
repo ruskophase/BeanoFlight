@@ -301,6 +301,8 @@ class CropDispatcher:
         ),
         delivery_result: Callable[[tuple[CropPayload, ...], bool], None]
         | None = None,
+        statistics_result: Callable[[tuple[CropPayload, ...]], None]
+        | None = None,
     ) -> None:
         self.registry_endpoint = registry_endpoint
         self.inference_endpoint = inference_endpoint
@@ -335,6 +337,7 @@ class CropDispatcher:
                 "emergency microbatch minimum must be at least two beans"
             )
         self.delivery_result = delivery_result
+        self.statistics_result = statistics_result
         self._items: deque[_FrameDispatch] = deque()
         self._condition = threading.Condition()
         self._active = 0
@@ -347,6 +350,7 @@ class CropDispatcher:
         self.submitted = 0
         self.dropped = 0
         self.delivery_failures = 0
+        self.statistics_result_failures = 0
         self.track_frames_dropped = 0
         self.registry_batches = 0
         self.dispatch_items_coalesced = 0
@@ -438,6 +442,7 @@ class CropDispatcher:
             **{name: timing.summary() for name, timing in self._timings.items()},
             "track_frames_dropped": self.track_frames_dropped,
             "delivery_failures": self.delivery_failures,
+            "statistics_result_failures": self.statistics_result_failures,
             "registry_batches": self.registry_batches,
             "dispatch_items_coalesced": self.dispatch_items_coalesced,
             "maximum_dispatch_items_per_batch": (
@@ -571,6 +576,9 @@ class CropDispatcher:
                         pending_updates = ()
                         send_started = time.perf_counter_ns()
                         sender.submit_batch(materialized_items)
+                        send_ms = (
+                            time.perf_counter_ns() - send_started
+                        ) / 1_000_000.0
                         if self.delivery_result is not None:
                             self.delivery_result(group, True)
                         delivered_ids = {
@@ -582,9 +590,13 @@ class CropDispatcher:
                             if payload.job.job_id not in delivered_ids
                         )
                         registered_jobs = ()
-                        send_ms = (
-                            time.perf_counter_ns() - send_started
-                        ) / 1_000_000.0
+                        if self.statistics_result is not None:
+                            try:
+                                self.statistics_result(materialized_items)
+                            except Exception:  # noqa: BLE001 - inference succeeded
+                                self.statistics_result_failures += len(
+                                    materialized_items
+                                )
                         per_payload = len(materialized_items)
                         for _payload in materialized_items:
                             self._timings["materialize_ms"].add(
@@ -898,6 +910,10 @@ class ReplayRunner:
                         else self.crop_selector.delivery_failed(payloads)
                     )
                 )
+            if self.statistics_collector is not None:
+                self.crop_dispatcher.statistics_result = (
+                    self.statistics_collector.ingest_materialized
+                )
 
     def run(
         self,
@@ -1194,7 +1210,6 @@ class ReplayRunner:
                         frame_age_total += frame_age_ms
                         frame_age_max = max(frame_age_max, frame_age_ms)
                         timing_samples["frame_age_ms"].append(frame_age_ms)
-                    post_read_started_ns = time.perf_counter_ns()
                     selected_crops: tuple[CropPayload, ...] = ()
                     crop_select_ms = 0.0
 
@@ -1313,6 +1328,27 @@ class ReplayRunner:
                                 )
                             prioritized_crops.append(payload)
                         selected_crops = tuple(prioritized_crops)
+                        if self.statistics_collector is not None:
+                            statistics_started_ns = time.perf_counter_ns()
+                            selected_crops = (
+                                self.statistics_collector.attach_to_inference(
+                                    frame,
+                                    analysis,
+                                    selected_crops,
+                                )
+                            )
+                            self.statistics_collector.cache_unattached_primary(
+                                frame,
+                                analysis,
+                                selected_crops,
+                            )
+                            timing_samples["statistics_attach_ms"].append(
+                                (
+                                    time.perf_counter_ns()
+                                    - statistics_started_ns
+                                )
+                                / 1_000_000.0
+                            )
                         updates = tuple(
                             (
                                 track,
@@ -1335,27 +1371,9 @@ class ReplayRunner:
                         if not accepted and selected_crops:
                             self.crop_selector.delivery_failed(selected_crops)
                     if self.statistics_collector is not None:
-                        statistics_started_ns = time.perf_counter_ns()
-                        pre_statistics_work_ms = (
-                            statistics_started_ns - post_read_started_ns
-                        ) / 1_000_000.0
-                        timing_samples["statistics_preoffer_work_ms"].append(
-                            pre_statistics_work_ms
-                        )
-                        self.statistics_collector.consider(
-                            frame,
-                            analysis,
-                            allow_preparation=(
-                                pre_statistics_work_ms
-                                <= self.statistics_collector.settings.maximum_preparation_start_ms
-                            ),
-                            preferred_bean_refs=frozenset(
-                                payload.job.bean_ref for payload in selected_crops
-                            ),
-                        )
-                        timing_samples["statistics_offer_ms"].append(
-                            (time.perf_counter_ns() - statistics_started_ns)
-                            / 1_000_000.0
+                        self.statistics_collector.observe_tracks(
+                            analysis.tracks,
+                            analysis.frame_index,
                         )
                     crop_ms = (time.perf_counter_ns() - crop_started) / 1_000_000.0
                     timing_samples["crop_select_ms"].append(crop_select_ms)

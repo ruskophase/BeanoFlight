@@ -258,8 +258,42 @@ class PerformanceBenchmarkTests(unittest.TestCase):
         self.assertEqual(summary["minimum_acceptable_fps"], 59.0)
         self.assertTrue(summary["all_within_one_fps_of_target"])
         self.assertTrue(summary["all_outcomes_complete"])
+        self.assertTrue(summary["all_confirmed_beans_have_statistics"])
         self.assertTrue(summary["passed"])
         self.assertEqual(summary["fps"]["count"], 3)
+
+    def test_summary_fails_when_confirmed_bean_has_no_statistics(self):
+        runs = [
+            {
+                "scenario": "full",
+                "summary": {
+                    "achieved_fps": 60.0,
+                    "mean_processing_ms": 5.0,
+                    "crops_submitted": 1,
+                    "timings": {
+                        "statistics_capture": {
+                            "enabled": True,
+                            "beans_without_samples": 1,
+                            "fatal_error": "",
+                        }
+                    },
+                },
+                "outcome": {
+                    "settled": True,
+                    "jobs": 1,
+                    "jobs_completed": 1,
+                    "jobs_dropped": 0,
+                    "jobs_failed": 0,
+                    "decisions": 1,
+                    "beans_with_jobs": 1,
+                },
+            }
+        ]
+
+        summary = _scenario_summaries(runs, 60.0)["full"]
+
+        self.assertFalse(summary["all_confirmed_beans_have_statistics"])
+        self.assertFalse(summary["passed"])
 
     def test_hardware_summary_fails_if_an_actuation_fails(self):
         runs = [
