@@ -111,3 +111,32 @@ def lower_current_thread_priority(*, increment: int = 10) -> bool:
     except OSError:
         return False
     return True
+
+
+def apply_background_audit_thread_profile(
+    *, cpu_from_end: int = 1
+) -> frozenset[int]:
+    """Put optional audit work behind the actuator on its reserved CPU.
+
+    The lower scheduler priority (a higher numeric nice value) is the safety
+    boundary: an actuator thread on the same CPU pre-empts this worker.
+    Keeping audit work away from the general CPU set also prevents it
+    competing with acquisition, detection and model inference when all cores
+    are busy.
+    """
+
+    lower_current_thread_priority()
+    if not all(
+        hasattr(os, name)
+        for name in ("cpu_count", "sched_setaffinity")
+    ):
+        return frozenset()
+    cpu_count = os.cpu_count() or 0
+    if cpu_count < 2 or cpu_from_end < 1:
+        return frozenset()
+    selected = frozenset((max(0, cpu_count - cpu_from_end),))
+    try:
+        os.sched_setaffinity(threading.get_native_id(), selected)
+    except OSError:
+        return frozenset()
+    return selected

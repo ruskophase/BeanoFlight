@@ -158,6 +158,7 @@ class FastCapLiveProducer:
         duration_seconds: float,
         controller_url: str | None = None,
         witness_result: Path | None = None,
+        test_override: bool = False,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.calibration_pack = calibration_pack.expanduser().resolve()
@@ -168,6 +169,7 @@ class FastCapLiveProducer:
         self.duration_seconds = duration_seconds
         self.controller_url = controller_url
         self.witness_result = witness_result
+        self.test_override = bool(test_override)
         self.event_callback = event_callback or (lambda _event: None)
         self.process: subprocess.Popen[str] | None = None
         self.clock_source_timestamp_ns = 0
@@ -206,6 +208,8 @@ class FastCapLiveProducer:
             command.extend(("--controller-url", self.controller_url))
         if self.witness_result is not None:
             command.extend(("--witness-result", str(self.witness_result)))
+        if self.test_override:
+            command.append("--test-override")
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
@@ -354,6 +358,7 @@ class SharedMemoryRawStereoSource(MMapRawVideoSource):
             left_profile,
             processing_profile=crop_processing,
         )
+        self._statistics_crop_processor: RawCropProcessor | None = None
         self.crop_processing_profile = self._crop_processor.processing_profile
 
         self._stereo_calibration = point_calibration
@@ -372,7 +377,10 @@ class SharedMemoryRawStereoSource(MMapRawVideoSource):
             right_profile,
             processing_profile=crop_processing,
         )
+        self._right_profile_path = right_profile_path
+        self._right_statistics_crop_processor: RawCropProcessor | None = None
         self._right_background: np.ndarray | None = None
+        self._right_fallback_background: np.ndarray | None = None
         self._right_background_blurred: np.ndarray | None = None
         self._right_fallback_background_blurred: np.ndarray | None = None
         self._stereo_refinement_threshold = 22
@@ -387,6 +395,8 @@ class SharedMemoryRawStereoSource(MMapRawVideoSource):
         self._stereo_failure_counts: dict[str, int] = {}
         self._stereo_failure_examples: list[dict[str, object]] = []
         self._stereo_refinement_fallbacks = 0
+        self._stereo_geometry_cache_frame = -1
+        self._stereo_geometry_cache = {}
 
         self._regions = {
             name: SharedRawRegion(preview_paths[name]) for name in ("CamL", "CamR")
@@ -465,14 +475,14 @@ class SharedMemoryRawStereoSource(MMapRawVideoSource):
         self._right_background = np.median(
             np.stack(right_frames), axis=0
         ).astype(np.uint8)
-        fallback = np.median(np.stack(right_fallback_frames), axis=0).astype(
-            np.uint8
-        )
+        self._right_fallback_background = np.median(
+            np.stack(right_fallback_frames), axis=0
+        ).astype(np.uint8)
         self._right_background_blurred = cv2.GaussianBlur(
             self._right_background, (5, 5), 0
         )
         self._right_fallback_background_blurred = cv2.GaussianBlur(
-            fallback, (5, 5), 0
+            self._right_fallback_background, (5, 5), 0
         )
         self._background_samples = sample_count
         self.pipeline_metadata["background"] = {

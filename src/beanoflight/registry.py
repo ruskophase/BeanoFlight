@@ -99,6 +99,8 @@ class RegistryRepository(Protocol):
         statuses: Sequence[TrackStatus] | None = None,
     ) -> tuple[BeanRecord, ...]: ...
 
+    def run_outcome_counts(self, run_id: str) -> dict[str, int]: ...
+
     def event_identity(self, event_id: str) -> tuple[BeanRef, str] | None: ...
 
     def events_since(
@@ -1018,6 +1020,48 @@ class BeanRegistry:
             return tuple(
                 sorted(records, key=lambda item: item.bean_ref.sequence)[:limit]
             )
+
+    def run_outcome_counts(self, run_id: str) -> dict[str, int]:
+        """Return lightweight run settlement counts for monitors/benchmarks."""
+
+        if not run_id:
+            raise ValueError("run_id is required for outcome counters")
+        repository_counts = getattr(self.repository, "run_outcome_counts", None)
+        if repository_counts is not None:
+            return repository_counts(run_id)
+        records = self.list_records(run_id=run_id)
+        jobs = tuple(job for record in records for job in record.inference_jobs)
+        decisions = tuple(record for record in records if record.decision is not None)
+        return {
+            "beans": len(records),
+            "jobs": len(jobs),
+            "beans_with_jobs": sum(bool(record.inference_jobs) for record in records),
+            "terminal_jobs": sum(
+                job.status
+                in {
+                    InferenceStatus.COMPLETED,
+                    InferenceStatus.DROPPED,
+                    InferenceStatus.FAILED,
+                }
+                for job in jobs
+            ),
+            "completed_jobs": sum(
+                job.status == InferenceStatus.COMPLETED for job in jobs
+            ),
+            "dropped_jobs": sum(
+                job.status == InferenceStatus.DROPPED for job in jobs
+            ),
+            "failed_jobs": sum(job.status == InferenceStatus.FAILED for job in jobs),
+            "decisions": len(decisions),
+            "finalized_decisions": sum(
+                record.decision is not None
+                and (
+                    record.decision.acknowledged_timestamp_ns is not None
+                    or record.actuation is not None
+                )
+                for record in decisions
+            ),
+        }
 
     def list_active(self, *, run_id: str | None = None) -> tuple[BeanRecord, ...]:
         return self.list_records(

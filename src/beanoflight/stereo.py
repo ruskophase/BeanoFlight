@@ -105,12 +105,14 @@ class StereoCropPreparation:
     source_size_px: int
     padded: bool
     pair: StereoPairMetadata
+    camr_mask: np.ndarray | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class StereoPointCalibration:
     homography_path: Path
     caml_to_camr_undistorted: np.ndarray
+    camr_to_caml_undistorted: np.ndarray
     caml_camera_matrix: np.ndarray
     caml_distortion: np.ndarray
     camr_camera_matrix: np.ndarray
@@ -151,6 +153,7 @@ class StereoPointCalibration:
         return cls(
             path,
             homography / homography[2, 2],
+            np.linalg.inv(homography),
             caml_matrix,
             caml_distortion,
             camr_matrix,
@@ -190,6 +193,25 @@ class StereoPointCalibration:
         if not math.isfinite(float(x)) or not math.isfinite(float(y)):
             raise StereoCalibrationError("stereo projection is not finite")
         return float(x), float(y)
+
+    def project_distorted_camr_to_undistorted_caml(
+        self, point: tuple[float, float]
+    ) -> tuple[float, float]:
+        """Map a distorted CamR point back into CamL's metric-plane domain."""
+
+        camr_undistorted = cv2.undistortPoints(
+            np.asarray(point, dtype=np.float64).reshape(1, 1, 2),
+            self.camr_camera_matrix,
+            self.camr_distortion,
+            P=self.camr_camera_matrix,
+        )
+        caml_undistorted = cv2.perspectiveTransform(
+            camr_undistorted, self.camr_to_caml_undistorted
+        ).reshape(2)
+        x, y = (float(value) for value in caml_undistorted)
+        if not math.isfinite(x) or not math.isfinite(y):
+            raise StereoCalibrationError("reverse stereo projection is not finite")
+        return x, y
 
 
 def _matrix(value: object, shape: tuple[int, int], name: str) -> np.ndarray:

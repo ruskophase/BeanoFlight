@@ -11,6 +11,11 @@ The current release is deliberately a human-verification and system-simulation
 tool. Its ESP32-S2 output is restricted to low-current gate-indicator LEDs; it
 does not drive physical valves.
 
+For calibrated per-batch colour, silhouette, apparent-size and volume-proxy
+analysis, see [Offline Statistics Bundles](docs/statistics-bundle.md). Direct-
+camera runs also capture bounded numerical evidence for up to two stereo views
+per bean; see [Live Statistics Capture](docs/live-statistics-capture.md).
+
 ## Review and Simulation modes
 
 **Review** is the default. Analyse a clip once, then move freely through the
@@ -227,7 +232,10 @@ The newest complete, hash-valid Camera Tuner bundle is used unless
 `--calibration-pack` pins one. After the initial empty-frame median is captured,
 the command prints `LIVE_BACKGROUND_READY`; bean flow may then continue for the
 whole run. No empty tail is required. Sequence gaps and stereo skew are included
-in the JSON source statistics.
+in the JSON source statistics. Numerical colour/size evidence capture is
+enabled by default in live mode and writes beneath
+`<state-root>/live-statistics-captures`; `--no-statistics` is reserved for a
+controlled baseline or fault-isolation run.
 
 See [simulation.md](docs/simulation.md) for the data flow, crop policy, clock
 contract and operating sequence.

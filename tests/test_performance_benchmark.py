@@ -85,6 +85,34 @@ class PerformanceBenchmarkTests(unittest.TestCase):
         self.assertEqual(arguments.inference_backend, "mock")
         self.assertEqual(str(arguments.inference_engine), "/tmp/test.engine")
 
+    def test_statistics_pressure_controls_are_shared_by_benchmark_and_runner(self):
+        options = [
+            "recording",
+            "--background-frames",
+            "1,2,3",
+            "--statistics-output-root",
+            "/tmp/statistics",
+            "--statistics-workers",
+            "1",
+            "--statistics-start-budget-ms",
+            "7.5",
+        ]
+        benchmark = benchmark_parser().parse_args(options)
+        system_test = system_test_parser().parse_args(options)
+
+        self.assertEqual(benchmark.statistics_workers, 1)
+        self.assertEqual(system_test.statistics_workers, 1)
+        self.assertEqual(benchmark.statistics_start_budget_ms, 7.5)
+        self.assertEqual(system_test.statistics_start_budget_ms, 7.5)
+
+    def test_live_witness_override_is_explicit_and_shared(self):
+        options = ["--live", "--live-test-override"]
+        benchmark = benchmark_parser().parse_args(options)
+        system_test = system_test_parser().parse_args(options)
+
+        self.assertTrue(benchmark.live_test_override)
+        self.assertTrue(system_test.live_test_override)
+
     def test_scenarios_are_validated_and_deduplicated(self):
         self.assertEqual(_scenarios("core,full,core"), ("core", "full"))
         with self.assertRaises(argparse.ArgumentTypeError):

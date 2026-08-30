@@ -8,6 +8,7 @@ import tempfile
 import time
 from collections.abc import Sequence
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .analysis import AnalysisEngine
@@ -21,6 +22,7 @@ from .detection import (
     temporal_median_background,
 )
 from .inference_transport import DEFAULT_CROP_ENDPOINT
+from .live_statistics import LiveStatisticsCollector, LiveStatisticsSettings
 from .prediction import GateLayout
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
 from .registry_zmq import ZeroMQRegistryClient
@@ -86,6 +88,14 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--controller-url")
     result.add_argument("--witness-result", type=Path)
+    result.add_argument(
+        "--live-test-override",
+        action="store_true",
+        help=(
+            "permit a measured failing witness for an explicitly labelled "
+            "non-production live workflow test"
+        ),
+    )
     result.add_argument(
         "--background-samples",
         type=int,
@@ -161,6 +171,38 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--no-crops", action="store_true")
     result.add_argument(
+        "--no-statistics",
+        action="store_true",
+        help="disable the default numerical statistics capture for a live run",
+    )
+    result.add_argument(
+        "--statistics-output-root",
+        type=Path,
+        help=(
+            "statistics capture parent; enables collection for optimized RAW "
+            "replay and overrides the live default"
+        ),
+    )
+    result.add_argument("--statistics-crop-size", type=int, default=160)
+    result.add_argument("--statistics-queue-capacity", type=int, default=24)
+    result.add_argument("--statistics-primary-reserve", type=int, default=8)
+    result.add_argument(
+        "--statistics-workers",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="low-priority measurement workers (maximum 2)",
+    )
+    result.add_argument(
+        "--statistics-start-budget-ms",
+        type=float,
+        default=10.0,
+        help=(
+            "offer statistics work only when the sorting-critical work already "
+            "performed for a frame is within this budget"
+        ),
+    )
+    result.add_argument(
         "--no-emergency-microbatch",
         action="store_true",
         help=(
@@ -195,6 +237,31 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit("--progress-every must be positive")
     if arguments.hole_pitch_mm <= 0 or arguments.sorting_offset_mm <= 0:
         raise SystemExit("metric dimensions must be positive")
+    if arguments.no_statistics and arguments.statistics_output_root is not None:
+        raise SystemExit(
+            "--no-statistics cannot be combined with --statistics-output-root"
+        )
+    statistics_enabled = (
+        (arguments.live and not arguments.no_statistics)
+        or arguments.statistics_output_root is not None
+    )
+    statistics_settings = LiveStatisticsSettings(
+        crop_size_px=arguments.statistics_crop_size,
+        queue_capacity=arguments.statistics_queue_capacity,
+        primary_queue_reserve=arguments.statistics_primary_reserve,
+        worker_count=arguments.statistics_workers,
+        maximum_preparation_start_ms=arguments.statistics_start_budget_ms,
+    )
+    try:
+        statistics_settings.validate()
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if statistics_enabled and not (arguments.live or arguments.optimized_raw):
+        raise SystemExit(
+            "statistics capture requires --live or --optimized-raw input"
+        )
+    if arguments.live_test_override and not arguments.live:
+        raise SystemExit("--live-test-override requires --live")
     if arguments.live:
         if arguments.recording is not None:
             raise SystemExit("recording must be omitted with --live")
@@ -256,6 +323,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 duration_seconds=capture_seconds,
                 controller_url=arguments.controller_url,
                 witness_result=arguments.witness_result,
+                test_override=arguments.live_test_override,
                 event_callback=fastcap_event,
             )
             producer.start()
@@ -330,18 +398,24 @@ def main(argv: Sequence[str] | None = None) -> None:
         if calibration_path is None:
             raise SourceError("could not locate a PinkPlane homography")
         stereo_crop_extractor = None
-        if (
+        statistics_collector = None
+        needs_inference_stereo = (
             (arguments.optimized_raw or arguments.live)
             and not arguments.no_crops
             and not arguments.single_view_inference
+        )
+        if (
+            (arguments.optimized_raw or arguments.live)
+            and (needs_inference_stereo or statistics_enabled)
         ):
             if not arguments.live:
                 source.configure_stereo(
                     calibration_path,
                     arguments.background_frames,
                 )
-            stereo_crop_extractor = source.prepare_stereo_crop
-            deferred_crop_extractor = None
+            if needs_inference_stereo:
+                stereo_crop_extractor = source.prepare_stereo_crop
+                deferred_crop_extractor = None
         calibration = MetricPlaneCalibration.from_pinkplane(
             calibration_path,
             image_size_px=(source.metadata.width, source.metadata.height),
@@ -368,6 +442,48 @@ def main(argv: Sequence[str] | None = None) -> None:
                 else None
             ),
         )
+        if statistics_enabled:
+            output_root = (
+                arguments.statistics_output_root.expanduser().resolve()
+                if arguments.statistics_output_root is not None
+                else state_root / "live-statistics-captures"
+            )
+            output_root.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+            statistics_collector = LiveStatisticsCollector(
+                source,
+                detector,
+                background,
+                calibration,
+                output_root / f"{stamp}-{engine.tracker.run_id[:8]}",
+                settings=statistics_settings,
+                provenance={
+                    "classification": (
+                        "test" if arguments.live_test_override else "production"
+                    ),
+                    "live_test_override": arguments.live_test_override,
+                    "source_path": str(source.path),
+                    "source_kind": source.source_kind,
+                    "calibration_or_recording": str(source.path),
+                    "homography": str(calibration_path),
+                    "metric_plane": calibration.to_json(),
+                    "background": {
+                        "method": (
+                            "initial synchronized live temporal median"
+                            if arguments.live
+                            else "explicit human-confirmed frames"
+                        ),
+                        "frame_indices": (
+                            []
+                            if arguments.live
+                            else list(arguments.background_frames)
+                        ),
+                        "sample_count": (
+                            arguments.background_samples if arguments.live else None
+                        ),
+                    },
+                },
+            )
         selector = None
         dispatcher = None
         if not arguments.no_crops:
@@ -406,11 +522,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             ),
             crop_selector=selector,
             crop_dispatcher=dispatcher,
+            statistics_collector=statistics_collector,
             sorting_context_endpoint=arguments.sorting_contexts,
             profile_metadata={
                 "name": "headless-system-test",
                 "optimized_raw": arguments.optimized_raw or arguments.live,
                 "live_camera_input": arguments.live,
+                "classification": (
+                    "test" if arguments.live_test_override else "production"
+                ),
+                "live_test_override": arguments.live_test_override,
                 "crops_enabled": not arguments.no_crops,
                 "stereo_crops": stereo_crop_extractor is not None,
                 "adaptive_edge_resize": not arguments.no_adaptive_edge_resize,
@@ -422,6 +543,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     if arguments.optimized_raw or arguments.live
                     else "calibrated-video"
                 ),
+                "statistics_capture": statistics_enabled,
                 "background": {
                     "method": (
                         "initial synchronized live temporal median"

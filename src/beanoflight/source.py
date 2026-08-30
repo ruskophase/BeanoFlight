@@ -26,6 +26,19 @@ from .stereo import (
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mkv", ".avi", ".mov", ".mp4", ".m4v", ".webm"}
 
+_LINEAR16_LEVELS = np.arange(65_536, dtype=np.float32) / 65_535.0
+_LINEAR16_TO_SRGB8 = np.clip(
+    np.where(
+        _LINEAR16_LEVELS <= 0.0031308,
+        _LINEAR16_LEVELS * 12.92,
+        1.055 * np.power(_LINEAR16_LEVELS, 1.0 / 2.4) - 0.055,
+    )
+    * 255.0
+    + 0.5,
+    0,
+    255,
+).astype(np.uint8)
+
 
 class SourceError(RuntimeError):
     pass
@@ -119,6 +132,22 @@ class _RawFrameLocation:
     raw_offset: int = 0
     stored_bytes: int = 0
     raw_codec: str = "raw"
+
+
+@dataclass(frozen=True, slots=True)
+class _RightRefinement:
+    centroid_px: tuple[float, float]
+    area_px: int
+    component_size_px: tuple[float, float]
+    component_mask: np.ndarray
+    component_origin_px: tuple[int, int]
+
+    def __iter__(self):
+        """Retain the historical centroid/area/size unpacking contract."""
+
+        yield self.centroid_px
+        yield self.area_px
+        yield self.component_size_px
 
 
 def resolve_caml_video(path: Path) -> Path:
@@ -430,6 +459,7 @@ class MMapRawVideoSource:
         self._crop_processor = RawCropProcessor(
             profile_path, profile, processing_profile=crop_processing
         )
+        self._statistics_crop_processor: RawCropProcessor | None = None
         self._stereo_calibration: StereoPointCalibration | None = None
         self._stereo_pairs: dict[int, _RawStereoPair] = {}
         self._right_profile: dict[str, object] | None = None
@@ -442,9 +472,12 @@ class MMapRawVideoSource:
         self._right_detection_lut: np.ndarray | None = None
         self._right_stored_detection_lut: np.ndarray | None = None
         self._right_background: np.ndarray | None = None
+        self._right_fallback_background: np.ndarray | None = None
         self._right_background_blurred: np.ndarray | None = None
         self._right_fallback_background_blurred: np.ndarray | None = None
         self._right_crop_processor: RawCropProcessor | None = None
+        self._right_profile_path: Path | None = None
+        self._right_statistics_crop_processor: RawCropProcessor | None = None
         self._stereo_refinement_threshold = 22
         self._stereo_max_refinement_px = 64.0
         self._stereo_search_margin_px = 64
@@ -457,6 +490,10 @@ class MMapRawVideoSource:
         self._stereo_failure_counts: dict[str, int] = {}
         self._stereo_failure_examples: list[dict[str, object]] = []
         self._stereo_refinement_fallbacks = 0
+        self._stereo_geometry_cache_frame = -1
+        self._stereo_geometry_cache: dict[
+            tuple[int, int], tuple[tuple[float, float], _RightRefinement]
+        ] = {}
         self.crop_processing_profile = self._crop_processor.processing_profile
         self.metadata = SourceMetadata(root, width, height, len(rows), fps, True)
         codecs = sorted({location.raw_codec for location in rows})
@@ -482,6 +519,13 @@ class MMapRawVideoSource:
     @property
     def stereo_enabled(self) -> bool:
         return self._stereo_calibration is not None
+
+    @property
+    def stereo_calibration(self) -> StereoPointCalibration:
+        calibration = self._stereo_calibration
+        if calibration is None:
+            raise SourceError("synchronized CamR replay has not been configured")
+        return calibration
 
     def stereo_statistics(self) -> dict[str, object]:
         return {
@@ -607,6 +651,7 @@ class MMapRawVideoSource:
             right_profile,
             processing_profile=self.crop_processing_profile,
         )
+        self._right_profile_path = right_profile_path
         self._stereo_pairs = pair_by_left
         self._stereo_calibration = point_calibration
         self._stereo_refinement_threshold = int(refinement_threshold)
@@ -614,13 +659,13 @@ class MMapRawVideoSource:
         self._stereo_search_margin_px = int(search_margin_px)
         (
             self._right_background,
-            fallback_background,
+            self._right_fallback_background,
         ) = self._build_right_background(background_indices)
         self._right_background_blurred = cv2.GaussianBlur(
             self._right_background, (5, 5), 0
         )
         self._right_fallback_background_blurred = cv2.GaussianBlur(
-            fallback_background, (5, 5), 0
+            self._right_fallback_background, (5, 5), 0
         )
         self.pipeline_metadata = {
             **self.pipeline_metadata,
@@ -719,6 +764,41 @@ class MMapRawVideoSource:
                 self.release_frame(frame)
         return np.median(np.stack(frames, axis=0), axis=0).astype(np.uint8)
 
+    def right_detection_gray(
+        self, frame: RawReplayFrame, *, dual_green: bool = False
+    ) -> np.ndarray:
+        """Return CamR's compact detection plane for offline measurements.
+
+        Normal live localization uses one Bayer green sample. ``dual_green``
+        exposes its averaged-green recovery path so an offline consumer can
+        reproduce masks for the few observations that need that fallback.
+        """
+
+        stored_lut = self._right_stored_detection_lut
+        if self._stereo_calibration is None or stored_lut is None:
+            raise SourceError("synchronized CamR replay has not been configured")
+        if frame.right_frame_index is None:
+            raise SourceError("RAW replay frame has no synchronized CamR pair")
+        if dual_green:
+            return _raw_green_plane(frame.right_mosaic, stored_lut)
+        if frame._right_detection_gray is None:
+            frame._right_detection_gray = _raw_single_green_plane(
+                frame.right_mosaic, stored_lut
+            )
+        return frame._right_detection_gray
+
+    def right_background_gray(self, *, dual_green: bool = False) -> np.ndarray:
+        """Return the frozen CamR background in the requested green domain."""
+
+        background = (
+            self._right_fallback_background
+            if dual_green
+            else self._right_background
+        )
+        if background is None:
+            raise SourceError("synchronized CamR background is unavailable")
+        return background
+
     def extract_crop(
         self,
         frame: RawReplayFrame,
@@ -758,8 +838,89 @@ class MMapRawVideoSource:
         allow_padding: bool,
         allow_resize: bool = True,
     ) -> StereoCropPreparation | None:
+        return self._prepare_stereo_crop_with_processors(
+            frame,
+            centroid_px,
+            size_px,
+            allow_padding=allow_padding,
+            allow_resize=allow_resize,
+            left_processor=self._crop_processor,
+            right_processor=self._right_crop_processor,
+            include_camr_mask=False,
+        )
+
+    def prepare_statistics_stereo_crop(
+        self,
+        frame: RawReplayFrame,
+        centroid_px: tuple[float, float],
+        size_px: int,
+        *,
+        allow_padding: bool = False,
+        allow_resize: bool = True,
+    ) -> StereoCropPreparation | None:
+        """Copy deferred calibrated ROIs without changing inference processing."""
+
+        left_processor, right_processor = self.configure_statistics_processing()
+        return self._prepare_stereo_crop_with_processors(
+            frame,
+            centroid_px,
+            size_px,
+            allow_padding=allow_padding,
+            allow_resize=allow_resize,
+            left_processor=left_processor,
+            right_processor=right_processor,
+            include_camr_mask=True,
+        )
+
+    def configure_statistics_processing(
+        self,
+    ) -> tuple[RawCropProcessor, RawCropProcessor]:
+        """Load calibrated ROI artifacts before the live frame clock starts."""
+
+        right_profile = self._right_profile
+        right_profile_path = self._right_profile_path
+        if right_profile is None or right_profile_path is None:
+            raise SourceError("synchronized CamR replay has not been configured")
+        if self._statistics_crop_processor is None:
+            self._statistics_crop_processor = (
+                self._crop_processor
+                if self._crop_processor.processing_profile == "calibrated"
+                else RawCropProcessor(
+                    self.profile_path,
+                    self.profile,
+                    processing_profile="calibrated",
+                )
+            )
+        if self._right_statistics_crop_processor is None:
+            current = self._right_crop_processor
+            self._right_statistics_crop_processor = (
+                current
+                if current is not None
+                and current.processing_profile == "calibrated"
+                else RawCropProcessor(
+                    right_profile_path,
+                    right_profile,
+                    processing_profile="calibrated",
+                )
+            )
+        return (
+            self._statistics_crop_processor,
+            self._right_statistics_crop_processor,
+        )
+
+    def _prepare_stereo_crop_with_processors(
+        self,
+        frame: RawReplayFrame,
+        centroid_px: tuple[float, float],
+        size_px: int,
+        *,
+        allow_padding: bool,
+        allow_resize: bool,
+        left_processor: RawCropProcessor,
+        right_processor: RawCropProcessor | None,
+        include_camr_mask: bool,
+    ) -> StereoCropPreparation | None:
         calibration = self._stereo_calibration
-        right_processor = self._right_crop_processor
         if calibration is None or right_processor is None:
             raise SourceError("synchronized CamR replay has not been configured")
         pair = self._stereo_pairs.get(frame.index)
@@ -770,14 +931,26 @@ class MMapRawVideoSource:
         ):
             self._stereo_failure("missing_synchronized_pair")
             return None
-        projected = calibration.project_distorted_caml_to_distorted_camr(
-            centroid_px
-        )
-        refined = self._refine_right_centroid(frame, projected, size_px)
-        if refined is None:
-            self._stereo_failure("no_local_camr_component")
-            return None
-        refined_centroid, area_px, component_size_px = refined
+        if self._stereo_geometry_cache_frame != frame.index:
+            self._stereo_geometry_cache_frame = frame.index
+            self._stereo_geometry_cache.clear()
+        cache_key = (round(centroid_px[0] * 1_000), round(centroid_px[1] * 1_000))
+        geometry = self._stereo_geometry_cache.get(cache_key)
+        if geometry is None:
+            projected = calibration.project_distorted_caml_to_distorted_camr(
+                centroid_px
+            )
+            refined = self._refine_right_centroid(frame, projected, size_px)
+            if refined is None:
+                self._stereo_failure("no_local_camr_component")
+                return None
+            geometry = (projected, refined)
+            self._stereo_geometry_cache[cache_key] = geometry
+        else:
+            projected, refined = geometry
+        refined_centroid = refined.centroid_px
+        area_px = refined.area_px
+        component_size_px = refined.component_size_px
         source_size_px = size_px
         if not allow_padding:
             complete_size = 2 * math.floor(
@@ -816,7 +989,7 @@ class MMapRawVideoSource:
                     )
                     return None
                 source_size_px = complete_size
-        left = self._crop_processor.prepare(
+        left = left_processor.prepare(
             frame.mosaic,
             centroid_px,
             source_size_px,
@@ -859,6 +1032,15 @@ class MMapRawVideoSource:
                 camr_centroid_px=refined_centroid,
                 refinement_distance_px=distance,
                 refinement_area_px=area_px,
+            ),
+            (
+                self._right_component_crop_mask(
+                    refined,
+                    refined_centroid,
+                    source_size_px,
+                )
+                if include_camr_mask
+                else None
             ),
         )
 
@@ -905,7 +1087,7 @@ class MMapRawVideoSource:
         frame: RawReplayFrame,
         projected_px: tuple[float, float],
         crop_size_px: int,
-    ) -> tuple[tuple[float, float], int, tuple[float, float]] | None:
+    ) -> _RightRefinement | None:
         background_blurred = self._right_background_blurred
         if background_blurred is None:
             raise SourceError("CamR background has not been built")
@@ -969,7 +1151,7 @@ class MMapRawVideoSource:
         native_right: int,
         native_bottom: int,
         projected_px: tuple[float, float],
-    ) -> tuple[tuple[float, float], int, tuple[float, float]] | None:
+    ) -> _RightRefinement | None:
         left = native_left // 2
         right = native_right // 2
         top = native_top // 2
@@ -1006,9 +1188,7 @@ class MMapRawVideoSource:
         scale_x = current_roi.shape[1] / (native_right - native_left)
         scale_y = current_roi.shape[0] / (native_bottom - native_top)
         x_px, y_px = projected_px
-        candidates: list[
-            tuple[float, tuple[float, float], int, tuple[float, float]]
-        ] = []
+        candidates: list[tuple[float, _RightRefinement]] = []
         for contour in contours:
             x, y, width, height = cv2.boundingRect(contour)
             component = foreground[y : y + height, x : x + width]
@@ -1039,20 +1219,60 @@ class MMapRawVideoSource:
             )
             distance = math.hypot(centre[0] - x_px, centre[1] - y_px)
             if distance <= self._stereo_max_refinement_px:
+                native_mask = cv2.resize(
+                    component,
+                    (round(native_width), round(native_height)),
+                    interpolation=cv2.INTER_NEAREST,
+                )
                 candidates.append(
                     (
                         distance,
-                        centre,
-                        native_area,
-                        (native_width, native_height),
+                        _RightRefinement(
+                            centroid_px=centre,
+                            area_px=native_area,
+                            component_size_px=(native_width, native_height),
+                            component_mask=np.ascontiguousarray(native_mask),
+                            component_origin_px=(
+                                round(native_left + x / scale_x),
+                                round(native_top + y / scale_y),
+                            ),
+                        ),
                     )
                 )
         if not candidates:
             return None
-        _distance, centre, area, component_size = min(
+        _distance, result = min(
             candidates, key=lambda item: item[0]
         )
-        return centre, area, component_size
+        return result
+
+    @staticmethod
+    def _right_component_crop_mask(
+        component: _RightRefinement,
+        centroid_px: tuple[float, float],
+        crop_size_px: int,
+    ) -> np.ndarray | None:
+        """Align the already-localized CamR component to its deferred ROI."""
+
+        crop_left = round(centroid_px[0]) - crop_size_px // 2
+        crop_top = round(centroid_px[1]) - crop_size_px // 2
+        component_left, component_top = component.component_origin_px
+        component_height, component_width = component.component_mask.shape
+        source_left = max(component_left, crop_left)
+        source_top = max(component_top, crop_top)
+        source_right = min(component_left + component_width, crop_left + crop_size_px)
+        source_bottom = min(component_top + component_height, crop_top + crop_size_px)
+        if source_left >= source_right or source_top >= source_bottom:
+            return None
+        result = np.zeros((crop_size_px, crop_size_px), dtype=np.uint8)
+        result[
+            source_top - crop_top : source_bottom - crop_top,
+            source_left - crop_left : source_right - crop_left,
+        ] = component.component_mask[
+            source_top - component_top : source_bottom - component_top,
+            source_left - component_left : source_right - component_left,
+        ]
+        return result if np.any(result) else None
 
     def undistort_point(self, point: tuple[float, float]) -> tuple[float, float]:
         return self.undistort_points((point,))[0]
@@ -1312,14 +1532,13 @@ class RawCropProcessor:
         if self._wb is not None:
             rgb *= self._wb.reshape(1, 1, 3)
         if self._matrix is not None:
-            rgb = np.einsum("...c,dc->...d", rgb, self._matrix)
-        rgb = np.clip(rgb, 0.0, 1.0)
-        rgb = np.where(
-            rgb <= 0.0031308,
-            rgb * 12.92,
-            1.055 * np.power(rgb, 1.0 / 2.4) - 0.055,
-        )
-        rgb8 = np.clip(rgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
+            rgb = cv2.transform(rgb, self._matrix)
+        linear16 = np.clip(
+            rgb * 65_535.0 + 0.5,
+            0,
+            65_535,
+        ).astype(np.uint16)
+        rgb8 = _LINEAR16_TO_SRGB8[linear16]
         return _finish_raw_crop(
             rgb8[..., ::-1],
             roi_left=roi_left,

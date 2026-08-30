@@ -61,6 +61,7 @@ REGISTRY_CAPABILITIES = (
     "event_batches",
     "events_since_compact",
     "record_pages",
+    "run_outcome_counts",
 )
 
 
@@ -250,6 +251,8 @@ class ZeroMQRegistryServer:
                 statuses=statuses,
             )
             return [record_to_dict(record, include_history=False) for record in records]
+        if operation == "run_outcome_counts":
+            return self.registry.run_outcome_counts(str(payload.get("run_id", "")))
         if operation == "events_since":
             return [
                 event_to_dict(event)
@@ -655,6 +658,14 @@ class ZeroMQRegistryClient:
             record_from_dict(_object(item))
             for item in _array(self._request("list_page", payload))
         )
+
+    def run_outcome_counts(self, run_id: str) -> dict[str, int]:
+        return {
+            key: int(value)
+            for key, value in _object(
+                self._request("run_outcome_counts", {"run_id": run_id})
+            ).items()
+        }
 
     def list_active(self, *, run_id: str | None = None) -> tuple[BeanRecord, ...]:
         return tuple(

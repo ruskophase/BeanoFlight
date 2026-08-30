@@ -365,6 +365,9 @@ class RawGreenDetector:
         self._background_source: np.ndarray | None = None
         self._background_blurred: np.ndarray | None = None
         self._processing_size: tuple[int, int] | None = None
+        self._last_labels: np.ndarray | None = None
+        self._last_detection_labels: dict[int, int] = {}
+        self._last_native_size: tuple[int, int] | None = None
 
     def detect(
         self,
@@ -442,6 +445,9 @@ class RawGreenDetector:
         count, labels, stats, centroids = cv2.connectedComponentsWithStats(
             foreground, connectivity=8
         )
+        self._last_labels = labels
+        self._last_detection_labels = {}
+        self._last_native_size = (native_width, native_height)
         scale_x = processing_size[0] / native_width
         scale_y = processing_size[1] / native_height
         detections: list[Detection] = []
@@ -485,8 +491,7 @@ class RawGreenDetector:
                     mask=component_mask,
                 )[0]
             )
-            detections.append(
-                Detection(
+            detection = Detection(
                     centroid_px=(
                         float(centroids[label][0] / scale_x),
                         float(centroids[label][1] / scale_y),
@@ -501,9 +506,39 @@ class RawGreenDetector:
                     solidity=float(solidity),
                     mean_bgr=(mean_gray, mean_gray, mean_gray),
                 )
-            )
+            detections.append(detection)
+            self._last_detection_labels[id(detection)] = label
         detections.sort(key=lambda value: (value.centroid_px[1], value.centroid_px[0]))
         return DetectionResult(tuple(detections), ())
+
+    def component_crop_mask(
+        self,
+        detection: Detection,
+        centroid_native_px: tuple[float, float],
+        crop_size_px: int,
+    ) -> np.ndarray | None:
+        """Copy the already-computed component into a native RAW crop domain."""
+
+        labels = self._last_labels
+        native_size = self._last_native_size
+        label = self._last_detection_labels.get(id(detection))
+        if labels is None or native_size is None or label is None or crop_size_px <= 0:
+            return None
+        native_width, native_height = native_size
+        centre_x, centre_y = (round(value) for value in centroid_native_px)
+        left = centre_x - crop_size_px // 2
+        top = centre_y - crop_size_px // 2
+        right = left + crop_size_px
+        bottom = top + crop_size_px
+        if left < 0 or top < 0 or right > native_width or bottom > native_height:
+            return None
+        scale_x = labels.shape[1] / native_width
+        scale_y = labels.shape[0] / native_height
+        xs = np.floor(np.arange(left, right) * scale_x).astype(np.intp)
+        ys = np.floor(np.arange(top, bottom) * scale_y).astype(np.intp)
+        np.clip(xs, 0, labels.shape[1] - 1, out=xs)
+        np.clip(ys, 0, labels.shape[0] - 1, out=ys)
+        return np.ascontiguousarray(labels[np.ix_(ys, xs)] == label, dtype=np.uint8) * 255
 
 
 def temporal_median_background(frames: Iterable[np.ndarray]) -> np.ndarray:

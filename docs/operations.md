@@ -136,7 +136,10 @@ path and `--background-frames`. The command starts headless FastCap, defaults to
 the newest valid tuner bundle, captures 15 initial empty pairs, prints
 `LIVE_BACKGROUND_READY`, waits five seconds for bean flow, and then consumes
 camera-paced frames. It creates no video or RAW recording. A current bound
-FastCap witness is still mandatory.
+FastCap witness is still mandatory. Live runs capture numerical colour/size
+evidence by default, with a hard maximum of two stereo observations per bean
+and a one-observation fallback. The lower-priority collector creates no bean
+images; see [Live Statistics Capture](live-statistics-capture.md).
 
 For an attended live run, keep the conveyor and vibration motor off while
 FastCap readiness, the witness and the empty background are confirmed. Ask the

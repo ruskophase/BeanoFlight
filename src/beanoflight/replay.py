@@ -16,6 +16,7 @@ from pathlib import Path
 from .analysis import AnalysisEngine
 from .crop import BeanCropSelector, CropPayload
 from .inference_transport import ZeroMQCropClient
+from .live_statistics import LiveStatisticsCollector
 from .models import FrameAnalysis
 from .registry_models import InferenceStatus, RunSession, RunState
 from .registry_zmq import ZeroMQRegistryClient
@@ -870,6 +871,7 @@ class ReplayRunner:
         settings: ReplaySettings | None = None,
         crop_selector: BeanCropSelector | None = None,
         crop_dispatcher: CropDispatcher | None = None,
+        statistics_collector: LiveStatisticsCollector | None = None,
         sorting_context_endpoint: str = "",
         profile_metadata: Mapping[str, object] | None = None,
     ) -> None:
@@ -880,6 +882,7 @@ class ReplayRunner:
         self.settings.validate()
         self.crop_selector = crop_selector
         self.crop_dispatcher = crop_dispatcher
+        self.statistics_collector = statistics_collector
         self.sorting_context_endpoint = sorting_context_endpoint
         self.profile_metadata = dict(profile_metadata or {})
         if self.crop_dispatcher is not None:
@@ -972,6 +975,24 @@ class ReplayRunner:
                         ),
                     }
                 ),
+                "statistics_capture": (
+                    {"enabled": False}
+                    if self.statistics_collector is None
+                    else {
+                        "enabled": True,
+                        "target_samples_per_bean": (
+                            self.statistics_collector.settings.target_samples_per_bean
+                        ),
+                        "hard_maximum_samples_per_bean": 2,
+                        "queue_capacity": (
+                            self.statistics_collector.settings.queue_capacity
+                        ),
+                        "output_directory": str(
+                            self.statistics_collector.output_directory
+                        ),
+                        "images_persisted": False,
+                    }
+                ),
                 "source_pipeline": getattr(self.source, "pipeline_metadata", {}),
                 "execution_profile": self.profile_metadata,
                 "suppress_cyclic_gc": self.settings.suppress_cyclic_gc,
@@ -1005,6 +1026,7 @@ class ReplayRunner:
         crop_selection_metrics: dict[str, object] = {}
         sorting_context_metrics: dict[str, object] = {"enabled": False}
         source_metrics: dict[str, object] = {}
+        statistics_capture_metrics: dict[str, object] = {"enabled": False}
         clock_metrics: dict[str, object] = {
             "synchronized": False,
             "anchor_attempts": 0,
@@ -1026,6 +1048,8 @@ class ReplayRunner:
                 )
             if self.crop_dispatcher is not None:
                 self.crop_dispatcher.start()
+            if self.statistics_collector is not None:
+                self.statistics_collector.start(run_id)
             if self.sorting_context_endpoint:
                 sorting_context_publisher = ZeroMQSortingContextPublisher(
                     self.sorting_context_endpoint
@@ -1170,6 +1194,7 @@ class ReplayRunner:
                         frame_age_total += frame_age_ms
                         frame_age_max = max(frame_age_max, frame_age_ms)
                         timing_samples["frame_age_ms"].append(frame_age_ms)
+                    post_read_started_ns = time.perf_counter_ns()
                     selected_crops: tuple[CropPayload, ...] = ()
                     crop_select_ms = 0.0
 
@@ -1309,6 +1334,29 @@ class ReplayRunner:
                         )
                         if not accepted and selected_crops:
                             self.crop_selector.delivery_failed(selected_crops)
+                    if self.statistics_collector is not None:
+                        statistics_started_ns = time.perf_counter_ns()
+                        pre_statistics_work_ms = (
+                            statistics_started_ns - post_read_started_ns
+                        ) / 1_000_000.0
+                        timing_samples["statistics_preoffer_work_ms"].append(
+                            pre_statistics_work_ms
+                        )
+                        self.statistics_collector.consider(
+                            frame,
+                            analysis,
+                            allow_preparation=(
+                                pre_statistics_work_ms
+                                <= self.statistics_collector.settings.maximum_preparation_start_ms
+                            ),
+                            preferred_bean_refs=frozenset(
+                                payload.job.bean_ref for payload in selected_crops
+                            ),
+                        )
+                        timing_samples["statistics_offer_ms"].append(
+                            (time.perf_counter_ns() - statistics_started_ns)
+                            / 1_000_000.0
+                        )
                     crop_ms = (time.perf_counter_ns() - crop_started) / 1_000_000.0
                     timing_samples["crop_select_ms"].append(crop_select_ms)
                     timing_samples["frame_dispatch_enqueue_ms"].append(crop_ms)
@@ -1373,6 +1421,10 @@ class ReplayRunner:
                 )
                 right_censored_tracks = len(censored)
                 if censored:
+                    if self.statistics_collector is not None:
+                        self.statistics_collector.observe_tracks(
+                            censored, frame_count - 1
+                        )
                     updates = tuple(
                         (
                             track,
@@ -1429,6 +1481,17 @@ class ReplayRunner:
             if self.crop_dispatcher is not None:
                 self.crop_dispatcher.close(drain=True)
                 crop_dispatch_metrics = self.crop_dispatcher.performance_metrics()
+            if self.statistics_collector is not None:
+                try:
+                    statistics_capture_metrics = self.statistics_collector.close(
+                        drain=True,
+                        failed=failure is not None,
+                    )
+                except Exception as exc:  # noqa: BLE001 - optional evidence only
+                    statistics_capture_metrics = {
+                        "enabled": True,
+                        "fatal_error": str(exc),
+                    }
             if self.crop_selector is not None:
                 crop_selection_metrics = self.crop_selector.statistics()
             source_statistics = getattr(self.source, "stereo_statistics", None)
@@ -1518,6 +1581,7 @@ class ReplayRunner:
                             "crop_dispatch": crop_dispatch_metrics,
                             "crop_selection": crop_selection_metrics,
                             "source": source_metrics,
+                            "statistics_capture": statistics_capture_metrics,
                             "sorting_context": sorting_context_metrics,
                             "clock": clock_metrics,
                         },
@@ -1567,6 +1631,7 @@ class ReplayRunner:
                 "crop_dispatch": crop_dispatch_metrics,
                 "crop_selection": crop_selection_metrics,
                 "source": source_metrics,
+                "statistics_capture": statistics_capture_metrics,
                 "sorting_context": sorting_context_metrics,
                 "clock": clock_metrics,
             },

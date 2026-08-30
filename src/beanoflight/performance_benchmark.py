@@ -71,6 +71,14 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--controller-url")
     result.add_argument("--witness-result", type=Path)
+    result.add_argument(
+        "--live-test-override",
+        action="store_true",
+        help=(
+            "permit a measured failing witness and permanently classify the "
+            "live benchmark as non-production test evidence"
+        ),
+    )
     result.add_argument("--background-samples", type=int, default=15)
     result.add_argument("--bean-start-delay", type=float, default=5.0)
     result.add_argument("--pair-threshold-us", type=float, default=5.0)
@@ -115,6 +123,29 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="disable deadline-aware second-sample microbatches for A/B testing",
     )
+    statistics = result.add_mutually_exclusive_group()
+    statistics.add_argument(
+        "--collect-statistics",
+        action="store_true",
+        help="exercise best-effort two-sample numerical statistics capture",
+    )
+    statistics.add_argument(
+        "--no-statistics",
+        action="store_true",
+        help="disable statistics capture, including its live-mode default",
+    )
+    result.add_argument(
+        "--statistics-output-root",
+        type=Path,
+        help="parent directory for preserved benchmark statistics captures",
+    )
+    result.add_argument("--statistics-crop-size", type=int, default=160)
+    result.add_argument("--statistics-queue-capacity", type=int, default=24)
+    result.add_argument("--statistics-primary-reserve", type=int, default=8)
+    result.add_argument(
+        "--statistics-workers", type=int, choices=(1, 2), default=1
+    )
+    result.add_argument("--statistics-start-budget-ms", type=float, default=10.0)
     result.add_argument("--database", type=Path)
     result.add_argument("--output", type=Path)
     result.add_argument(
@@ -190,6 +221,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--minimum-samples-per-bean must be between one and five")
     if arguments.expected_beans is not None and arguments.expected_beans <= 0:
         raise SystemExit("--expected-beans must be positive")
+    if arguments.statistics_output_root is not None:
+        arguments.collect_statistics = True
+    if arguments.no_statistics and arguments.statistics_output_root is not None:
+        raise SystemExit(
+            "--no-statistics cannot be combined with --statistics-output-root"
+        )
+    if arguments.statistics_start_budget_ms <= 0:
+        raise SystemExit("--statistics-start-budget-ms must be positive")
+    if arguments.live_test_override and not arguments.live:
+        raise SystemExit("--live-test-override requires --live")
     if arguments.live:
         if arguments.recording is not None or arguments.background_frames is not None:
             raise SystemExit(
@@ -370,6 +411,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     thermal_abort_detail = str(exc)
                     stop_runs = True
                     break
+                if arguments.live:
+                    print(
+                        "LIVE_CAPTURE_COMPLETE: camera measurement window ended; "
+                        "stop bean flow now",
+                        flush=True,
+                    )
                 outcome = _wait_for_outcome(
                     commands,
                     str(summary["run_id"]),
@@ -439,6 +486,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 None if arguments.recording is None else str(arguments.recording.resolve())
             ),
             "live_camera_input": arguments.live,
+            "classification": (
+                "test" if arguments.live_test_override else "production"
+            ),
+            "test_override": arguments.live_test_override,
+            "production_valid": not arguments.live_test_override,
             "calibration_pack": (
                 None
                 if arguments.calibration_pack is None
@@ -458,6 +510,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             "adaptive_edge_resize": not arguments.no_adaptive_edge_resize,
             "genuine_stereo_crops": not arguments.single_view_inference,
             "emergency_microbatch": not arguments.no_emergency_microbatch,
+            "statistics_capture": {
+                "enabled": (
+                    arguments.collect_statistics
+                    or (arguments.live and not arguments.no_statistics)
+                ),
+                "output_root": (
+                    None
+                    if arguments.statistics_output_root is None
+                    else str(arguments.statistics_output_root.resolve())
+                ),
+                "crop_size_px": arguments.statistics_crop_size,
+                "queue_capacity": arguments.statistics_queue_capacity,
+                "primary_queue_reserve": arguments.statistics_primary_reserve,
+                "worker_count": arguments.statistics_workers,
+                "start_budget_ms": arguments.statistics_start_budget_ms,
+            },
             "direct_evidence_dedicated_io": True,
             "sorter_deadline_aware_gc": True,
             "sorter_gc_statistics": sorter_gc_statistics,
@@ -671,6 +739,8 @@ def _run_replay(
             command.extend(("--controller-url", arguments.controller_url))
         if arguments.witness_result is not None:
             command.extend(("--witness-result", str(arguments.witness_result)))
+        if arguments.live_test_override:
+            command.append("--live-test-override")
     else:
         command.extend(
             (
@@ -688,6 +758,30 @@ def _run_replay(
         command.append("--single-view-inference")
     if arguments.no_emergency_microbatch:
         command.append("--no-emergency-microbatch")
+    if arguments.no_statistics:
+        command.append("--no-statistics")
+    statistics_enabled = arguments.collect_statistics or (
+        arguments.live and not arguments.no_statistics
+    )
+    if statistics_enabled:
+        command.extend(
+            (
+                "--statistics-crop-size",
+                str(arguments.statistics_crop_size),
+                "--statistics-queue-capacity",
+                str(arguments.statistics_queue_capacity),
+                "--statistics-primary-reserve",
+                str(arguments.statistics_primary_reserve),
+                "--statistics-workers",
+                str(arguments.statistics_workers),
+                "--statistics-start-budget-ms",
+                str(arguments.statistics_start_budget_ms),
+            )
+        )
+        if arguments.statistics_output_root is not None:
+            command.extend(
+                ("--statistics-output-root", str(arguments.statistics_output_root))
+            )
     replay = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -750,20 +844,20 @@ def _wait_for_outcome(
     records = ()
     session = None
     settled = False
+    settlement_counts: dict[str, int] = {}
     registry_transport_retries = 0
     try:
-        # A full page sweep can itself take several seconds for a multi-minute
-        # run. Keep enough time for a second coherent sweep if early pages were
-        # read while the final inference/audit work was still settling.
+        # Never page every durable bean while inference/sorting writes are still
+        # settling. Those heavyweight reads contend for the single Registry
+        # connection and can turn a short backlog into minutes of feedback.
         deadline = time.monotonic() + 30.0
         while True:
             try:
-                records, page_retries = _list_run_records(
-                    client,
-                    run_id,
+                settlement_counts, count_retries = _retry_registry_call(
+                    lambda: client.run_outcome_counts(run_id),
                     abort_event=abort_event,
                 )
-                registry_transport_retries += page_retries
+                registry_transport_retries += count_retries
             except RegistryTransportError:
                 registry_transport_retries += 1
                 if abort_event is not None and abort_event.is_set():
@@ -772,31 +866,13 @@ def _wait_for_outcome(
                     raise
                 time.sleep(0.02)
                 continue
-            jobs = tuple(job for record in records for job in record.inference_jobs)
-            decisions = sum(record.decision is not None for record in records)
-            expected_decisions = sum(bool(record.inference_jobs) for record in records)
-            terminal = sum(
-                job.status
-                in {
-                    InferenceStatus.COMPLETED,
-                    InferenceStatus.DROPPED,
-                    InferenceStatus.FAILED,
-                }
-                for job in jobs
-            )
-            finalized_decisions = sum(
-                record.decision is not None
-                and (
-                    record.decision.acknowledged_timestamp_ns is not None
-                    or record.actuation is not None
-                )
-                for record in records
-            )
             if (
-                len(jobs) >= expected_jobs
-                and terminal >= expected_jobs
-                and decisions >= expected_decisions
-                and finalized_decisions >= decisions
+                settlement_counts.get("jobs", 0) >= expected_jobs
+                and settlement_counts.get("terminal_jobs", 0) >= expected_jobs
+                and settlement_counts.get("decisions", 0)
+                >= settlement_counts.get("beans_with_jobs", 0)
+                and settlement_counts.get("finalized_decisions", 0)
+                >= settlement_counts.get("decisions", 0)
             ):
                 settled = True
                 break
@@ -804,20 +880,31 @@ def _wait_for_outcome(
                 break
             if abort_event is not None and abort_event.is_set():
                 break
-            time.sleep(0.02)
-        session, session_retries = _retry_registry_call(
-            lambda: client.get_session(run_id),
-            abort_event=abort_event,
-        )
-        registry_transport_retries += session_retries
-        evicted, eviction_retries = _retry_registry_call(
-            lambda: client.evict_completed(
-                before_timestamp_ns=(1 << 63) - 1,
-                run_id=run_id,
-            ),
-            abort_event=abort_event,
-        )
-        registry_transport_retries += eviction_retries
+            # The count query is deliberately lightweight, but the Registry
+            # still serializes it with writes. A 10 Hz poll leaves ample
+            # service time for the final sorter decision and audit commits.
+            time.sleep(0.1)
+        evicted = 0
+        if settled:
+            records, page_retries = _list_run_records(
+                client,
+                run_id,
+                abort_event=abort_event,
+            )
+            registry_transport_retries += page_retries
+            session, session_retries = _retry_registry_call(
+                lambda: client.get_session(run_id),
+                abort_event=abort_event,
+            )
+            registry_transport_retries += session_retries
+            evicted, eviction_retries = _retry_registry_call(
+                lambda: client.evict_completed(
+                    before_timestamp_ns=(1 << 63) - 1,
+                    run_id=run_id,
+                ),
+                abort_event=abort_event,
+            )
+            registry_transport_retries += eviction_retries
     finally:
         client.close()
     jobs = tuple(job for record in records for job in record.inference_jobs)
@@ -881,12 +968,21 @@ def _wait_for_outcome(
         if isinstance(pair, dict)
     )
     return {
-        "beans": len(records),
-        "beans_with_jobs": sum(bool(record.inference_jobs) for record in records),
-        "jobs": len(jobs),
-        "jobs_completed": sum(job.status == InferenceStatus.COMPLETED for job in jobs),
-        "jobs_dropped": sum(job.status == InferenceStatus.DROPPED for job in jobs),
-        "jobs_failed": sum(job.status == InferenceStatus.FAILED for job in jobs),
+        "beans": settlement_counts.get("beans", len(records)),
+        "beans_with_jobs": settlement_counts.get(
+            "beans_with_jobs", sum(bool(record.inference_jobs) for record in records)
+        ),
+        "jobs": settlement_counts.get("jobs", len(jobs)),
+        "jobs_completed": settlement_counts.get(
+            "completed_jobs",
+            sum(job.status == InferenceStatus.COMPLETED for job in jobs),
+        ),
+        "jobs_dropped": settlement_counts.get(
+            "dropped_jobs", sum(job.status == InferenceStatus.DROPPED for job in jobs)
+        ),
+        "jobs_failed": settlement_counts.get(
+            "failed_jobs", sum(job.status == InferenceStatus.FAILED for job in jobs)
+        ),
         "incomplete_jobs": incomplete_jobs,
         "classification_evidence": len(evidence),
         "stereo_pairs_complete": sum(
@@ -917,7 +1013,9 @@ def _wait_for_outcome(
             and bool(item.value["ensemble"].get("deadline_fallback", False))
             for item in pooled
         ),
-        "decisions": sum(record.decision is not None for record in records),
+        "decisions": settlement_counts.get(
+            "decisions", sum(record.decision is not None for record in records)
+        ),
         "actuations": sum(record.actuation is not None for record in records),
         "actuations_succeeded": sum(
             record.actuation is not None and record.actuation.success
@@ -945,6 +1043,8 @@ def _wait_for_outcome(
         "hot_records_evicted": evicted,
         "registry_transport_retries": registry_transport_retries,
         "settled": settled,
+        "settlement_counts": settlement_counts,
+        "detailed_records_collected": settled,
         "clock_consistency": _clock_consistency(records, session),
         "identity_continuity": _identity_continuity(records),
         "timing_ledger": summarize_timing_ledgers(records),
@@ -959,9 +1059,9 @@ def _list_run_records(client, run_id: str, *, abort_event=None):
     retries = 0
     while True:
         page, page_retries = _retry_registry_call(
-            lambda: client.list_records_page(
+            lambda _after_sequence=after_sequence: client.list_records_page(
                 run_id=run_id,
-                after_sequence=after_sequence,
+                after_sequence=_after_sequence,
                 limit=100,
             ),
             abort_event=abort_event,

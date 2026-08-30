@@ -144,6 +144,7 @@ class ZeroMQRegistryTests(unittest.TestCase):
             self.assertIn("complete_inference_jobs_ack", ping["capabilities"])
             self.assertIn("record_actuation_ack", ping["capabilities"])
             self.assertIn("record_pages", ping["capabilities"])
+            self.assertIn("run_outcome_counts", ping["capabilities"])
             self.assertEqual(ping["database"], str(repository.path.resolve()))
             # PUB/SUB subscriptions are asynchronous; allow the local handshake.
             time.sleep(0.1)
@@ -251,6 +252,20 @@ class ZeroMQRegistryTests(unittest.TestCase):
             self.assertEqual(actuation_revision, 7)
             self.assertTrue(client.get(bean_ref).actuation.success)
             self.assertEqual(client.event_cursor(), 7)
+            self.assertEqual(
+                client.run_outcome_counts(bean_ref.run_id),
+                {
+                    "beans": 1,
+                    "jobs": 1,
+                    "beans_with_jobs": 1,
+                    "terminal_jobs": 0,
+                    "completed_jobs": 0,
+                    "dropped_jobs": 0,
+                    "failed_jobs": 0,
+                    "decisions": 1,
+                    "finalized_decisions": 1,
+                },
+            )
             metrics = client.service_metrics()
             self.assertGreater(
                 metrics["operations_ms"]["update_track_revisions"]["count"], 0

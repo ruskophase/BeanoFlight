@@ -78,6 +78,30 @@ class RawReplayTests(unittest.TestCase):
         self.assertGreaterEqual(component_size[0], 40)
         self.assertGreaterEqual(component_size[1], 32)
 
+    def test_reverse_stereo_projection_inverts_forward_homography(self):
+        from beanoflight.stereo import StereoPointCalibration
+
+        matrix = np.asarray(
+            ((1.1, 0.02, 14.0), (-0.01, 0.95, 8.0), (0.0, 0.0, 1.0)),
+            dtype=np.float64,
+        )
+        identity = np.eye(3, dtype=np.float64)
+        calibration = StereoPointCalibration(
+            Path("homography.json"),
+            matrix,
+            np.linalg.inv(matrix),
+            identity,
+            np.zeros(5),
+            identity,
+            np.zeros(5),
+        )
+        point = (100.0, 75.0)
+        right = calibration.project_distorted_caml_to_distorted_camr(point)
+        recovered = calibration.project_distorted_camr_to_undistorted_caml(right)
+
+        self.assertAlmostEqual(recovered[0], point[0], places=6)
+        self.assertAlmostEqual(recovered[1], point[1], places=6)
+
     def test_mmaps_green_plane_and_defers_crop_colour_work(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

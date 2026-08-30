@@ -587,6 +587,43 @@ class SQLiteBeanRepository:
                 if (record := self.load(reference)) is not None
             )
 
+    def run_outcome_counts(self, run_id: str) -> dict[str, int]:
+        """Return settlement counters without materializing bean histories."""
+
+        if not run_id:
+            raise ValueError("run_id is required for outcome counters")
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM beans WHERE run_id=?) AS beans,
+                    (SELECT COUNT(*) FROM inference_jobs WHERE run_id=?) AS jobs,
+                    (SELECT COUNT(DISTINCT sequence) FROM inference_jobs
+                        WHERE run_id=?) AS beans_with_jobs,
+                    (SELECT COUNT(*) FROM inference_jobs
+                        WHERE run_id=? AND status IN ('completed','dropped','failed'))
+                        AS terminal_jobs,
+                    (SELECT COUNT(*) FROM inference_jobs
+                        WHERE run_id=? AND status='completed') AS completed_jobs,
+                    (SELECT COUNT(*) FROM inference_jobs
+                        WHERE run_id=? AND status='dropped') AS dropped_jobs,
+                    (SELECT COUNT(*) FROM inference_jobs
+                        WHERE run_id=? AND status='failed') AS failed_jobs,
+                    (SELECT COUNT(*) FROM sorting_decisions WHERE run_id=?)
+                        AS decisions,
+                    (SELECT COUNT(*) FROM sorting_decisions AS decision
+                        WHERE decision.run_id=? AND (
+                            decision.acknowledged_timestamp_ns IS NOT NULL OR EXISTS(
+                                SELECT 1 FROM actuation_results AS actuation
+                                WHERE actuation.decision_id=decision.decision_id
+                            )
+                        )) AS finalized_decisions
+                """,
+                (run_id,) * 9,
+            ).fetchone()
+        assert row is not None
+        return {key: int(value) for key, value in dict(row).items()}
+
     def event_identity(self, event_id: str) -> tuple[BeanRef, str] | None:
         if not event_id:
             return None
