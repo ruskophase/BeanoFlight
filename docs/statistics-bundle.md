@@ -76,5 +76,35 @@ exceed the measured sustained capacity of the highest-pressure recording.
 See [Live Statistics Capture](live-statistics-capture.md) for the runtime and
 file contract, and the [2026-08-30 playback pressure test](benchmarks/2026-08-30-live-statistics-playback.md)
 for the five-minute validation results. Direct-camera 80/90/100/110 steps/s
-acceptance remains the next gate before treating the integration as live-
-qualified.
+acceptance is recorded in the [2026-08-31 live matrix](benchmarks/2026-08-31-inference-attached-live-matrix.md).
+
+## Bundles from live numerical captures
+
+`beano-live-statistics-bundle` consumes a completed, hash-valid inference-
+attached capture. It aggregates the retained one or two measurements per
+confirmed bean, applies the global camera dark/white-balance/colour-matrix
+calibration to the masked means, derives pixel-domain ellipse and volume
+proxies, and writes labelled, grid-lined charts. It does not require or create
+bean images or a contact sheet.
+
+```bash
+beano-live-statistics-bundle /path/to/live-capture \
+  --output-root /path/to/statistics-bundles
+```
+
+For one capture, `--output /exact/bundle/path` selects the exact destination.
+
+The generated `dark-bean-candidates.png` shows the batch lightness histogram,
+the one-sided `mean L* - 2 sample SD` threshold and the approximate colours of
+flagged beans in the Lab a*/b* plane. `dark-bean-candidates.csv` provides the
+corresponding bean rows. This is a review screen, not a sorting rule: under a
+roughly normal healthy-bean distribution, approximately 2.3% of healthy beans
+are inherently below a one-sided two-SD threshold. A production threshold must
+therefore be calibrated against labelled known-good and deliberately dark
+beans, preferably alongside the included median/MAD robust reference.
+
+Live inference uses the linear `ml-fast` image path. Because only numerical
+masked means are retained, the offline bundle can apply the global linear
+calibration and sRGB transfer but cannot reconstruct spatial flat-field/defect
+correction or the exact mean of a per-pixel nonlinear Lab transform. Fields
+and chart titles identify these values as approximate.

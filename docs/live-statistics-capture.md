@@ -120,7 +120,8 @@ After every run verify:
   paired measurements;
 - both motors are stopped and the controller lease is safely released.
 
-The statistics fields are not sorting inputs. The separate offline batch tool
-will aggregate two observations, fall back to one, perform colour/size
-derivations and generate the charts currently prototyped by
-`beano-statistics`.
+The statistics fields are not sorting inputs. `beano-live-statistics-bundle`
+aggregates two observations, falls back to one, performs the explicitly
+approximate offline colour/size derivations and generates a self-contained
+batch bundle without requiring saved bean images. See
+[Offline Statistics Bundles](statistics-bundle.md).

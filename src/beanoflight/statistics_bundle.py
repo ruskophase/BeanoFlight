@@ -170,8 +170,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     for recording in arguments.recordings:
         resolved = recording.expanduser().resolve()
         output = (
-            arguments.output_root.expanduser().resolve()
-            / f"{resolved.name}-statistics"
+            arguments.output_root.expanduser().resolve() / f"{resolved.name}-statistics"
             if arguments.output_root is not None
             else resolved / "postprocess/statistics-bundle"
         )
@@ -287,8 +286,10 @@ def build_statistics_bundle(
             return calibration.pixel_to_mm(source.undistort_point(point))
 
         def camr_to_mm(point):
-            caml_point = source.stereo_calibration.project_distorted_camr_to_undistorted_caml(
-                point
+            caml_point = (
+                source.stereo_calibration.project_distorted_camr_to_undistorted_caml(
+                    point
+                )
             )
             return calibration.pixel_to_mm(caml_point)
 
@@ -321,12 +322,18 @@ def build_statistics_bundle(
                         TrackStatus.EXITED,
                     }
                     info["terminal_status"] = track.status.value
-                    if not track.history or len(samples_by_ref[track.bean_ref]) >= options.samples_per_bean:
+                    if (
+                        not track.history
+                        or len(samples_by_ref[track.bean_ref])
+                        >= options.samples_per_bean
+                    ):
                         continue
                     observation = track.history[-1]
                     if observation.frame_index != frame_index:
                         continue
-                    normalized = (observation.position_mm[1] - calibration.top_y_mm) / fov_height_mm
+                    normalized = (
+                        observation.position_mm[1] - calibration.top_y_mm
+                    ) / fov_height_mm
                     band = min(2, max(0, int(normalized * 3.0)))
                     if band in bands_by_ref[track.bean_ref]:
                         continue
@@ -426,12 +433,8 @@ def build_statistics_bundle(
                     except ValueError:
                         sampling_failures["invalid_or_clipped_silhouette"] += 1
                         continue
-                    kernel_ms = (
-                        time.perf_counter_ns() - feature_started
-                    ) / 1_000_000.0
-                    kernel_cpu_ms = (
-                        left_features.kernel_ms + right_features.kernel_ms
-                    )
+                    kernel_ms = (time.perf_counter_ns() - feature_started) / 1_000_000.0
+                    kernel_cpu_ms = left_features.kernel_ms + right_features.kernel_ms
                     row: dict[str, Any] = {
                         "schema": OBSERVATION_SCHEMA,
                         "bean_id": str(track.bean_ref),
@@ -446,8 +449,12 @@ def build_statistics_bundle(
                         "caml_centroid_y_px": prepared.pair.caml_centroid_px[1],
                         "camr_centroid_x_px": prepared.pair.camr_centroid_px[0],
                         "camr_centroid_y_px": prepared.pair.camr_centroid_px[1],
-                        "camr_projected_x_px": prepared.pair.camr_projected_centroid_px[0],
-                        "camr_projected_y_px": prepared.pair.camr_projected_centroid_px[1],
+                        "camr_projected_x_px": prepared.pair.camr_projected_centroid_px[
+                            0
+                        ],
+                        "camr_projected_y_px": prepared.pair.camr_projected_centroid_px[
+                            1
+                        ],
                         "right_frame_index": prepared.pair.right_frame_index,
                         "synchronization_delta_ns": prepared.pair.synchronization_delta_ns,
                         "source_crop_size_px": prepared.source_size_px,
@@ -457,9 +464,25 @@ def build_statistics_bundle(
                         "feature_kernel_cpu_ms": kernel_cpu_ms,
                         "refinement_distance_px": prepared.pair.refinement_distance_px,
                     }
-                    row.update({f"caml_{key}": value for key, value in left_features.values.items()})
-                    row.update({f"camr_{key}": value for key, value in right_features.values.items()})
-                    row.update(paired_features(left_features.values, right_features.values, prepared.pair.refinement_distance_px))
+                    row.update(
+                        {
+                            f"caml_{key}": value
+                            for key, value in left_features.values.items()
+                        }
+                    )
+                    row.update(
+                        {
+                            f"camr_{key}": value
+                            for key, value in right_features.values.items()
+                        }
+                    )
+                    row.update(
+                        paired_features(
+                            left_features.values,
+                            right_features.values,
+                            prepared.pair.refinement_distance_px,
+                        )
+                    )
                     observations.append(row)
                     samples_by_ref[track.bean_ref].append(row)
                     bands_by_ref[track.bean_ref].add(band)
@@ -493,7 +516,9 @@ def build_statistics_bundle(
         ]
         # Rebuild sample groups after tentative one-hit tracks have been removed.
         confirmed_samples: dict[BeanRef, list[dict[str, Any]]] = {
-            ref: rows for ref, rows in samples_by_ref.items() if ref in confirmed and rows
+            ref: rows
+            for ref, rows in samples_by_ref.items()
+            if ref in confirmed and rows
         }
         beans = _aggregate_beans(confirmed_samples, track_info)
         _score_appearance_outliers(beans)
@@ -607,16 +632,24 @@ def _aggregate_beans(
                 bean[f"{camera}_{key}_median"] = robust_median(rows, f"{camera}_{key}")
         for key in PAIRED_FEATURE_KEYS:
             bean[f"{key}_median"] = robust_median(rows, key)
-        bean["projected_area_geomean_mm2_p10"] = _percentile(rows, "projected_area_geomean_mm2", 10)
-        bean["projected_area_geomean_mm2_p90"] = _percentile(rows, "projected_area_geomean_mm2", 90)
+        bean["projected_area_geomean_mm2_p10"] = _percentile(
+            rows, "projected_area_geomean_mm2", 10
+        )
+        bean["projected_area_geomean_mm2_p90"] = _percentile(
+            rows, "projected_area_geomean_mm2", 90
+        )
         bean["combined_lab_l_mean"] = _mean_pair(bean, "lab_l_mean")
         bean["combined_lab_a_mean"] = _mean_pair(bean, "lab_a_mean")
         bean["combined_lab_b_mean"] = _mean_pair(bean, "lab_b_mean")
         bean["combined_lab_chroma_mean"] = _mean_pair(bean, "lab_chroma_mean")
         bean["combined_saturation_mean"] = _mean_pair(bean, "hsv_saturation_mean")
         bean["combined_red_chromaticity"] = _mean_pair(bean, "linear_red_chromaticity")
-        bean["combined_green_chromaticity"] = _mean_pair(bean, "linear_green_chromaticity")
-        bean["combined_blue_chromaticity"] = _mean_pair(bean, "linear_blue_chromaticity")
+        bean["combined_green_chromaticity"] = _mean_pair(
+            bean, "linear_green_chromaticity"
+        )
+        bean["combined_blue_chromaticity"] = _mean_pair(
+            bean, "linear_blue_chromaticity"
+        )
         result.append(bean)
     return result
 
@@ -629,8 +662,12 @@ def _mean_pair(bean: Mapping[str, Any], key: str) -> float:
     return float(np.mean(finite)) if finite.size else math.nan
 
 
-def _percentile(rows: Sequence[Mapping[str, Any]], key: str, percentile: float) -> float:
-    values = [float(row[key]) for row in rows if key in row and math.isfinite(float(row[key]))]
+def _percentile(
+    rows: Sequence[Mapping[str, Any]], key: str, percentile: float
+) -> float:
+    values = [
+        float(row[key]) for row in rows if key in row and math.isfinite(float(row[key]))
+    ]
     return float(np.percentile(values, percentile)) if values else math.nan
 
 
@@ -720,16 +757,27 @@ def _build_summary(
             "combined_lab_l_mean": numeric_summary(bean_values("combined_lab_l_mean")),
             "combined_lab_a_mean": numeric_summary(bean_values("combined_lab_a_mean")),
             "combined_lab_b_mean": numeric_summary(bean_values("combined_lab_b_mean")),
-            "projected_area_geomean_mm2": numeric_summary(bean_values("projected_area_geomean_mm2_median")),
-            "equivalent_sphere_volume_proxy_mm3": numeric_summary(bean_values("equivalent_sphere_volume_proxy_mm3_median")),
-            "rotational_ellipsoid_volume_proxy_mm3": numeric_summary(bean_values("rotational_ellipsoid_volume_proxy_mm3_median")),
-            "appearance_outlier_score": numeric_summary(bean_values("appearance_outlier_score")),
+            "projected_area_geomean_mm2": numeric_summary(
+                bean_values("projected_area_geomean_mm2_median")
+            ),
+            "equivalent_sphere_volume_proxy_mm3": numeric_summary(
+                bean_values("equivalent_sphere_volume_proxy_mm3_median")
+            ),
+            "rotational_ellipsoid_volume_proxy_mm3": numeric_summary(
+                bean_values("rotational_ellipsoid_volume_proxy_mm3_median")
+            ),
+            "appearance_outlier_score": numeric_summary(
+                bean_values("appearance_outlier_score")
+            ),
         },
         "performance": {
             "elapsed_seconds": elapsed_seconds,
             "source_frames_per_second": frames_processed / max(elapsed_seconds, 1e-9),
-            "stereo_samples_per_second_end_to_end": len(observations) / max(elapsed_seconds, 1e-9),
-            "calibrated_crop_materialization_ms": numeric_summary(materialization_times),
+            "stereo_samples_per_second_end_to_end": len(observations)
+            / max(elapsed_seconds, 1e-9),
+            "calibrated_crop_materialization_ms": numeric_summary(
+                materialization_times
+            ),
             "two_view_feature_kernel_ms": feature_summary,
             "two_view_feature_kernel_cpu_ms": numeric_summary(feature_cpu_times),
             "calibrated_statistics_job_wall_ms": job_summary,
@@ -945,62 +993,342 @@ def _write_charts(path: Path, beans: Sequence[Mapping[str, Any]]) -> None:
 
 def _chart_canvas(title: str, subtitle: str) -> np.ndarray:
     canvas = np.full((900, 1500, 3), 248, np.uint8)
-    cv2.putText(canvas, title, (55, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.25, (25, 25, 25), 2, cv2.LINE_AA)
-    cv2.putText(canvas, subtitle, (55, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (80, 80, 80), 1, cv2.LINE_AA)
+    cv2.putText(
+        canvas,
+        title,
+        (55, 60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.25,
+        (25, 25, 25),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        subtitle,
+        (55, 95),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (80, 80, 80),
+        1,
+        cv2.LINE_AA,
+    )
     return canvas
 
 
-def _panel(canvas: np.ndarray, rect: tuple[int, int, int, int], title: str) -> tuple[int, int, int, int]:
+def _panel(
+    canvas: np.ndarray, rect: tuple[int, int, int, int], title: str
+) -> tuple[int, int, int, int]:
     x, y, width, height = rect
     cv2.rectangle(canvas, (x, y), (x + width, y + height), (218, 218, 218), 1)
-    cv2.putText(canvas, title, (x + 18, y + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.63, (35, 35, 35), 1, cv2.LINE_AA)
+    cv2.putText(
+        canvas,
+        title,
+        (x + 18, y + 32),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.63,
+        (35, 35, 35),
+        1,
+        cv2.LINE_AA,
+    )
     return x + 58, y + 58, width - 82, height - 100
 
 
-def _histogram(canvas: np.ndarray, rect: tuple[int, int, int, int], values: Sequence[float], colour: tuple[int, int, int], label: str) -> None:
+def _histogram(
+    canvas: np.ndarray,
+    rect: tuple[int, int, int, int],
+    values: Sequence[float],
+    colour: tuple[int, int, int],
+    x_label: str,
+    y_label: str = "Bean count",
+    *,
+    vertical_markers: Sequence[tuple[float, tuple[int, int, int], str]] = (),
+    highlight_below: float | None = None,
+    highlight_colour: tuple[int, int, int] = (45, 45, 45),
+) -> None:
     x, y, width, height = rect
     finite = np.asarray([value for value in values if math.isfinite(value)], np.float64)
-    cv2.line(canvas, (x, y + height), (x + width, y + height), (100, 100, 100), 1)
-    cv2.line(canvas, (x, y), (x, y + height), (100, 100, 100), 1)
+    maximum = 1
+    low, high = 0.0, 1.0
     if finite.size:
         low, high = float(np.min(finite)), float(np.max(finite))
         if high <= low:
             high = low + 1.0
-        counts, _edges = np.histogram(finite, bins=min(30, max(5, round(math.sqrt(len(finite))))), range=(low, high))
+        counts, edges = np.histogram(
+            finite,
+            bins=min(30, max(5, round(math.sqrt(len(finite))))),
+            range=(low, high),
+        )
         bar_width = width / len(counts)
         maximum = max(int(np.max(counts)), 1)
+        _plot_grid(
+            canvas,
+            rect,
+            x_limits=(low, high),
+            y_limits=(0.0, float(maximum)),
+            x_label=x_label,
+            y_label=y_label,
+            integer_y=True,
+        )
         for index, count in enumerate(counts):
             left = round(x + index * bar_width)
             right = round(x + (index + 1) * bar_width) - 1
             top = round(y + height - height * int(count) / maximum)
-            cv2.rectangle(canvas, (left, top), (max(left, right), y + height - 1), colour, -1)
-        cv2.putText(canvas, f"{low:.2f}", (x, y + height + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (70, 70, 70), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"{high:.2f}", (x + width - 65, y + height + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (70, 70, 70), 1, cv2.LINE_AA)
+            bin_colour = (
+                highlight_colour
+                if highlight_below is not None
+                and float((edges[index] + edges[index + 1]) * 0.5) <= highlight_below
+                else colour
+            )
+            cv2.rectangle(
+                canvas,
+                (left, top),
+                (max(left, right), y + height - 1),
+                bin_colour,
+                -1,
+            )
+        _horizontal_grid_lines(
+            canvas,
+            rect,
+            y_limits=(0.0, float(maximum)),
+        )
+        marker_row = 0
+        for value, marker_colour, marker_label in vertical_markers:
+            if not math.isfinite(value) or not low <= value <= high:
+                continue
+            px = round(x + (value - low) / (high - low) * width)
+            cv2.line(
+                canvas,
+                (px, y),
+                (px, y + height),
+                marker_colour,
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                canvas,
+                marker_label,
+                (min(px + 5, x + width - 175), y + 42 + marker_row * 21),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.43,
+                marker_colour,
+                1,
+                cv2.LINE_AA,
+            )
+            marker_row += 1
         median = float(np.median(finite))
-        cv2.putText(canvas, f"median {median:.2f}; n={len(finite)}", (x + 8, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (55, 55, 55), 1, cv2.LINE_AA)
-    cv2.putText(canvas, label, (x + width // 2 - 70, y + height + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (55, 55, 55), 1, cv2.LINE_AA)
+        cv2.putText(
+            canvas,
+            f"median {median:.2f}; n={len(finite)}",
+            (x + 8, y + 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (55, 55, 55),
+            1,
+            cv2.LINE_AA,
+        )
+    else:
+        _plot_grid(
+            canvas,
+            rect,
+            x_limits=(low, high),
+            y_limits=(0.0, float(maximum)),
+            x_label=x_label,
+            y_label=y_label,
+            integer_y=True,
+        )
 
 
-def _scatter(canvas: np.ndarray, rect: tuple[int, int, int, int], xs: Sequence[float], ys: Sequence[float], colours: Sequence[tuple[int, int, int]], x_label: str, y_label: str) -> None:
+def _scatter(
+    canvas: np.ndarray,
+    rect: tuple[int, int, int, int],
+    xs: Sequence[float],
+    ys: Sequence[float],
+    colours: Sequence[tuple[int, int, int]],
+    x_label: str,
+    y_label: str,
+) -> None:
     x, y, width, height = rect
-    points = [(a, b, colour) for a, b, colour in zip(xs, ys, colours) if math.isfinite(a) and math.isfinite(b)]
-    cv2.line(canvas, (x, y + height), (x + width, y + height), (100, 100, 100), 1)
-    cv2.line(canvas, (x, y), (x, y + height), (100, 100, 100), 1)
+    points = [
+        (a, b, colour)
+        for a, b, colour in zip(xs, ys, colours)
+        if math.isfinite(a) and math.isfinite(b)
+    ]
+    x_low, x_high = 0.0, 1.0
+    y_low, y_high = 0.0, 1.0
     if points:
         x_values = np.asarray([item[0] for item in points])
         y_values = np.asarray([item[1] for item in points])
         x_low, x_high = _plot_limits(x_values)
         y_low, y_high = _plot_limits(y_values)
+    _plot_grid(
+        canvas,
+        rect,
+        x_limits=(x_low, x_high),
+        y_limits=(y_low, y_high),
+        x_label=x_label,
+        y_label=y_label,
+    )
+    if points:
         for x_value, y_value, colour in points:
             px = round(x + (x_value - x_low) / (x_high - x_low) * width)
             py = round(y + height - (y_value - y_low) / (y_high - y_low) * height)
             cv2.circle(canvas, (px, py), 3, colour, -1, cv2.LINE_AA)
-        cv2.putText(canvas, f"{x_low:.2f}", (x, y + height + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (70, 70, 70), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"{x_high:.2f}", (x + width - 62, y + height + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (70, 70, 70), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"{y_low:.2f}", (x - 50, y + height), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (70, 70, 70), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"{y_high:.2f}", (x - 50, y + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (70, 70, 70), 1, cv2.LINE_AA)
-    cv2.putText(canvas, x_label, (x + width // 2 - 65, y + height + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (55, 55, 55), 1, cv2.LINE_AA)
-    cv2.putText(canvas, y_label, (x + 8, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (55, 55, 55), 1, cv2.LINE_AA)
+
+
+def _plot_grid(
+    canvas: np.ndarray,
+    rect: tuple[int, int, int, int],
+    *,
+    x_limits: tuple[float, float],
+    y_limits: tuple[float, float],
+    x_label: str,
+    y_label: str,
+    integer_y: bool = False,
+) -> None:
+    x, y, width, height = rect
+    x_low, x_high = x_limits
+    y_low, y_high = y_limits
+    divisions = 5
+    for index in range(divisions + 1):
+        fraction = index / divisions
+        px = round(x + fraction * width)
+        py = round(y + height - fraction * height)
+        cv2.line(canvas, (px, y), (px, y + height), (232, 232, 232), 1)
+        cv2.line(canvas, (x, py), (x + width, py), (226, 226, 226), 1)
+        x_value = x_low + fraction * (x_high - x_low)
+        y_value = y_low + fraction * (y_high - y_low)
+        _put_text_right(
+            canvas,
+            _format_axis_value(y_value, integer=integer_y),
+            (x - 7, py + 5),
+            scale=0.38,
+        )
+        _put_text_centered(
+            canvas,
+            _format_axis_value(x_value),
+            (px, y + height + 21),
+            scale=0.38,
+        )
+    cv2.line(
+        canvas,
+        (x, y + height),
+        (x + width, y + height),
+        (95, 95, 95),
+        1,
+    )
+    cv2.line(canvas, (x, y), (x, y + height), (95, 95, 95), 1)
+    _put_text_centered(
+        canvas,
+        x_label,
+        (x + width // 2, y + height + 47),
+        scale=0.48,
+    )
+    _put_vertical_text(
+        canvas,
+        y_label,
+        centre=(x - 47, y + height // 2),
+        scale=0.48,
+    )
+
+
+def _horizontal_grid_lines(
+    canvas: np.ndarray,
+    rect: tuple[int, int, int, int],
+    *,
+    y_limits: tuple[float, float],
+) -> None:
+    x, y, width, height = rect
+    low, high = y_limits
+    if high <= low:
+        return
+    for index in range(1, 5):
+        py = round(y + height - index / 5.0 * height)
+        cv2.line(canvas, (x, py), (x + width, py), (205, 205, 205), 1)
+
+
+def _put_text_centered(
+    canvas: np.ndarray,
+    value: str,
+    centre: tuple[int, int],
+    *,
+    scale: float,
+) -> None:
+    size, _baseline = cv2.getTextSize(value, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+    cv2.putText(
+        canvas,
+        value,
+        (round(centre[0] - size[0] / 2), centre[1]),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        (55, 55, 55),
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def _put_text_right(
+    canvas: np.ndarray,
+    value: str,
+    right_baseline: tuple[int, int],
+    *,
+    scale: float,
+) -> None:
+    size, _baseline = cv2.getTextSize(value, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+    cv2.putText(
+        canvas,
+        value,
+        (right_baseline[0] - size[0], right_baseline[1]),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        (65, 65, 65),
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def _put_vertical_text(
+    canvas: np.ndarray,
+    value: str,
+    *,
+    centre: tuple[int, int],
+    scale: float,
+) -> None:
+    size, baseline = cv2.getTextSize(value, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+    label = np.full((size[1] + baseline + 8, size[0] + 8, 3), 248, np.uint8)
+    cv2.putText(
+        label,
+        value,
+        (4, size[1] + 3),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        (55, 55, 55),
+        1,
+        cv2.LINE_AA,
+    )
+    rotated = cv2.rotate(label, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    height, width = rotated.shape[:2]
+    left = round(centre[0] - width / 2)
+    top = round(centre[1] - height / 2)
+    if (
+        left < 0
+        or top < 0
+        or left + width > canvas.shape[1]
+        or top + height > canvas.shape[0]
+    ):
+        return
+    canvas[top : top + height, left : left + width] = rotated
+
+
+def _format_axis_value(value: float, *, integer: bool = False) -> str:
+    absolute = abs(value)
+    if absolute >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if absolute >= 10_000:
+        return f"{value / 1_000:.1f}k"
+    if absolute >= 1_000:
+        return f"{value / 1_000:.2f}k"
+    return str(round(value)) if integer else f"{value:.2f}"
 
 
 def _plot_limits(values: np.ndarray) -> tuple[float, float]:
@@ -1012,37 +1340,107 @@ def _plot_limits(values: np.ndarray) -> tuple[float, float]:
 
 
 def _appearance_chart(path: Path, beans: Sequence[Mapping[str, Any]]) -> None:
-    canvas = _chart_canvas("Calibrated two-view bean appearance", "Each point is one confirmed track; colours are display approximations of calibrated mean RGB")
+    canvas = _chart_canvas(
+        "Calibrated two-view bean appearance",
+        "Each point is one confirmed track; colours are display approximations of calibrated mean RGB",
+    )
     left = _panel(canvas, (45, 125, 690, 710), "Lightness distribution")
     right = _panel(canvas, (765, 125, 690, 710), "CIE Lab colour plane")
-    _histogram(canvas, left, [float(bean["combined_lab_l_mean"]) for bean in beans], (186, 126, 52), "combined Lab L*")
+    _histogram(
+        canvas,
+        left,
+        [float(bean["combined_lab_l_mean"]) for bean in beans],
+        (186, 126, 52),
+        "combined Lab L*",
+    )
     colours = [_bean_colour(bean) for bean in beans]
-    _scatter(canvas, right, [float(bean["combined_lab_a_mean"]) for bean in beans], [float(bean["combined_lab_b_mean"]) for bean in beans], colours, "Lab a* (green - red)", "Lab b* (blue - yellow)")
+    _scatter(
+        canvas,
+        right,
+        [float(bean["combined_lab_a_mean"]) for bean in beans],
+        [float(bean["combined_lab_b_mean"]) for bean in beans],
+        colours,
+        "Lab a* (green - red)",
+        "Lab b* (blue - yellow)",
+    )
     cv2.imwrite(str(path), canvas)
 
 
 def _size_chart(path: Path, beans: Sequence[Mapping[str, Any]]) -> None:
-    canvas = _chart_canvas("Projected size and approximate volume", "Volume values are proxies; opposing views do not independently measure hidden thickness")
+    canvas = _chart_canvas(
+        "Projected size and approximate volume",
+        "Volume values are proxies; opposing views do not independently measure hidden thickness",
+    )
     left = _panel(canvas, (45, 125, 690, 710), "Rotational-ellipsoid proxy")
     right = _panel(canvas, (765, 125, 690, 710), "Projected area agreement")
-    _histogram(canvas, left, [float(bean["rotational_ellipsoid_volume_proxy_mm3_median"]) for bean in beans], (70, 145, 210), "volume proxy (mm^3)")
-    _scatter(canvas, right, [float(bean["caml_area_mm2_median"]) for bean in beans], [float(bean["camr_area_mm2_median"]) for bean in beans], [(90, 120, 210)] * len(beans), "CamL area (mm^2)", "CamR area (mm^2)")
+    _histogram(
+        canvas,
+        left,
+        [float(bean["rotational_ellipsoid_volume_proxy_mm3_median"]) for bean in beans],
+        (70, 145, 210),
+        "volume proxy (mm^3)",
+    )
+    _scatter(
+        canvas,
+        right,
+        [float(bean["caml_area_mm2_median"]) for bean in beans],
+        [float(bean["camr_area_mm2_median"]) for bean in beans],
+        [(90, 120, 210)] * len(beans),
+        "CamL area (mm^2)",
+        "CamR area (mm^2)",
+    )
     cv2.imwrite(str(path), canvas)
 
 
 def _agreement_chart(path: Path, beans: Sequence[Mapping[str, Any]]) -> None:
-    canvas = _chart_canvas("Stereo-view agreement", "Large differences can indicate pose, silhouette mismatch, segmentation error, or departure from the calibrated plane")
+    canvas = _chart_canvas(
+        "Stereo-view agreement",
+        "Large differences can indicate pose, silhouette mismatch, segmentation error, or departure from the calibrated plane",
+    )
     left = _panel(canvas, (45, 125, 690, 710), "CamR / CamL projected-area ratio")
     right = _panel(canvas, (765, 125, 690, 710), "View lightness difference")
-    _histogram(canvas, left, [float(bean["projected_area_ratio_camr_to_caml_median"]) for bean in beans], (92, 168, 105), "area ratio")
-    _histogram(canvas, right, [float(bean["lab_l_view_delta_median"]) for bean in beans], (184, 105, 152), "CamR L* - CamL L*")
+    _histogram(
+        canvas,
+        left,
+        [float(bean["projected_area_ratio_camr_to_caml_median"]) for bean in beans],
+        (92, 168, 105),
+        "area ratio",
+    )
+    _histogram(
+        canvas,
+        right,
+        [float(bean["lab_l_view_delta_median"]) for bean in beans],
+        (184, 105, 152),
+        "CamR L* - CamL L*",
+    )
     cv2.imwrite(str(path), canvas)
 
 
 def _bean_colour(bean: Mapping[str, Any]) -> tuple[int, int, int]:
-    b = int(np.clip((float(bean["caml_mean_b_median"]) + float(bean["camr_mean_b_median"])) * 0.5, 0, 255))
-    g = int(np.clip((float(bean["caml_mean_g_median"]) + float(bean["camr_mean_g_median"])) * 0.5, 0, 255))
-    r = int(np.clip((float(bean["caml_mean_r_median"]) + float(bean["camr_mean_r_median"])) * 0.5, 0, 255))
+    b = int(
+        np.clip(
+            (float(bean["caml_mean_b_median"]) + float(bean["camr_mean_b_median"]))
+            * 0.5,
+            0,
+            255,
+        )
+    )
+    g = int(
+        np.clip(
+            (float(bean["caml_mean_g_median"]) + float(bean["camr_mean_g_median"]))
+            * 0.5,
+            0,
+            255,
+        )
+    )
+    r = int(
+        np.clip(
+            (float(bean["caml_mean_r_median"]) + float(bean["camr_mean_r_median"]))
+            * 0.5,
+            0,
+            255,
+        )
+    )
     return b, g, r
 
 
@@ -1056,10 +1454,14 @@ def _warm_feature_kernel() -> None:
     extract_view_features(image, mask, area_scale_mm2_per_px=0.01)
 
 
-def _representative_jpeg(left: np.ndarray, right: np.ndarray, left_mask: np.ndarray, right_mask: np.ndarray) -> bytes:
+def _representative_jpeg(
+    left: np.ndarray, right: np.ndarray, left_mask: np.ndarray, right_mask: np.ndarray
+) -> bytes:
     def rendered(image, mask):
         result = image.copy()
-        contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _hierarchy = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
         cv2.drawContours(result, contours, -1, (40, 255, 40), 2, cv2.LINE_AA)
         return cv2.resize(result, (180, 180), interpolation=cv2.INTER_AREA)
 
@@ -1070,29 +1472,67 @@ def _representative_jpeg(left: np.ndarray, right: np.ndarray, left_mask: np.ndar
     return encoded.tobytes()
 
 
-def _write_outliers(path: Path, beans: Sequence[Mapping[str, Any]], representatives: Mapping[BeanRef, bytes], groups: Mapping[BeanRef, Sequence[Mapping[str, Any]]]) -> None:
+def _write_outliers(
+    path: Path,
+    beans: Sequence[Mapping[str, Any]],
+    representatives: Mapping[BeanRef, bytes],
+    groups: Mapping[BeanRef, Sequence[Mapping[str, Any]]],
+) -> None:
     refs_by_id = {str(ref): ref for ref in groups}
-    ranked = sorted(beans, key=lambda bean: float(bean["appearance_outlier_score"]), reverse=True)[:24]
+    ranked = sorted(
+        beans, key=lambda bean: float(bean["appearance_outlier_score"]), reverse=True
+    )[:24]
     tiles = []
     for rank, bean in enumerate(ranked, 1):
         ref = refs_by_id.get(str(bean["bean_id"]))
         if ref is None or ref not in representatives:
             continue
-        image = cv2.imdecode(np.frombuffer(representatives[ref], np.uint8), cv2.IMREAD_COLOR)
+        image = cv2.imdecode(
+            np.frombuffer(representatives[ref], np.uint8), cv2.IMREAD_COLOR
+        )
         label = f"#{rank} {bean['bean_id']} score={float(bean['appearance_outlier_score']):.2f} {bean['appearance_flags']}"
         tile = np.full((230, 380, 3), 244, np.uint8)
         tile[5:185, 10:370] = image
-        cv2.putText(tile, label[:52], (10, 207), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (30, 30, 30), 1, cv2.LINE_AA)
-        cv2.putText(tile, "CamL                            CamR", (18, 224), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (70, 70, 70), 1, cv2.LINE_AA)
+        cv2.putText(
+            tile,
+            label[:52],
+            (10, 207),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (30, 30, 30),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            tile,
+            "CamL                            CamR",
+            (18, 224),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (70, 70, 70),
+            1,
+            cv2.LINE_AA,
+        )
         tiles.append(tile)
         cv2.imwrite(str(path / f"{rank:02d}-bean-{ref.sequence:06d}.png"), image)
     columns = 4
     rows = max(1, math.ceil(len(tiles) / columns))
     sheet = np.full((70 + rows * 230, columns * 380, 3), 250, np.uint8)
-    cv2.putText(sheet, "Highest calibrated-colour outlier scores (review candidates, not automatic rejects)", (25, 43), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (25, 25, 25), 2, cv2.LINE_AA)
+    cv2.putText(
+        sheet,
+        "Highest calibrated-colour outlier scores (review candidates, not automatic rejects)",
+        (25, 43),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.78,
+        (25, 25, 25),
+        2,
+        cv2.LINE_AA,
+    )
     for index, tile in enumerate(tiles):
         row, column = divmod(index, columns)
-        sheet[70 + row * 230 : 70 + (row + 1) * 230, column * 380 : (column + 1) * 380] = tile
+        sheet[
+            70 + row * 230 : 70 + (row + 1) * 230, column * 380 : (column + 1) * 380
+        ] = tile
     cv2.imwrite(str(path / "contact-sheet.png"), sheet)
 
 
@@ -1103,7 +1543,13 @@ def _file_inventory(root: Path) -> list[dict[str, Any]]:
         for item in root.rglob("*")
         if item.is_file() and item != root / "manifest.json"
     ):
-        result.append({"path": str(path.relative_to(root)), "bytes": path.stat().st_size, "sha256": _sha256(path)})
+        result.append(
+            {
+                "path": str(path.relative_to(root)),
+                "bytes": path.stat().st_size,
+                "sha256": _sha256(path),
+            }
+        )
     return result
 
 
