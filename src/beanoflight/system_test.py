@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import tempfile
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import asdict
@@ -225,9 +227,7 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--registry", default=DEFAULT_COMMAND_ENDPOINT)
     result.add_argument("--crops", default=DEFAULT_CROP_ENDPOINT)
-    result.add_argument(
-        "--sorting-contexts", default=DEFAULT_SORTING_CONTEXT_ENDPOINT
-    )
+    result.add_argument("--sorting-contexts", default=DEFAULT_SORTING_CONTEXT_ENDPOINT)
     result.add_argument("--hole-pitch-mm", type=float, default=9.16)
     result.add_argument("--sorting-offset-mm", type=float, default=30.0)
     result.add_argument("--progress-every", type=int, default=60)
@@ -247,9 +247,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             "--no-statistics cannot be combined with --statistics-output-root"
         )
     statistics_enabled = (
-        (arguments.live and not arguments.no_statistics)
-        or arguments.statistics_output_root is not None
-    )
+        arguments.live and not arguments.no_statistics
+    ) or arguments.statistics_output_root is not None
     statistics_settings = LiveStatisticsSettings(
         crop_size_px=arguments.statistics_crop_size,
         queue_capacity=arguments.statistics_queue_capacity,
@@ -262,9 +261,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     if statistics_enabled and not (arguments.live or arguments.optimized_raw):
-        raise SystemExit(
-            "statistics capture requires --live or --optimized-raw input"
-        )
+        raise SystemExit("statistics capture requires --live or --optimized-raw input")
     if statistics_enabled and (arguments.no_crops or arguments.single_view_inference):
         raise SystemExit(
             "inference-attached statistics requires stereo inference crops"
@@ -299,9 +296,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 resolve_live_calibration_pack,
             )
 
-            calibration_pack = resolve_live_calibration_pack(
-                arguments.calibration_pack
-            )
+            calibration_pack = resolve_live_calibration_pack(arguments.calibration_pack)
             state_root = arguments.state_root.expanduser().resolve()
             state_root.mkdir(parents=True, exist_ok=True)
             live_temporary = tempfile.TemporaryDirectory(
@@ -353,11 +348,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
             background = source.acquire_background(
                 arguments.background_samples,
-                on_progress=lambda count, total: print(
-                    f"live background {count}/{total}", flush=True
-                )
-                if count == total
-                else None,
+                on_progress=lambda count, total: (
+                    print(f"live background {count}/{total}", flush=True)
+                    if count == total
+                    else None
+                ),
             )
             print(
                 "LIVE_BACKGROUND_READY: begin bean flow now; "
@@ -413,9 +408,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             and not arguments.no_crops
             and not arguments.single_view_inference
         )
-        if (
-            (arguments.optimized_raw or arguments.live)
-            and (needs_inference_stereo or statistics_enabled)
+        if (arguments.optimized_raw or arguments.live) and (
+            needs_inference_stereo or statistics_enabled
         ):
             if not arguments.live:
                 source.configure_stereo(
@@ -446,9 +440,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             ),
             registry=registry,
             positions_mapper=(
-                positions_mapper
-                if arguments.optimized_raw or arguments.live
-                else None
+                positions_mapper if arguments.optimized_raw or arguments.live else None
             ),
         )
         if statistics_enabled:
@@ -483,9 +475,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             else "explicit human-confirmed frames"
                         ),
                         "frame_indices": (
-                            []
-                            if arguments.live
-                            else list(arguments.background_frames)
+                            [] if arguments.live else list(arguments.background_frames)
                         ),
                         "sample_count": (
                             arguments.background_samples if arguments.live else None
@@ -508,9 +498,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             dispatcher = CropDispatcher(
                 arguments.registry,
                 arguments.crops,
-                emergency_microbatch_enabled=(
-                    not arguments.no_emergency_microbatch
-                ),
+                emergency_microbatch_enabled=(not arguments.no_emergency_microbatch),
             )
         runner = ReplayRunner(
             source,
@@ -525,9 +513,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 maximum_frame_age_ms=arguments.maximum_frame_age_ms,
                 clock_start_lead_ms=arguments.clock_start_lead_ms,
                 maximum_clock_offset_ms=arguments.maximum_clock_offset_ms,
-                emergency_microbatch_enabled=(
-                    not arguments.no_emergency_microbatch
-                ),
+                emergency_microbatch_enabled=(not arguments.no_emergency_microbatch),
             ),
             crop_selector=selector,
             crop_dispatcher=dispatcher,
@@ -544,9 +530,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "crops_enabled": not arguments.no_crops,
                 "stereo_crops": stereo_crop_extractor is not None,
                 "adaptive_edge_resize": not arguments.no_adaptive_edge_resize,
-                "emergency_microbatch": (
-                    not arguments.no_emergency_microbatch
-                ),
+                "emergency_microbatch": (not arguments.no_emergency_microbatch),
                 "crop_processing": (
                     arguments.crop_processing
                     if arguments.optimized_raw or arguments.live
@@ -560,9 +544,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                         else "explicit human-confirmed frames"
                     ),
                     "frame_indices": (
-                        []
-                        if arguments.live
-                        else list(arguments.background_frames)
+                        [] if arguments.live else list(arguments.background_frames)
                     ),
                     "sample_count": (
                         arguments.background_samples if arguments.live else None
@@ -588,10 +570,27 @@ def main(argv: Sequence[str] | None = None) -> None:
         def prebuffer_progress(buffered: int, target: int) -> None:
             print(f"prebuffer {buffered}/{target} decoded frames", flush=True)
 
-        summary = runner.run(
-            on_progress=progress,
-            on_prebuffer=prebuffer_progress,
-        )
+        stop = threading.Event()
+        previous_handlers: dict[int, object] = {}
+
+        def request_stop(signum, _frame) -> None:
+            print(
+                f"ORDERLY_STOP_REQUESTED: {signal.Signals(signum).name}",
+                flush=True,
+            )
+            stop.set()
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, request_stop)
+        try:
+            summary = runner.run(
+                stop=stop,
+                on_progress=progress,
+                on_prebuffer=prebuffer_progress,
+            )
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
         print(json.dumps(asdict(summary), indent=2), flush=True)
     finally:
         if registry is not None:

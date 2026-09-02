@@ -30,7 +30,9 @@ from .telemetry import SystemTelemetrySampler, TimingAccumulator, summarize_samp
 DEFAULT_EMERGENCY_MICROBATCH_WINDOW_MS = 35.0
 DEFAULT_DECISION_SAFETY_RESERVE_MS = 17.0
 DEFAULT_EMERGENCY_MICROBATCH_MINIMUM_BEANS = 5
-MAXIMUM_REPLAY_FRAMES = 100_000
+# A live batch can run for several hours and still needs an explicit finite
+# safety bound. At 60 FPS this ceiling is approximately 4 h 38 min.
+MAXIMUM_REPLAY_FRAMES = 1_000_000
 MAXIMUM_STALE_SKIP_EVENTS = 128
 
 
@@ -47,9 +49,7 @@ class ReplaySettings:
     maximum_clock_offset_ms: float = 2.0
     suppress_cyclic_gc: bool = True
     emergency_microbatch_enabled: bool = True
-    emergency_microbatch_window_ms: float = (
-        DEFAULT_EMERGENCY_MICROBATCH_WINDOW_MS
-    )
+    emergency_microbatch_window_ms: float = DEFAULT_EMERGENCY_MICROBATCH_WINDOW_MS
 
     def validate(self) -> None:
         if not math.isfinite(self.target_fps) or self.target_fps < 0:
@@ -58,8 +58,7 @@ class ReplaySettings:
             raise ValueError("prebuffer frames must be between zero and 120")
         if not 1 <= self.maximum_frames <= MAXIMUM_REPLAY_FRAMES:
             raise ValueError(
-                "maximum replay frames must be between 1 and "
-                f"{MAXIMUM_REPLAY_FRAMES}"
+                f"maximum replay frames must be between 1 and {MAXIMUM_REPLAY_FRAMES}"
             )
         if self.crop_queue_capacity <= 0:
             raise ValueError("crop queue capacity must be positive")
@@ -68,10 +67,7 @@ class ReplaySettings:
             or self.maximum_frame_age_ms <= 0
         ):
             raise ValueError("maximum frame age must be finite and positive")
-        if (
-            not math.isfinite(self.clock_start_lead_ms)
-            or self.clock_start_lead_ms <= 0
-        ):
+        if not math.isfinite(self.clock_start_lead_ms) or self.clock_start_lead_ms <= 0:
             raise ValueError("clock start lead must be finite and positive")
         if (
             not math.isfinite(self.maximum_clock_offset_ms)
@@ -82,9 +78,7 @@ class ReplaySettings:
             not math.isfinite(self.emergency_microbatch_window_ms)
             or self.emergency_microbatch_window_ms <= 0
         ):
-            raise ValueError(
-                "emergency microbatch window must be finite and positive"
-            )
+            raise ValueError("emergency microbatch window must be finite and positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,21 +293,15 @@ class CropDispatcher:
         emergency_microbatch_minimum_beans: int = (
             DEFAULT_EMERGENCY_MICROBATCH_MINIMUM_BEANS
         ),
-        delivery_result: Callable[[tuple[CropPayload, ...], bool], None]
-        | None = None,
-        statistics_result: Callable[[tuple[CropPayload, ...]], None]
-        | None = None,
+        delivery_result: Callable[[tuple[CropPayload, ...], bool], None] | None = None,
+        statistics_result: Callable[[tuple[CropPayload, ...]], None] | None = None,
     ) -> None:
         self.registry_endpoint = registry_endpoint
         self.inference_endpoint = inference_endpoint
         self.timeout_ms = timeout_ms
         self.capacity = max(1, capacity)
-        self.emergency_microbatch_enabled = bool(
-            emergency_microbatch_enabled
-        )
-        self.emergency_microbatch_window_ms = float(
-            emergency_microbatch_window_ms
-        )
+        self.emergency_microbatch_enabled = bool(emergency_microbatch_enabled)
+        self.emergency_microbatch_window_ms = float(emergency_microbatch_window_ms)
         self.decision_safety_reserve_ms = float(decision_safety_reserve_ms)
         self.emergency_microbatch_minimum_beans = int(
             emergency_microbatch_minimum_beans
@@ -322,28 +310,22 @@ class CropDispatcher:
             not math.isfinite(self.emergency_microbatch_window_ms)
             or self.emergency_microbatch_window_ms <= 0
         ):
-            raise ValueError(
-                "emergency microbatch window must be finite and positive"
-            )
+            raise ValueError("emergency microbatch window must be finite and positive")
         if (
             not math.isfinite(self.decision_safety_reserve_ms)
             or self.decision_safety_reserve_ms < 0
         ):
-            raise ValueError(
-                "decision safety reserve must be finite and non-negative"
-            )
+            raise ValueError("decision safety reserve must be finite and non-negative")
         if self.emergency_microbatch_minimum_beans < 2:
-            raise ValueError(
-                "emergency microbatch minimum must be at least two beans"
-            )
+            raise ValueError("emergency microbatch minimum must be at least two beans")
         self.delivery_result = delivery_result
         self.statistics_result = statistics_result
         self._items: deque[_FrameDispatch] = deque()
         self._condition = threading.Condition()
         self._active = 0
-        self._registry_queue: queue.Queue[
-            _RegistryDispatch | _RegistryJobFailure
-        ] = queue.Queue(maxsize=max(64, self.capacity * 8))
+        self._registry_queue: queue.Queue[_RegistryDispatch | _RegistryJobFailure] = (
+            queue.Queue(maxsize=max(64, self.capacity * 8))
+        )
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._registry_thread: threading.Thread | None = None
@@ -445,9 +427,7 @@ class CropDispatcher:
             "statistics_result_failures": self.statistics_result_failures,
             "registry_batches": self.registry_batches,
             "dispatch_items_coalesced": self.dispatch_items_coalesced,
-            "maximum_dispatch_items_per_batch": (
-                self.maximum_dispatch_items_per_batch
-            ),
+            "maximum_dispatch_items_per_batch": (self.maximum_dispatch_items_per_batch),
             "emergency_microbatches": self.emergency_microbatches,
             "emergency_microbatch_beans": self.emergency_microbatch_beans,
             "emergency_remainder_batches": self.emergency_remainder_batches,
@@ -491,20 +471,14 @@ class CropDispatcher:
                         continue
                     items = self._take_dispatch_batch_locked()
                     self._active += len(items)
-                payloads = tuple(
-                    payload for item in items for payload in item.payloads
-                )
-                all_updates = tuple(
-                    update for item in items for update in item.updates
-                )
+                payloads = tuple(payload for item in items for payload in item.payloads)
+                all_updates = tuple(update for item in items for update in item.updates)
                 registered_jobs = ()
                 undelivered_payloads = payloads
                 try:
                     now_ns = time.perf_counter_ns()
                     for item in items:
-                        queue_delay_ms = (
-                            now_ns - item.enqueued_ns
-                        ) / 1_000_000.0
+                        queue_delay_ms = (now_ns - item.enqueued_ns) / 1_000_000.0
                         for _payload in item.payloads or (None,):
                             self._timings["queue_delay_ms"].add(queue_delay_ms)
                     self.dispatch_items_coalesced += max(0, len(items) - 1)
@@ -513,9 +487,7 @@ class CropDispatcher:
                     )
 
                     if not payloads:
-                        if not self._queue_registry(
-                            _RegistryDispatch(all_updates, ())
-                        ):
+                        if not self._queue_registry(_RegistryDispatch(all_updates, ())):
                             self.track_frames_dropped += len(items)
                         continue
 
@@ -524,27 +496,19 @@ class CropDispatcher:
                         time.monotonic_ns(),
                         enabled=self.emergency_microbatch_enabled,
                         window_ms=self.emergency_microbatch_window_ms,
-                        decision_safety_reserve_ms=(
-                            self.decision_safety_reserve_ms
-                        ),
-                        minimum_frame_beans=(
-                            self.emergency_microbatch_minimum_beans
-                        ),
+                        decision_safety_reserve_ms=(self.decision_safety_reserve_ms),
+                        minimum_frame_beans=(self.emergency_microbatch_minimum_beans),
                     )
                     if len(dispatch_groups) > 1:
                         self.emergency_microbatches += 1
-                        self.emergency_microbatch_beans += len(
-                            dispatch_groups[0]
-                        )
+                        self.emergency_microbatch_beans += len(dispatch_groups[0])
                         self.emergency_remainder_batches += 1
                     pending_updates = all_updates
                     for group in dispatch_groups:
-                        materialized_items, materialize_ms = (
-                            _materialize_payloads(
-                                group,
-                                time.monotonic_ns(),
-                                right_executor=right_materializer,
-                            )
+                        materialized_items, materialize_ms = _materialize_payloads(
+                            group,
+                            time.monotonic_ns(),
+                            right_executor=right_materializer,
                         )
                         inference_send_ns = time.monotonic_ns()
                         materialized_items = tuple(
@@ -570,20 +534,14 @@ class CropDispatcher:
                         if not self._queue_registry(
                             _RegistryDispatch(pending_updates, registered_jobs)
                         ):
-                            raise RuntimeError(
-                                "asynchronous Registry queue is full"
-                            )
+                            raise RuntimeError("asynchronous Registry queue is full")
                         pending_updates = ()
                         send_started = time.perf_counter_ns()
                         sender.submit_batch(materialized_items)
-                        send_ms = (
-                            time.perf_counter_ns() - send_started
-                        ) / 1_000_000.0
+                        send_ms = (time.perf_counter_ns() - send_started) / 1_000_000.0
                         if self.delivery_result is not None:
                             self.delivery_result(group, True)
-                        delivered_ids = {
-                            payload.job.job_id for payload in group
-                        }
+                        delivered_ids = {payload.job.job_id for payload in group}
                         undelivered_payloads = tuple(
                             payload
                             for payload in undelivered_payloads
@@ -626,9 +584,7 @@ class CropDispatcher:
             right_materializer.shutdown(wait=True, cancel_futures=True)
             sender.close()
 
-    def _queue_registry(
-        self, item: _RegistryDispatch | _RegistryJobFailure
-    ) -> bool:
+    def _queue_registry(self, item: _RegistryDispatch | _RegistryJobFailure) -> bool:
         try:
             self._registry_queue.put_nowait(item)
         except queue.Full:
@@ -734,9 +690,7 @@ def _emergency_microbatch_groups(
         if _crop_sample_index(payload) != 2:
             continue
         marks = payload.job.timing_marks_ns
-        crossing_source_ns = marks.get(
-            "inference_priority_crossing_source_ns"
-        )
+        crossing_source_ns = marks.get("inference_priority_crossing_source_ns")
         if crossing_source_ns is None:
             continue
         deadline_source_ns = int(crossing_source_ns) - round(
@@ -748,9 +702,7 @@ def _emergency_microbatch_groups(
         )
         if deadline_monotonic_ns is None:
             continue
-        remaining_ms = (
-            deadline_monotonic_ns - now_monotonic_ns
-        ) / 1_000_000.0
+        remaining_ms = (deadline_monotonic_ns - now_monotonic_ns) / 1_000_000.0
         if 0 < remaining_ms <= window_ms:
             candidates.append((deadline_monotonic_ns, payload))
     if not candidates:
@@ -784,9 +736,7 @@ def _emergency_microbatch_groups(
                     **marks,
                     "emergency_microbatch": int(is_urgent),
                     "emergency_microbatch_remainder": int(not is_urgent),
-                    "emergency_microbatch_triggered_monotonic_ns": (
-                        now_monotonic_ns
-                    ),
+                    "emergency_microbatch_triggered_monotonic_ns": (now_monotonic_ns),
                     "emergency_microbatch_deadline_monotonic_ns": (
                         earliest_deadline_ns
                     ),
@@ -811,11 +761,7 @@ def _job_source_to_monotonic_ns(
     marks = payload.job.timing_marks_ns
     clock_monotonic_ns = int(marks.get("run_clock_monotonic_ns", 0))
     scale_ppb = int(marks.get("run_clock_scale_ppb", 0))
-    if (
-        clock_monotonic_ns <= 0
-        or scale_ppb <= 0
-        or "run_clock_source_ns" not in marks
-    ):
+    if clock_monotonic_ns <= 0 or scale_ppb <= 0 or "run_clock_source_ns" not in marks:
         return None
     return clock_monotonic_ns + round(
         (source_timestamp_ns - int(marks["run_clock_source_ns"]))
@@ -903,12 +849,10 @@ class ReplayRunner:
             # keeps AnalysisEngine's original synchronous Registry behaviour.
             self.engine.registry = None
             if self.crop_selector is not None:
-                self.crop_dispatcher.delivery_result = (
-                    lambda payloads, succeeded: (
-                        self.crop_selector.delivery_succeeded(payloads)
-                        if succeeded
-                        else self.crop_selector.delivery_failed(payloads)
-                    )
+                self.crop_dispatcher.delivery_result = lambda payloads, succeeded: (
+                    self.crop_selector.delivery_succeeded(payloads)
+                    if succeeded
+                    else self.crop_selector.delivery_failed(payloads)
                 )
             if self.statistics_collector is not None:
                 self.crop_dispatcher.statistics_result = (
@@ -1137,9 +1081,7 @@ class ReplayRunner:
                     if not resume_clock.metrics["synchronized"]:
                         raise RuntimeError(str(resume_clock.metrics["failure"]))
                     clock_metrics = resume_clock.metrics
-                    next_deadline = (
-                        resume_clock.start_perf_counter_ns / 1_000_000_000.0
-                    )
+                    next_deadline = resume_clock.start_perf_counter_ns / 1_000_000_000.0
                     was_paused = False
                 if (
                     not is_live
@@ -1204,8 +1146,7 @@ class ReplayRunner:
                             raise SourceError("live run clock is not armed")
                         frame_age_ms = max(
                             0.0,
-                            (time.monotonic_ns() - capture_monotonic_ns)
-                            / 1_000_000.0,
+                            (time.monotonic_ns() - capture_monotonic_ns) / 1_000_000.0,
                         )
                         frame_age_total += frame_age_ms
                         frame_age_max = max(frame_age_max, frame_age_ms)
@@ -1213,9 +1154,7 @@ class ReplayRunner:
                     selected_crops: tuple[CropPayload, ...] = ()
                     crop_select_ms = 0.0
 
-                    def select_urgent(
-                        tracked: FrameAnalysis, _frame=frame
-                    ) -> None:
+                    def select_urgent(tracked: FrameAnalysis, _frame=frame) -> None:
                         nonlocal selected_crops, crop_select_ms
                         if self.crop_selector is None:
                             return
@@ -1343,10 +1282,7 @@ class ReplayRunner:
                                 selected_crops,
                             )
                             timing_samples["statistics_attach_ms"].append(
-                                (
-                                    time.perf_counter_ns()
-                                    - statistics_started_ns
-                                )
+                                (time.perf_counter_ns() - statistics_started_ns)
                                 / 1_000_000.0
                             )
                         updates = tuple(
@@ -1577,8 +1513,7 @@ class ReplayRunner:
                             "frames_skipped": frames_skipped,
                             "stale_skip_events": tuple(stale_skip_events),
                             "stale_skip_events_truncated": (
-                                len(stale_skip_events)
-                                >= MAXIMUM_STALE_SKIP_EVENTS
+                                len(stale_skip_events) >= MAXIMUM_STALE_SKIP_EVENTS
                                 and frames_skipped
                                 > sum(
                                     int(item["frame_count"])
@@ -1666,9 +1601,7 @@ class ReplayRunner:
 
         lead_ns = round(self.settings.clock_start_lead_ms * 1_000_000)
         minimum_margin_ns = min(5_000_000, max(500_000, lead_ns // 4))
-        maximum_offset_ns = round(
-            self.settings.maximum_clock_offset_ms * 1_000_000
-        )
+        maximum_offset_ns = round(self.settings.maximum_clock_offset_ms * 1_000_000)
         attempts: list[dict[str, object]] = []
         misses = 0
         maximum_attempts = 4
@@ -1681,9 +1614,7 @@ class ReplayRunner:
                 "epoch": expected_epoch,
                 "source_timestamp_ns": start_source_ns,
                 "monotonic_ns": anchor_monotonic_ns,
-                "playback_scale_ppb": round(
-                    current.playback_scale * 1_000_000_000
-                ),
+                "playback_scale_ppb": round(current.playback_scale * 1_000_000_000),
             }
             previous_contracts = current.settings.get("clock_contracts", ())
             if not isinstance(previous_contracts, (list, tuple)):
@@ -1708,9 +1639,7 @@ class ReplayRunner:
                 expected_revision=current.revision,
             )
             persisted_monotonic_ns = time.monotonic_ns()
-            update_ms = (
-                time.perf_counter_ns() - update_started_ns
-            ) / 1_000_000.0
+            update_ms = (time.perf_counter_ns() - update_started_ns) / 1_000_000.0
             margin_ns = anchor_monotonic_ns - persisted_monotonic_ns
             attempt_metrics: dict[str, object] = {
                 "attempt": attempt,
@@ -1794,9 +1723,7 @@ class ReplayRunner:
     ) -> _RunClockStart:
         """Persist FastCap's camera-timestamp to monotonic-clock anchor."""
 
-        source_anchor_ns = int(
-            getattr(self.source, "clock_source_timestamp_ns", 0)
-        )
+        source_anchor_ns = int(getattr(self.source, "clock_source_timestamp_ns", 0))
         monotonic_anchor_ns = int(getattr(self.source, "clock_monotonic_ns", 0))
         if source_anchor_ns <= 0 or monotonic_anchor_ns <= 0:
             return _RunClockStart(
@@ -1816,9 +1743,7 @@ class ReplayRunner:
             "epoch": expected_epoch,
             "source_timestamp_ns": source_anchor_ns,
             "monotonic_ns": monotonic_anchor_ns,
-            "playback_scale_ppb": round(
-                session.playback_scale * 1_000_000_000
-            ),
+            "playback_scale_ppb": round(session.playback_scale * 1_000_000_000),
         }
         current = self.registry.put_session(
             replace(
