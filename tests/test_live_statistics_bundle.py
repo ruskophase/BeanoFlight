@@ -1,3 +1,4 @@
+import json
 import math
 import tempfile
 import unittest
@@ -6,6 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from beanoflight.live_statistics_bundle import (
+    _compact_runtime_report,
     _derive_observation,
     _MeanColourCalibration,
     _score_live_appearance,
@@ -23,6 +25,49 @@ def _identity_calibration() -> _MeanColourCalibration:
 
 
 class LiveStatisticsBundleTests(unittest.TestCase):
+    def test_runtime_report_is_compacted_to_matching_run(self):
+        report = {
+            "schema": "beanoflight-performance-benchmark/v3",
+            "runs": [
+                {
+                    "summary": {
+                        "run_id": "wanted",
+                        "frames_processed": 600,
+                        "achieved_fps": 59.9,
+                        "timings": {"large": [1, 2, 3]},
+                    },
+                    "outcome": {
+                        "jobs_completed": 400,
+                        "jobs_dropped": 0,
+                        "beans": [{"large": "record"}],
+                    },
+                }
+            ],
+            "summaries": {"full": {"passed": True}},
+            "system_telemetry": {
+                "max_rss_mib": 500.0,
+                "thermal_abort": False,
+                "temperature_c": {
+                    "cpu": {"max": 54.0},
+                    "gpu": {"max": 52.0},
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "report.json"
+            path.write_text(json.dumps(report), encoding="utf-8")
+
+            compact = _compact_runtime_report(path, "wanted")
+
+        self.assertIsNotNone(compact)
+        assert compact is not None
+        self.assertEqual(compact["summary"]["frames_processed"], 600)
+        self.assertEqual(compact["outcome"]["jobs_completed"], 400)
+        self.assertEqual(compact["maximum_temperature_c"], 54.0)
+        self.assertTrue(compact["acceptance_passed"])
+        self.assertNotIn("timings", compact["summary"])
+        self.assertNotIn("beans", compact["outcome"])
+
     def test_mean_colour_calibration_preserves_lightness_order(self):
         calibration = _identity_calibration()
 
@@ -32,6 +77,18 @@ class LiveStatisticsBundleTests(unittest.TestCase):
         self.assertLess(dark["approx_lab_l"], light["approx_lab_l"])
         self.assertAlmostEqual(dark["approx_lab_a"], 0.0, delta=1.0)
         self.assertAlmostEqual(dark["approx_lab_b"], 0.0, delta=1.0)
+
+    def test_lab_conversion_retains_sub_display_code_precision(self):
+        calibration = _identity_calibration()
+
+        first = calibration.transform_mean_bgr((100.1, 110.1, 120.1))
+        second = calibration.transform_mean_bgr((100.3, 110.3, 120.3))
+
+        self.assertEqual(
+            first["approx_calibrated_mean_r"],
+            second["approx_calibrated_mean_r"],
+        )
+        self.assertNotEqual(first["approx_lab_l"], second["approx_lab_l"])
 
     def test_observation_derives_geometry_and_single_view_fallback(self):
         source = {

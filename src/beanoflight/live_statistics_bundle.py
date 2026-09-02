@@ -36,6 +36,7 @@ from .statistics_bundle import (
     _write_json,
     _write_jsonl,
 )
+from .statistics_dashboard import write_statistics_dashboard
 from .statistics_features import numeric_summary
 
 BUNDLE_SCHEMA = "beanoflight-live-statistics-bundle/v1"
@@ -109,20 +110,20 @@ class _MeanColourCalibration:
             linear_rgb * 12.92,
             1.055 * np.power(linear_rgb, 1.0 / 2.4) - 0.055,
         )
-        display_bgr = np.clip(srgb[::-1] * 255.0 + 0.5, 0, 255).astype(np.uint8)
-        lab = cv2.cvtColor(display_bgr.reshape(1, 1, 3), cv2.COLOR_BGR2LAB)[
+        lab = cv2.cvtColor(srgb.astype(np.float32).reshape(1, 1, 3), cv2.COLOR_RGB2LAB)[
             0, 0
         ].astype(np.float64)
+        display_bgr = np.clip(srgb[::-1] * 255.0 + 0.5, 0, 255).astype(np.uint8)
         denominator = max(float(np.sum(linear_rgb)), 1e-12)
         chromaticity = linear_rgb / denominator
         return {
             "approx_calibrated_mean_b": float(display_bgr[0]),
             "approx_calibrated_mean_g": float(display_bgr[1]),
             "approx_calibrated_mean_r": float(display_bgr[2]),
-            "approx_lab_l": float(lab[0] * (100.0 / 255.0)),
-            "approx_lab_a": float(lab[1] - 128.0),
-            "approx_lab_b": float(lab[2] - 128.0),
-            "approx_lab_chroma": float(math.hypot(lab[1] - 128.0, lab[2] - 128.0)),
+            "approx_lab_l": float(lab[0]),
+            "approx_lab_a": float(lab[1]),
+            "approx_lab_b": float(lab[2]),
+            "approx_lab_chroma": float(math.hypot(lab[1], lab[2])),
             "approx_linear_red_chromaticity": float(chromaticity[0]),
             "approx_linear_green_chromaticity": float(chromaticity[1]),
             "approx_linear_blue_chromaticity": float(chromaticity[2]),
@@ -142,6 +143,11 @@ def parser() -> argparse.ArgumentParser:
     destination.add_argument("--output", type=Path)
     destination.add_argument("--output-root", type=Path)
     result.add_argument("--calibration-pack", type=Path)
+    result.add_argument(
+        "--run-report",
+        type=Path,
+        help="optional performance report used for compact processing-health evidence",
+    )
     result.add_argument("--overwrite", action="store_true")
     return result
 
@@ -169,6 +175,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 resolved,
                 output,
                 calibration_pack=arguments.calibration_pack,
+                run_report=arguments.run_report,
                 overwrite=arguments.overwrite,
             )
         )
@@ -180,6 +187,7 @@ def build_live_statistics_bundle(
     output: Path,
     *,
     calibration_pack: Path | None = None,
+    run_report: Path | None = None,
     overwrite: bool = False,
 ) -> dict[str, object]:
     capture_directory = capture_directory.expanduser().resolve()
@@ -248,6 +256,13 @@ def build_live_statistics_bundle(
             derived_observations,
             dark_summary,
             source_observation_count=len(observations),
+            runtime=_compact_runtime_report(run_report, run_id),
+        )
+        dashboard = write_statistics_dashboard(
+            temporary / "dashboard",
+            beans=beans,
+            summary=summary,
+            source_fps=_source_fps(calibration_root),
         )
         _write_json(temporary / "summary.json", summary)
         (temporary / "README.md").write_text(
@@ -285,10 +300,19 @@ def build_live_statistics_bundle(
                     }
                     for camera in ("CamL", "CamR")
                 },
+                "run_report": (
+                    {
+                        "path": str(run_report.expanduser().resolve()),
+                        "sha256": _sha256(run_report.expanduser().resolve()),
+                    }
+                    if run_report is not None
+                    else None
+                ),
                 "colour_reconstruction": (
                     "Approximate transformation of each masked linear "
                     "sensor-BGR channel mean through global dark subtraction, "
-                    "white balance, colour matrix and sRGB encoding. Spatial "
+                    "white balance, colour matrix, sRGB encoding and "
+                    "floating-point CIE Lab conversion. Spatial "
                     "flat-field/defect correction and per-pixel nonlinear "
                     "colour statistics cannot be reconstructed from retained "
                     "aggregates."
@@ -302,6 +326,7 @@ def build_live_statistics_bundle(
             },
             "definitions": _definitions(),
             "summary": summary,
+            "dashboard": dashboard,
             "files": _file_inventory(temporary),
         }
         _write_json(temporary / "manifest.json", manifest)
@@ -318,6 +343,7 @@ def build_live_statistics_bundle(
         "observations": len(derived_observations),
         "dark_candidates_2sd": len(dark_candidates),
         "dark_lightness_threshold": dark_summary["threshold_mean_minus_2sd"],
+        "dashboard": str(output / "dashboard" / "index.html"),
     }
 
 
@@ -483,6 +509,18 @@ def _aggregate_live_beans(
         bean["source_schema"] = bean.get("schema")
         bean["schema"] = DERIVED_BEAN_SCHEMA
         bean["derived_observation_count"] = len(rows)
+        view_counts = [
+            int(value)
+            for row in rows
+            if math.isfinite(value := _finite_value(row.get("measurement_view_count")))
+        ]
+        bean["minimum_measurement_view_count"] = min(view_counts) if view_counts else 0
+        bean["sensor_edge_observation_count"] = sum(
+            bool(row.get("caml_detection_touches_sensor_edge", False)) for row in rows
+        )
+        bean["enrichment_fallback_observation_count"] = sum(
+            not bool(row.get("feature_enrichment_valid", True)) for row in rows
+        )
         for camera in ("caml", "camr"):
             for key in (
                 "area_native_px",
@@ -645,6 +683,7 @@ def _live_summary(
     dark_summary: Mapping[str, Any],
     *,
     source_observation_count: int,
+    runtime: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     def values(key: str) -> list[float]:
         result = []
@@ -672,6 +711,17 @@ def _live_summary(
             "beans_without_samples": sum(
                 int(bean.get("sample_count", 0)) == 0 for bean in beans
             ),
+            "beans_with_colour": sum(
+                math.isfinite(_finite_value(bean.get("combined_approx_lab_l_mean")))
+                for bean in beans
+            ),
+            "beans_with_sensor_edge_observation": sum(
+                bool(bean.get("sensor_edge_observation_count", 0)) for bean in beans
+            ),
+            "beans_with_enrichment_fallback": sum(
+                bool(bean.get("enrichment_fallback_observation_count", 0))
+                for bean in beans
+            ),
         },
         "distributions": {
             key: numeric_summary(values(key))
@@ -689,6 +739,92 @@ def _live_summary(
         },
         "dark_bean_screen": dict(dark_summary),
         "source_capture_statistics": capture.get("statistics", {}),
+        "runtime": dict(runtime) if runtime is not None else None,
+    }
+
+
+def _source_fps(calibration_root: Path) -> float:
+    profile = _read_json(calibration_root / "CamL" / "profile.json")
+    return _finite_value(
+        profile.get("capture", {}).get("controls", {}).get("frame_rate_hz"),
+        60.0,
+    )
+
+
+def _compact_runtime_report(
+    report_path: Path | None, run_id: str
+) -> dict[str, Any] | None:
+    if report_path is None:
+        return None
+    resolved = report_path.expanduser().resolve()
+    report = _read_json(resolved)
+    runs = report.get("runs", ())
+    if not isinstance(runs, list):
+        raise SourceError(f"performance report has no runs: {resolved}")
+    match = next(
+        (
+            run
+            for run in runs
+            if isinstance(run, dict)
+            and str(run.get("summary", {}).get("run_id", "")) == run_id
+        ),
+        None,
+    )
+    if match is None:
+        raise SourceError(f"performance report has no matching run ID {run_id}")
+    source_summary = match.get("summary", {})
+    outcome = match.get("outcome", {})
+    summary_keys = (
+        "frames_processed",
+        "elapsed_seconds",
+        "achieved_fps",
+        "source_timeline_fps",
+        "frames_skipped",
+        "missed_deadlines",
+        "mean_processing_ms",
+        "max_processing_ms",
+        "mean_frame_age_ms",
+        "max_frame_age_ms",
+        "crops_submitted",
+        "crops_dropped",
+        "stopped",
+        "clock_synchronized",
+    )
+    outcome_keys = (
+        "beans_with_jobs",
+        "jobs_completed",
+        "jobs_dropped",
+        "jobs_failed",
+        "stereo_pairs_complete",
+        "stereo_pairs_incomplete",
+        "classification_decision_bases",
+        "classification_complete_pools",
+        "classification_deadline_fallbacks",
+        "actuations_succeeded",
+        "actuations_failed",
+        "settled",
+    )
+    temperatures = report.get("system_telemetry", {}).get("temperature_c", {})
+    maximum_temperature = max(
+        (
+            value
+            for sensor in temperatures.values()
+            if isinstance(sensor, dict)
+            and (value := _finite_value(sensor.get("max")))
+            and math.isfinite(value)
+        ),
+        default=math.nan,
+    )
+    full_summary = report.get("summaries", {}).get("full", {})
+    return {
+        "source_report": str(resolved),
+        "report_schema": report.get("schema"),
+        "summary": {key: source_summary.get(key) for key in summary_keys},
+        "outcome": {key: outcome.get(key) for key in outcome_keys},
+        "acceptance_passed": full_summary.get("passed"),
+        "maximum_temperature_c": maximum_temperature,
+        "thermal_abort": report.get("system_telemetry", {}).get("thermal_abort"),
+        "max_rss_mib": report.get("system_telemetry", {}).get("max_rss_mib"),
     }
 
 
@@ -904,7 +1040,8 @@ def _definitions() -> dict[str, str]:
         "approximate_calibrated_colour": (
             "Global dark subtraction, camera white balance, colour matrix and "
             "sRGB transfer applied to each retained masked sensor-BGR channel "
-            "mean. This cannot reproduce spatial flat-field/defect correction "
+            "mean, with Lab calculated before display-channel rounding. This "
+            "cannot reproduce spatial flat-field/defect correction "
             "or a mean of per-pixel nonlinear Lab values."
         ),
         "dark_candidate_2sd": (
@@ -936,6 +1073,7 @@ Source numerical capture: `{source_name}`
 
 Start with:
 
+- `dashboard/index.html` — interactive, offline batch explorer
 - `charts/appearance-distributions.png`
 - `charts/size-and-volume.png`
 - `charts/view-agreement.png`
@@ -950,6 +1088,7 @@ The colour values are **approximate calibrated mean colours** reconstructed
 from the numerical linear sensor-BGR aggregates retained by the live pipeline.
 They apply global dark, white-balance and colour-matrix terms, but cannot
 reconstruct per-pixel flat-field/defect correction or exact Lab distributions.
+Lab is calculated in floating point before RGB display-channel rounding.
 
 The dark-bean flag is a provisional, one-sided within-batch screen at
 `mean approximate L* - 2 sample SD`. It is useful for visualising candidates,
@@ -957,6 +1096,14 @@ not yet for automatic rejection. Calibrate it using labelled known-good and
 dark beans, and validate its false-reject rate before sorting with it.
 
 Pixel volume values are relative proxies, not physical volume measurements.
+
+The dashboard has no network dependencies and can be opened directly from a
+local disk or Samba share. Selecting a chart region identifies the exact beans
+behind it and offers CSV or colour-swatch contact-sheet export. Selections can
+also be accumulated into a named, deduplicated review collection for later
+threshold development. Stereo charts show paired CamL/CamR swatches. Live
+captures retain no bean images, so all swatches show approximate mean colour
+rather than texture.
 """
 
 
