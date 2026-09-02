@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import math
+from itertools import pairwise
 
 import cv2
 import numpy as np
 
 from .calibration import CalibrationError, MetricPlaneCalibration
-from .models import CrossingPrediction, FrameAnalysis, PipelineStage, TrackSnapshot, TrackStatus
+from .models import (
+    CrossingPrediction,
+    FrameAnalysis,
+    PipelineStage,
+    TrackSnapshot,
+    TrackStatus,
+)
 from .prediction import GateLayout
-
 
 STATUS_COLOURS = {
     TrackStatus.TENTATIVE: (30, 200, 255),
@@ -66,7 +72,7 @@ def render_analysis(
 ) -> np.ndarray:
     height, width = frame_bgr.shape[:2]
     line_centre = calibration.mm_to_pixel((0.0, layout.line_y_mm))
-    output_height = max(height + 80, int(math.ceil(line_centre[1] + 80)))
+    output_height = max(height + 80, math.ceil(line_centre[1] + 80))
     output_height = min(max(output_height, height), height * 2)
     rendered = np.full((output_height, width, 3), (13, 16, 20), dtype=np.uint8)
     rendered[:height] = frame_bgr
@@ -99,7 +105,11 @@ def render_analysis(
         detection = rejection.observation.detection
         x, y, component_width, component_height = detection.bbox_px
         rejection_label = (
-            "EDGE-REJECTED" if "margin" in rejection.reason else "BIRTH-REJECTED"
+            "TOP-PENDING"
+            if rejection.reason.startswith("top entry pending")
+            else "EDGE-REJECTED"
+            if "margin" in rejection.reason
+            else "BIRTH-REJECTED"
         )
         cv2.rectangle(
             rendered,
@@ -338,6 +348,6 @@ def _draw_gates(
 def _draw_dashed_polyline(
     image: np.ndarray, points: list[tuple[int, int]], colour: tuple[int, int, int]
 ) -> None:
-    for index, (first, second) in enumerate(zip(points, points[1:])):
+    for index, (first, second) in enumerate(pairwise(points)):
         if index % 2 == 0:
             cv2.line(image, first, second, colour, 2, cv2.LINE_AA)

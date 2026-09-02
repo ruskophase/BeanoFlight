@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import math
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import Sequence
+from functools import cache
 
 import numpy as np
 
@@ -210,9 +210,10 @@ class TrackManager:
         self.run_id = run_id or uuid.uuid4().hex
         self.events = events
         self._next_sequence = 1
-        self._next_suppression = 1
+        self._next_internal_sequence = -1
         self._active: dict[BeanRef, _Track] = {}
         self._suppressed: dict[BeanRef, tuple[_Track, str]] = {}
+        self._pending_births: dict[BeanRef, _Track] = {}
         self.last_rejections: tuple[DetectionRejection, ...] = ()
 
     @property
@@ -223,6 +224,10 @@ class TrackManager:
     def suppressed_count(self) -> int:
         return len(self._suppressed)
 
+    @property
+    def pending_birth_count(self) -> int:
+        return len(self._pending_births)
+
     def update(
         self, observations: Sequence[Observation], timestamp_ns: int
     ) -> tuple[TrackSnapshot, ...]:
@@ -232,7 +237,8 @@ class TrackManager:
         tracks = list(self._active.values())
         suppressed_items = list(self._suppressed.values())
         suppressed_tracks = [item[0] for item in suppressed_items]
-        association_tracks = [*tracks, *suppressed_tracks]
+        pending_tracks = list(self._pending_births.values())
+        association_tracks = [*tracks, *suppressed_tracks, *pending_tracks]
         for track in association_tracks:
             track.predict(timestamp_ns, self.settings)
         costs = np.full(
@@ -257,7 +263,7 @@ class TrackManager:
                     and track.status == TrackStatus.CONFIRMED
                 ):
                     self._publish("confirmed", track, timestamp_ns)
-            else:
+            elif track_index < len(tracks) + len(suppressed_tracks):
                 suppressed_index = track_index - len(tracks)
                 reason = suppressed_items[suppressed_index][1]
                 track.update(observations[observation_index], self.settings)
@@ -267,6 +273,9 @@ class TrackManager:
                         f"continuation of {reason}",
                     )
                 )
+            else:
+                observation = observations[observation_index]
+                self._continue_pending_birth(track, observation, timestamp_ns, rejections)
 
         for track_index, track in enumerate(tracks):
             if track_index in matched_association_tracks:
@@ -294,18 +303,35 @@ class TrackManager:
             if out_of_view or expired:
                 self._suppressed.pop(track.bean_ref, None)
 
+        pending_offset = len(tracks) + len(suppressed_tracks)
+        for pending_index, track in enumerate(pending_tracks):
+            association_index = pending_offset + pending_index
+            if association_index in matched_association_tracks:
+                continue
+            # A provisional top-edge candidate owns no public bean ID. If it
+            # cannot be associated on the immediately following frame, discard
+            # it so stale, biased motion cannot compete with a clean birth.
+            self._pending_births.pop(track.bean_ref, None)
+
         for observation_index, observation in enumerate(observations):
             if observation_index in matched_observations:
                 continue
             edge_reason = self._edge_rejection_reason(observation)
             if edge_reason is not None:
                 rejections.append(DetectionRejection(observation, edge_reason))
-                suppression_ref = BeanRef(self.run_id, -self._next_suppression)
-                self._next_suppression += 1
+                suppression_ref = self._new_internal_ref()
                 suppression = _Track(
                     suppression_ref, observation, self.settings, self.top_y_mm
                 )
                 self._suppressed[suppression_ref] = (suppression, edge_reason)
+                continue
+            pending_reason = self._top_birth_pending_reason(observation)
+            if pending_reason is not None:
+                rejections.append(DetectionRejection(observation, pending_reason))
+                pending_ref = self._new_internal_ref()
+                self._pending_births[pending_ref] = _Track(
+                    pending_ref, observation, self.settings, self.top_y_mm
+                )
                 continue
             if self.settings.require_top_birth and (
                 observation.position_mm[1] > self.top_y_mm + self.settings.birth_zone_depth_mm
@@ -324,6 +350,66 @@ class TrackManager:
         active_snapshots = [track.snapshot() for track in self._active.values()]
         return tuple(sorted((*active_snapshots, *emitted), key=lambda value: value.bean_ref))
 
+    def cancel_active_at_boundary(
+        self, timestamp_ns: int
+    ) -> tuple[TrackSnapshot, ...]:
+        """Right-censor public tracks when a bounded observation ends."""
+
+        snapshots: list[TrackSnapshot] = []
+        for track in self._active.values():
+            track.predict(max(timestamp_ns, track.timestamp_ns), self.settings)
+            track.status = TrackStatus.CANCELLED
+            snapshots.append(track.snapshot())
+            self._publish("cancelled", track, track.timestamp_ns)
+        self._active.clear()
+        self._suppressed.clear()
+        self._pending_births.clear()
+        return tuple(sorted(snapshots, key=lambda value: value.bean_ref))
+
+    def _continue_pending_birth(
+        self,
+        candidate: _Track,
+        observation: Observation,
+        timestamp_ns: int,
+        rejections: list[DetectionRejection],
+    ) -> None:
+        edge_reason = self._edge_rejection_reason(observation)
+        if edge_reason is not None:
+            self._pending_births.pop(candidate.bean_ref, None)
+            suppression = _Track(
+                candidate.bean_ref, observation, self.settings, self.top_y_mm
+            )
+            self._suppressed[candidate.bean_ref] = (suppression, edge_reason)
+            rejections.append(DetectionRejection(observation, edge_reason))
+            return
+        pending_reason = self._top_birth_pending_reason(observation)
+        if pending_reason is not None:
+            candidate.update(observation, self.settings)
+            rejections.append(DetectionRejection(observation, pending_reason))
+            return
+        self._pending_births.pop(candidate.bean_ref, None)
+        if self.settings.require_top_birth and (
+            observation.position_mm[1]
+            > self.top_y_mm + self.settings.birth_zone_depth_mm
+        ):
+            rejections.append(
+                DetectionRejection(observation, "outside top birth region")
+            )
+            return
+        bean_ref = BeanRef(self.run_id, self._next_sequence)
+        self._next_sequence += 1
+        # Deliberately start from the first admissible observation. A centroid
+        # measured while the bean or its inference crop was clipped can bias
+        # the initial velocity enough to fragment the track on the next frame.
+        track = _Track(bean_ref, observation, self.settings, self.top_y_mm)
+        self._active[bean_ref] = track
+        self._publish("created", track, timestamp_ns)
+
+    def _new_internal_ref(self) -> BeanRef:
+        bean_ref = BeanRef(self.run_id, self._next_internal_sequence)
+        self._next_internal_sequence -= 1
+        return bean_ref
+
     def _edge_rejection_reason(self, observation: Observation) -> str | None:
         x, _y, width, _height = observation.detection.bbox_px
         touches_left = x < self.settings.left_birth_margin_px
@@ -336,6 +422,14 @@ class TrackManager:
             return "left birth margin"
         if touches_right:
             return "right birth margin"
+        return None
+
+    def _top_birth_pending_reason(self, observation: Observation) -> str | None:
+        _x, y, width, height = observation.detection.bbox_px
+        _centroid_x, centroid_y = observation.detection.centroid_px
+        complete_centred_crop_size = max(0, math.floor(centroid_y) * 2)
+        if y <= 0 or complete_centred_crop_size < max(width, height):
+            return "top entry pending (complete bean crop unavailable)"
         return None
 
     def _publish(self, kind: str, track: _Track, timestamp_ns: int) -> None:
@@ -361,7 +455,7 @@ def _optimal_assignment(costs: np.ndarray) -> tuple[tuple[int, int], ...]:
         raise ValueError("small-set assignment supports at most 16 detections")
     unmatched_cost = 1.0
 
-    @lru_cache(maxsize=None)
+    @cache
     def solve(track_index: int, used_mask: int) -> tuple[float, tuple[tuple[int, int], ...]]:
         if track_index == track_count:
             return 0.0, ()

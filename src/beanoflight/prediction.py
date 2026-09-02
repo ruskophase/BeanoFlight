@@ -7,7 +7,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .models import CrossingPrediction, Gate, GateProbability, TrackSnapshot, TrackStatus
+from .models import (
+    CrossingPrediction,
+    Gate,
+    GateProbability,
+    TrackSnapshot,
+    TrackStatus,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,7 +58,11 @@ class TrajectoryPredictor:
         self.process_acceleration_sigma_mm_s2 = process_acceleration_sigma_mm_s2
 
     def predict(self, track: TrackSnapshot) -> CrossingPrediction | None:
-        if track.status in (TrackStatus.EXITED, TrackStatus.CANCELLED):
+        # EXITED means the bean has left the image, not the machine. Its final
+        # propagated state is specifically what downstream sorting needs for
+        # the line below the FoV. A one-hit tentative track can already supply
+        # inference evidence, but not a trajectory used for an immutable sort.
+        if track.status in {TrackStatus.TENTATIVE, TrackStatus.CANCELLED}:
             return None
         x, y, vx, vy = track.state
         dt = _crossing_time(y, vy, self.layout.line_y_mm, self.gravity_mm_s2)

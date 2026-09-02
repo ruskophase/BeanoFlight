@@ -1,0 +1,391 @@
+"""Tk policy controls and optional diagnostics for BeanoSorter."""
+
+from __future__ import annotations
+
+import argparse
+import queue
+import threading
+import tkinter as tk
+from collections.abc import Sequence
+from tkinter import messagebox, ttk
+
+from .classification_transport import DEFAULT_DIRECT_EVIDENCE_ENDPOINT
+from .registry_service import DEFAULT_COMMAND_ENDPOINT, DEFAULT_EVENT_ENDPOINT
+from .runtime_priority import apply_latency_thread_profile
+from .sorter import SorterActivity, SorterService, SorterSettings
+from .sorting_context_transport import DEFAULT_SORTING_CONTEXT_ENDPOINT
+
+
+class SorterApp(tk.Tk):
+    def __init__(
+        self,
+        registry_endpoint: str,
+        *,
+        event_endpoint: str = DEFAULT_EVENT_ENDPOINT,
+        classification_endpoint: str = DEFAULT_DIRECT_EVIDENCE_ENDPOINT,
+        sorting_context_endpoint: str = DEFAULT_SORTING_CONTEXT_ENDPOINT,
+        actuation_endpoint: str = "",
+        animate_gates: bool = False,
+        show_activity: bool = False,
+        suppress_cyclic_gc: bool = False,
+    ) -> None:
+        super().__init__(className="Beano Sorter")
+        self.title("BeanoSorter — Policy and Scheduling")
+        self.iconname("BeanoSorter")
+        self.geometry("1150x720")
+        self.minsize(900, 600)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.registry_endpoint = registry_endpoint
+        self.event_endpoint = event_endpoint
+        self.classification_endpoint = classification_endpoint
+        self.sorting_context_endpoint = sorting_context_endpoint
+        self.actuation_endpoint = actuation_endpoint
+        self.suppress_cyclic_gc = bool(suppress_cyclic_gc)
+        self.service: SorterService | None = None
+        self._activities: queue.Queue[SorterActivity] = queue.Queue(maxsize=256)
+        self._gate_items: dict[int, int] = {}
+        self._displayed_gate_states: dict[int, bool] = {}
+        self._activity_display_enabled = threading.Event()
+
+        defaults = SorterSettings()
+        self.categories_var = tk.StringVar(value=",".join(defaults.reject_categories))
+        self.confidence_var = tk.StringVar(value=str(defaults.minimum_confidence))
+        self.probability_var = tk.StringVar(
+            value=str(defaults.gate_probability_threshold)
+        )
+        self.lead_var = tk.StringVar(value=str(defaults.open_lead_ms))
+        self.lag_var = tk.StringVar(value=str(defaults.close_lag_ms))
+        self.notice_var = tk.StringVar(value=str(defaults.minimum_notice_ms))
+        self.ensemble_reserve_var = tk.StringVar(
+            value=str(defaults.ensemble_deadline_reserve_ms)
+        )
+        self.adjacent_pair_var = tk.BooleanVar(
+            value=defaults.allow_adjacent_gate_pair
+        )
+        self.status_var = tk.StringVar(value="Stopped")
+        self.counts_var = tk.StringVar(
+            value="decisions 0 · actuations 0 · low-confidence defects 0 · errors 0"
+        )
+        self.animate_gates_var = tk.BooleanVar(value=animate_gates)
+        self.show_activity_var = tk.BooleanVar(value=show_activity)
+        self._build()
+        self._display_options_changed()
+        self.after(50 if animate_gates or show_activity else 500, self._poll)
+        self.after(100, self.start_service)
+
+    def _build(self) -> None:
+        controls = ttk.LabelFrame(self, text="Sorting policy", padding=10)
+        controls.pack(fill=tk.X, padx=10, pady=10)
+        fields = (
+            ("Reject categories", self.categories_var, 34),
+            ("Min confidence", self.confidence_var, 10),
+            ("Gate probability", self.probability_var, 10),
+            ("Open lead ms", self.lead_var, 10),
+            ("Close lag ms", self.lag_var, 10),
+            ("Min notice ms", self.notice_var, 10),
+            ("Pool reserve ms", self.ensemble_reserve_var, 10),
+        )
+        for column, (label, variable, width) in enumerate(fields):
+            ttk.Label(controls, text=label).grid(row=0, column=column, sticky=tk.W)
+            ttk.Entry(controls, textvariable=variable, width=width).grid(
+                row=1, column=column, padx=(0, 8), sticky=tk.EW
+            )
+        ttk.Button(controls, text="Start / apply", command=self.start_service).grid(
+            row=1, column=len(fields), padx=(8, 4)
+        )
+        ttk.Button(controls, text="Stop", command=self.stop_service).grid(
+            row=1, column=len(fields) + 1
+        )
+        ttk.Checkbutton(
+            controls,
+            text="Diagnostic screen mirror (ESP32 LEDs are authoritative)",
+            variable=self.animate_gates_var,
+            command=self._display_options_changed,
+        ).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+        ttk.Checkbutton(
+            controls,
+            text="Show activity log",
+            variable=self.show_activity_var,
+            command=self._display_options_changed,
+        ).grid(row=2, column=3, columnspan=3, sticky=tk.W, pady=(8, 0))
+        ttk.Checkbutton(
+            controls,
+            text="Allow adjacent gate pair when combined probability qualifies",
+            variable=self.adjacent_pair_var,
+        ).grid(row=2, column=6, columnspan=2, sticky=tk.W, pady=(8, 0))
+
+        gates = ttk.LabelFrame(self, text="Virtual sorting line", padding=10)
+        gates.pack(fill=tk.X, padx=10, pady=(0, 10))
+        self.canvas = tk.Canvas(
+            gates, height=155, background="#171c22", highlightthickness=0
+        )
+        self.canvas.pack(fill=tk.X)
+        self.canvas.bind("<Configure>", lambda _event: self._draw_gates())
+
+        activity_frame = ttk.LabelFrame(self, text="Decisions and actuation", padding=8)
+        activity_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.activity = tk.Text(activity_frame, state=tk.DISABLED, wrap=tk.NONE)
+        self.activity.pack(fill=tk.BOTH, expand=True)
+
+        footer = ttk.Frame(self, padding=(10, 0, 10, 10))
+        footer.pack(fill=tk.X)
+        ttk.Label(footer, textvariable=self.status_var).pack(side=tk.LEFT)
+        ttk.Label(footer, textvariable=self.counts_var).pack(side=tk.RIGHT)
+
+    def start_service(self) -> None:
+        try:
+            settings = SorterSettings(
+                reject_categories=tuple(
+                    item.strip()
+                    for item in self.categories_var.get().split(",")
+                    if item.strip()
+                ),
+                minimum_confidence=float(self.confidence_var.get()),
+                gate_probability_threshold=float(self.probability_var.get()),
+                open_lead_ms=float(self.lead_var.get()),
+                close_lag_ms=float(self.lag_var.get()),
+                minimum_notice_ms=float(self.notice_var.get()),
+                ensemble_deadline_reserve_ms=float(
+                    self.ensemble_reserve_var.get()
+                ),
+                allow_adjacent_gate_pair=self.adjacent_pair_var.get(),
+            )
+            settings.validate()
+        except ValueError as exc:
+            messagebox.showerror("Sorter settings", str(exc), parent=self)
+            return
+        self.stop_service()
+        self.service = SorterService(
+            registry_endpoint=self.registry_endpoint,
+            event_endpoint=self.event_endpoint,
+            classification_endpoint=self.classification_endpoint,
+            sorting_context_endpoint=self.sorting_context_endpoint,
+            actuation_endpoint=self.actuation_endpoint,
+            settings=settings,
+            suppress_cyclic_gc=self.suppress_cyclic_gc,
+            activity=self._post_activity,
+        )
+        self.service.start()
+        self.status_var.set(
+            f"Running · direct results {self.classification_endpoint} · "
+            f"contexts {self.sorting_context_endpoint} · "
+            + ("deadline-aware GC · " if self.suppress_cyclic_gc else "")
+            + (
+                f"ESP32 plans {self.actuation_endpoint}"
+                if self.actuation_endpoint
+                else "virtual actuator"
+            )
+        )
+
+    def stop_service(self) -> None:
+        service = self.service
+        self.service = None
+        if service is not None:
+            service.close()
+        self.status_var.set("Stopped")
+        self._paint_gate_states({})
+
+    def _draw_gates(self) -> None:
+        self.canvas.delete("all")
+        self._gate_items.clear()
+        width = max(1, self.canvas.winfo_width())
+        indices = tuple(range(-10, 11))
+        spacing = width / (len(indices) + 1)
+        for offset, gate in enumerate(indices, start=1):
+            x = round(offset * spacing)
+            item = self.canvas.create_oval(
+                x - 22,
+                40,
+                x + 22,
+                84,
+                fill="#111111",
+                outline="#8b98a6",
+                width=2,
+            )
+            self.canvas.create_text(
+                x,
+                112,
+                text="G0" if gate == 0 else f"G{gate:+d}",
+                fill="#dce3ea",
+            )
+            self._gate_items[gate] = item
+        self._paint_gate_states(
+            self._displayed_gate_states if self.animate_gates_var.get() else {}
+        )
+
+    def _post_activity(self, activity: SorterActivity) -> None:
+        if not self._activity_display_enabled.is_set():
+            return
+        try:
+            self._activities.put_nowait(activity)
+        except queue.Full:
+            try:
+                self._activities.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._activities.put_nowait(activity)
+            except queue.Full:
+                pass
+
+    def _poll(self) -> None:
+        while True:
+            try:
+                item = self._activities.get_nowait()
+            except queue.Empty:
+                break
+            message = f"{item.kind:9} {item.bean_id}"
+            if item.category:
+                message += f" · {item.category}"
+            if item.confidence is not None:
+                message += f" {item.confidence:.1%}"
+            if item.gate_indices:
+                message += f" · gates {item.gate_indices}"
+            if item.detail:
+                message += f" · {item.detail}"
+            if self._activity_display_enabled.is_set():
+                self.activity.configure(state=tk.NORMAL)
+                self.activity.insert("1.0", message + "\n")
+                if int(self.activity.index("end-1c").split(".")[0]) > 400:
+                    self.activity.delete("400.0", tk.END)
+                self.activity.configure(state=tk.DISABLED)
+        service = self.service
+        if service is not None:
+            self._update_gate_states(service.gate_states)
+            gc_stats = service.garbage_collection_statistics()
+            gc_detail = (
+                " · GC "
+                f"{gc_stats['generation0_collections']}/"
+                f"{gc_stats['generation1_collections']}/"
+                f"{gc_stats['full_collections']} · "
+                f"RSS {float(gc_stats['current_rss_mib']):.0f} MiB"
+                + (
+                    " · FEEDER SLOWDOWN REQUESTED"
+                    if gc_stats["feeder_slowdown_requested"]
+                    else ""
+                )
+                if self.suppress_cyclic_gc
+                else ""
+            )
+            self.counts_var.set(
+                f"decisions {service.decisions} · actuations {service.actuations} · "
+                f"pools {service.pooled_classifications} · "
+                f"fallbacks {service.deadline_fallbacks} · "
+                f"direct evidence {service.direct_evidence_received} · "
+                f"direct queue rejects {service.direct_batches_rejected} · "
+                f"context hits {service.context_cache_hits} · "
+                f"context misses {service.context_cache_misses} · "
+                f"contexts coalesced {service.contexts_coalesced} · "
+                f"Registry recoveries {service.registry_recovery_decisions} · "
+                f"ESP32 plans {service.external_plans_accepted}/"
+                f"{service.external_plans_rejected} · "
+                f"low-confidence defects {service.low_confidence_defects} · "
+                f"errors {service.errors}"
+                f"{gc_detail}"
+            )
+        delay_ms = (
+            50
+            if self.animate_gates_var.get() or self._activity_display_enabled.is_set()
+            else 500
+        )
+        self.after(delay_ms, self._poll)
+
+    def _update_gate_states(self, states: dict[int, bool]) -> None:
+        normalized = {gate: bool(active) for gate, active in states.items() if active}
+        if (
+            not self.animate_gates_var.get()
+            or normalized == self._displayed_gate_states
+        ):
+            return
+        self._paint_gate_states(normalized)
+
+    def _paint_gate_states(self, states: dict[int, bool]) -> None:
+        self._displayed_gate_states = dict(states)
+        for gate, item in self._gate_items.items():
+            self.canvas.itemconfigure(
+                item,
+                fill="#ed3038" if states.get(gate, False) else "#111111",
+                outline="#ff9196" if states.get(gate, False) else "#8b98a6",
+            )
+
+    def _display_options_changed(self) -> None:
+        if self.show_activity_var.get():
+            self._activity_display_enabled.set()
+        else:
+            self._activity_display_enabled.clear()
+        if self.animate_gates_var.get():
+            states = {} if self.service is None else self.service.gate_states
+            self._paint_gate_states(states)
+        else:
+            self._paint_gate_states({})
+
+    def _close(self) -> None:
+        self.stop_service()
+        self.destroy()
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description="BeanoFlight sorting simulation GUI")
+    result.add_argument("--registry", default=DEFAULT_COMMAND_ENDPOINT)
+    result.add_argument("--events", default=DEFAULT_EVENT_ENDPOINT)
+    result.add_argument(
+        "--classifications", default=DEFAULT_DIRECT_EVIDENCE_ENDPOINT
+    )
+    result.add_argument(
+        "--sorting-contexts", default=DEFAULT_SORTING_CONTEXT_ENDPOINT
+    )
+    result.add_argument(
+        "--actuator",
+        default="",
+        help=(
+            "approved-plan endpoint for external BeanoActuator; blank keeps the "
+            "virtual diagnostic actuator"
+        ),
+    )
+    result.add_argument(
+        "--gate-animation",
+        action="store_true",
+        help="start with the optional diagnostic screen mirror enabled",
+    )
+    result.add_argument(
+        "--no-gate-animation",
+        action="store_true",
+        help="compatibility flag: keep diagnostic gate animation disabled",
+    )
+    result.add_argument(
+        "--activity-log",
+        action="store_true",
+        help="start with sorter activity rendering enabled",
+    )
+    result.add_argument(
+        "--no-activity-log",
+        action="store_true",
+        help="compatibility flag: keep sorter activity rendering disabled",
+    )
+    result.add_argument(
+        "--suppress-cyclic-gc",
+        action="store_true",
+        help="run cyclic garbage collection only in deadline-safe windows",
+    )
+    return result
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    arguments = parser().parse_args(argv)
+    apply_latency_thread_profile()
+    SorterApp(
+        arguments.registry,
+        event_endpoint=arguments.events,
+        classification_endpoint=arguments.classifications,
+        sorting_context_endpoint=arguments.sorting_contexts,
+        actuation_endpoint=arguments.actuator,
+        animate_gates=(
+            arguments.gate_animation and not arguments.no_gate_animation
+        ),
+        show_activity=arguments.activity_log and not arguments.no_activity_log,
+        suppress_cyclic_gc=arguments.suppress_cyclic_gc,
+    ).mainloop()
+
+
+if __name__ == "__main__":
+    main()

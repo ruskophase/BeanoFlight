@@ -110,6 +110,24 @@ class CrossingPrediction:
 
 
 @dataclass(frozen=True, slots=True)
+class AnalysisTimings:
+    detection_ms: float
+    coordinate_mapping_ms: float
+    tracking_ms: float
+    prediction_ms: float
+    registry_ms: float
+
+    def as_dict(self) -> dict[str, float]:
+        return {
+            "detection_ms": self.detection_ms,
+            "coordinate_mapping_ms": self.coordinate_mapping_ms,
+            "tracking_ms": self.tracking_ms,
+            "prediction_ms": self.prediction_ms,
+            "registry_ms": self.registry_ms,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class FrameAnalysis:
     frame_index: int
     timestamp_ns: int
@@ -118,6 +136,7 @@ class FrameAnalysis:
     tracks: tuple[TrackSnapshot, ...]
     predictions: tuple[CrossingPrediction, ...]
     processing_ms: float
+    timings: AnalysisTimings | None = None
 
 
 @dataclass(frozen=True, slots=True)
