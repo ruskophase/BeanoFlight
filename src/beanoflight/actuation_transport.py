@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 
 import zmq
 
@@ -12,6 +12,7 @@ from .models import BeanRef
 from .registry_models import bean_ref_from_dict, bean_ref_to_dict
 
 ACTUATION_PLAN_SCHEMA = "beanoflight-actuation-plan/v1"
+ACTUATION_PULSE_SCHEMA = "beanoflight-actuation-plan/v2"
 ACTUATION_ACK_SCHEMA = "beanoflight-actuation-plan-ack/v1"
 DEFAULT_ACTUATION_ENDPOINT = "ipc:///tmp/beanoflight-actuation-plans.ipc"
 MAX_ACTUATION_PLAN_BYTES = 64 * 1024
@@ -19,6 +20,18 @@ MAX_ACTUATION_PLAN_BYTES = 64 * 1024
 
 class ActuationTransportError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class ActuationPulse:
+    gate_index: int
+    nozzle_id: int
+    open_monotonic_ns: int
+    close_monotonic_ns: int
+    crossing_monotonic_ns: int
+    open_source_ns: int
+    close_source_ns: int
+    crossing_source_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,28 +48,81 @@ class ActuationPlan:
     run_clock_source_ns: int
     run_clock_monotonic_ns: int
     run_clock_scale_ppb: int
+    pulses: tuple[ActuationPulse, ...] = ()
+    nozzle_map_sha256: str | None = None
 
     def validate(self) -> None:
         if not self.decision_id or not self.gate_indices:
             raise ActuationTransportError("actuation plan ID and gates are required")
-        if any(gate < -10 or gate > 10 for gate in self.gate_indices):
-            raise ActuationTransportError("actuation gate index must be -10 through +10")
+        if any(
+            type(gate) is not int or gate < -10 or gate > 10
+            for gate in self.gate_indices
+        ):
+            raise ActuationTransportError(
+                "actuation gate index must be -10 through +10"
+            )
         if len(set(self.gate_indices)) != len(self.gate_indices):
             raise ActuationTransportError("actuation plan gates must be unique")
         if not (
-            0 < self.open_monotonic_ns
+            0
+            < self.open_monotonic_ns
             <= self.crossing_monotonic_ns
             <= self.close_monotonic_ns
         ):
             raise ActuationTransportError("invalid monotonic actuation window")
         if not (
-            0 <= self.open_source_ns
-            <= self.crossing_source_ns
-            <= self.close_source_ns
+            0 <= self.open_source_ns <= self.crossing_source_ns <= self.close_source_ns
         ):
             raise ActuationTransportError("invalid source-clock actuation window")
         if self.run_clock_monotonic_ns <= 0 or self.run_clock_scale_ppb <= 0:
             raise ActuationTransportError("actuation plan run clock is invalid")
+        if self.pulses:
+            if (
+                not self.nozzle_map_sha256
+                or tuple(p.gate_index for p in self.pulses) != self.gate_indices
+            ):
+                raise ActuationTransportError(
+                    "Measured pulse channels or map identity do not match plan"
+                )
+            if any(
+                type(p.nozzle_id) is not int or p.nozzle_id <= 0 for p in self.pulses
+            ) or len({p.nozzle_id for p in self.pulses}) != len(self.pulses):
+                raise ActuationTransportError(
+                    "Measured pulse nozzle IDs must be unique positive integers"
+                )
+            for pulse in self.pulse_plans():
+                pulse.validate()
+            if self.open_monotonic_ns != min(
+                p.open_monotonic_ns for p in self.pulses
+            ) or self.close_monotonic_ns != max(
+                p.close_monotonic_ns for p in self.pulses
+            ):
+                raise ActuationTransportError("Pulse aggregate bounds are inconsistent")
+            if self.open_source_ns != min(
+                p.open_source_ns for p in self.pulses
+            ) or self.close_source_ns != max(p.close_source_ns for p in self.pulses):
+                raise ActuationTransportError(
+                    "Pulse aggregate source bounds are inconsistent"
+                )
+
+    def pulse_plans(self):
+        """Firmware schedules one window per command; keep one parent audit."""
+        if not self.pulses:
+            return (self,)
+        return tuple(
+            replace(
+                self,
+                gate_indices=(p.gate_index,),
+                pulses=(),
+                open_monotonic_ns=p.open_monotonic_ns,
+                close_monotonic_ns=p.close_monotonic_ns,
+                crossing_monotonic_ns=p.crossing_monotonic_ns,
+                open_source_ns=p.open_source_ns,
+                close_source_ns=p.close_source_ns,
+                crossing_source_ns=p.crossing_source_ns,
+            )
+            for p in self.pulses
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +164,9 @@ class ZeroMQActuationPlanPublisher:
         plan.validate()
         encoded = _encode(
             {
-                "schema": ACTUATION_PLAN_SCHEMA,
+                "schema": ACTUATION_PULSE_SCHEMA
+                if plan.pulses
+                else ACTUATION_PLAN_SCHEMA,
                 "sent_monotonic_ns": time.monotonic_ns(),
                 "plan": plan_to_dict(plan),
             }
@@ -160,9 +228,14 @@ class ZeroMQActuationPlanReceiver:
             if len(encoded) > MAX_ACTUATION_PLAN_BYTES:
                 raise ActuationTransportError("actuation plan exceeds size limit")
             message = _object(json.loads(encoded.decode("utf-8")))
-            if message.get("schema") != ACTUATION_PLAN_SCHEMA:
+            if message.get("schema") not in (
+                ACTUATION_PLAN_SCHEMA,
+                ACTUATION_PULSE_SCHEMA,
+            ):
                 raise ActuationTransportError("invalid actuation plan schema")
             plan = plan_from_dict(_object(message.get("plan")))
+            if bool(plan.pulses) != (message.get("schema") == ACTUATION_PULSE_SCHEMA):
+                raise ActuationTransportError("Actuation pulse schema mismatch")
             decision_id = plan.decision_id
             accepted, detail = accept(plan)
         except Exception as exc:  # noqa: BLE001 - negative acknowledgement
@@ -186,6 +259,8 @@ class ZeroMQActuationPlanReceiver:
 
 def plan_to_dict(plan: ActuationPlan) -> dict[str, object]:
     return {
+        "pulses": [asdict(pulse) for pulse in plan.pulses],
+        "nozzle_map_sha256": plan.nozzle_map_sha256,
         "decision_id": plan.decision_id,
         "bean_ref": bean_ref_to_dict(plan.bean_ref),
         "gate_indices": list(plan.gate_indices),
@@ -218,6 +293,8 @@ def plan_from_dict(value: dict[str, object]) -> ActuationPlan:
         run_clock_source_ns=int(value.get("run_clock_source_ns", -1)),
         run_clock_monotonic_ns=int(value.get("run_clock_monotonic_ns", 0)),
         run_clock_scale_ppb=int(value.get("run_clock_scale_ppb", 0)),
+        pulses=tuple(ActuationPulse(**_object(p)) for p in value.get("pulses", [])),
+        nozzle_map_sha256=value.get("nozzle_map_sha256"),
     )
     plan.validate()
     return plan

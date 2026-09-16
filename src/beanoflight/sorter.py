@@ -33,11 +33,12 @@ from .classification_transport import (
     DirectEvidenceBatch,
     ZeroMQDirectEvidenceReceiver,
 )
-from .models import BeanEvent, BeanRef, GateProbability, TrackStatus
+from .models import BeanEvent, BeanRef, Gate, GateProbability, TrackStatus
 from .registry_models import (
     ActuationResult,
     BeanRecord,
     Enrichment,
+    GateWindow,
     RunSession,
     RunState,
     SortingDecision,
@@ -124,6 +125,7 @@ class _PendingActuation:
     open_monotonic_ns: int | None
     close_monotonic_ns: int | None
     opened_source_ns: int | None = None
+    window_results: tuple[tuple[int | None, int | None], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,9 +252,7 @@ class SorterService:
         self._actuator_condition = threading.Condition(self._pending_lock)
         self._awaiting_prediction: set[BeanRef] = set()
         self._awaiting_ensemble: dict[BeanRef, _PendingEnsemble] = {}
-        self._pending_registry_recovery: dict[
-            BeanRef, _PendingRegistryRecovery
-        ] = {}
+        self._pending_registry_recovery: dict[BeanRef, _PendingRegistryRecovery] = {}
         self._planned: OrderedDict[BeanRef, None] = OrderedDict()
         self._audit_queue: queue.Queue[_DecisionAudit] = queue.Queue()
         self._actuation_audit_queue: queue.Queue[_ActuationAudit] = queue.Queue()
@@ -268,16 +268,17 @@ class SorterService:
             self._direct_ingress_ready.set()
         self._sorting_contexts: dict[BeanRef, _CachedSortingContext] = {}
         self._registry_recovery_timing: dict[BeanRef, dict[str, int]] = {}
-        self._recovery_queue: queue.Queue[RunSession | _RecoveredRecord] = (
-            queue.Queue(maxsize=2_048)
+        self._recovery_queue: queue.Queue[RunSession | _RecoveredRecord] = queue.Queue(
+            maxsize=2_048
         )
         self._recovery_watch: set[BeanRef] = set()
         self._recovery_watch_lock = threading.Lock()
-        self._external_actuation_queue: queue.Queue[_ExternalActuation] = (
-            queue.Queue(maxsize=256)
+        self._external_actuation_queue: queue.Queue[_ExternalActuation] = queue.Queue(
+            maxsize=256
         )
         self._externally_scheduled: OrderedDict[str, None] = OrderedDict()
         self._gate_counts: dict[int, int] = {}
+        self.display_gates: tuple[Gate, ...] = ()
         self._cursor = 0
         self.decisions = 0
         self.actuations = 0
@@ -340,12 +341,14 @@ class SorterService:
                     self._direct_evidence_ingress_loop,
                 )
             )
-        workers.extend([
-            ("beano-sorter-decisions", self._decision_loop),
-            ("beano-sorter-recovery", self._recovery_loop),
-            ("beano-sorter-audit", self._audit_loop),
-            ("beano-actuation-audit", self._actuation_audit_loop),
-        ])
+        workers.extend(
+            [
+                ("beano-sorter-decisions", self._decision_loop),
+                ("beano-sorter-recovery", self._recovery_loop),
+                ("beano-sorter-audit", self._audit_loop),
+                ("beano-actuation-audit", self._actuation_audit_loop),
+            ]
+        )
         if self.actuation_endpoint:
             workers.extend(
                 (
@@ -405,9 +408,7 @@ class SorterService:
                 "shutdown_collections": self.gc_shutdown_collections,
                 "shutdown_pause_ms": self.gc_shutdown_pause_ms,
                 "planned_cache_entries": len(self._planned),
-                "external_decision_cache_entries": len(
-                    self._externally_scheduled
-                ),
+                "external_decision_cache_entries": len(self._externally_scheduled),
                 "baseline_rss_mib": self._gc_baseline_rss_mib,
                 "current_rss_mib": self._gc_current_rss_mib,
                 "peak_rss_mib": self._gc_peak_rss_mib,
@@ -439,13 +440,11 @@ class SorterService:
                 >= round(GC_FULL_INTERVAL_SECONDS * 1_000_000_000)
                 or memory_pressure
             )
-            young_due = (
-                now_ns - self._gc_last_young_ns
-                >= round(GC_YOUNG_INTERVAL_SECONDS * 1_000_000_000)
+            young_due = now_ns - self._gc_last_young_ns >= round(
+                GC_YOUNG_INTERVAL_SECONDS * 1_000_000_000
             )
-            generation1_due = (
-                now_ns - self._gc_last_generation1_ns
-                >= round(GC_GENERATION1_INTERVAL_SECONDS * 1_000_000_000)
+            generation1_due = now_ns - self._gc_last_generation1_ns >= round(
+                GC_GENERATION1_INTERVAL_SECONDS * 1_000_000_000
             )
             if not full_due and not generation1_due and not young_due:
                 continue
@@ -459,14 +458,11 @@ class SorterService:
                 continue
             self._run_gc_collection(generation)
 
-    def _raise_gc_pressure_warning(
-        self, now_ns: int, rss_growth_mib: float
-    ) -> None:
+    def _raise_gc_pressure_warning(self, now_ns: int, rss_growth_mib: float) -> None:
         with self._gc_lock:
             self.gc_pressure_active = True
-            warning_due = (
-                now_ns - self._gc_last_pressure_warning_ns
-                >= round(GC_PRESSURE_WARNING_INTERVAL_SECONDS * 1_000_000_000)
+            warning_due = now_ns - self._gc_last_pressure_warning_ns >= round(
+                GC_PRESSURE_WARNING_INTERVAL_SECONDS * 1_000_000_000
             )
             if not warning_due:
                 return
@@ -512,22 +508,15 @@ class SorterService:
         guard_ns = round(guard_ms * 1_000_000)
         try:
             awaiting_ensemble = tuple(self._awaiting_ensemble.values())
-            registry_recoveries = tuple(
-                self._pending_registry_recovery.values()
-            )
+            registry_recoveries = tuple(self._pending_registry_recovery.values())
             sorting_contexts = tuple(self._sorting_contexts.values())
             sessions = dict(self._sessions)
         except RuntimeError:
             # A concurrent mutation means this is not demonstrably a quiet
             # window. Try again on a later maintenance poll.
             return False
-        deadlines = [
-            item.deadline_monotonic_ns for item in awaiting_ensemble
-        ]
-        deadlines.extend(
-            item.due_monotonic_ns
-            for item in registry_recoveries
-        )
+        deadlines = [item.deadline_monotonic_ns for item in awaiting_ensemble]
+        deadlines.extend(item.due_monotonic_ns for item in registry_recoveries)
         # A trajectory may precede its first inference result. Preserve the
         # opportunity to classify it by treating its anticipated fallback as
         # a real deadline even though no ensemble is pending yet.
@@ -600,9 +589,7 @@ class SorterService:
         contexts = None
         try:
             if self.sorting_context_endpoint:
-                contexts = ZeroMQSortingContextReceiver(
-                    self.sorting_context_endpoint
-                )
+                contexts = ZeroMQSortingContextReceiver(self.sorting_context_endpoint)
                 self.sorting_context_endpoint = contexts.endpoint
         except Exception as exc:  # noqa: BLE001 - surfaced to GUI/controller
             self.startup_error = str(exc)
@@ -659,10 +646,7 @@ class SorterService:
                         self.contexts_coalesced += max(
                             0,
                             sum(len(batch.items) for batch in pending_contexts)
-                            - sum(
-                                len(batch.items)
-                                for batch in coalesced_contexts
-                            ),
+                            - sum(len(batch.items) for batch in coalesced_contexts),
                         )
                         for context_batch in coalesced_contexts:
                             self._process_sorting_context(
@@ -880,8 +864,7 @@ class SorterService:
                     record,
                     received_monotonic_ns,
                     defer_classification=bool(self.classification_endpoint)
-                    and event.kind
-                    in {"inference.completed", "enrichment.added"},
+                    and event.kind in {"inference.completed", "enrichment.added"},
                 )
             )
         if events:
@@ -931,14 +914,10 @@ class SorterService:
             direct_received_monotonic_ns=direct_received_ns,
             context_path=cached_context is not None,
             context_sent_monotonic_ns=(
-                None
-                if cached_context is None
-                else cached_context.sent_monotonic_ns
+                None if cached_context is None else cached_context.sent_monotonic_ns
             ),
             context_received_monotonic_ns=(
-                None
-                if cached_context is None
-                else cached_context.received_monotonic_ns
+                None if cached_context is None else cached_context.received_monotonic_ns
             ),
         )
 
@@ -994,8 +973,7 @@ class SorterService:
                 previous = self._sorting_contexts.get(bean_ref)
                 if (
                     previous is None
-                    or previous.record.track.timestamp_ns
-                    <= context.track.timestamp_ns
+                    or previous.record.track.timestamp_ns <= context.track.timestamp_ns
                 ):
                     self._sorting_contexts[bean_ref] = _CachedSortingContext(
                         context_record,
@@ -1048,12 +1026,8 @@ class SorterService:
                 continue
             records.append(cached_context.record)
             context_sent_by_ref[bean_ref] = cached_context.sent_monotonic_ns
-            context_received_by_ref[bean_ref] = (
-                cached_context.received_monotonic_ns
-            )
-            context_embedded_by_ref[bean_ref] = (
-                cached_context.embedded_with_evidence
-            )
+            context_received_by_ref[bean_ref] = cached_context.received_monotonic_ns
+            context_embedded_by_ref[bean_ref] = cached_context.embedded_with_evidence
             self.context_cache_hits += 1
         for record in records:
             self._pending_registry_recovery.pop(record.bean_ref, None)
@@ -1068,9 +1042,7 @@ class SorterService:
                 direct_sent_monotonic_ns=sent_ns,
                 direct_received_monotonic_ns=first_received_ns,
                 context_path=context_received_ns is not None,
-                context_sent_monotonic_ns=context_sent_by_ref.get(
-                    record.bean_ref
-                ),
+                context_sent_monotonic_ns=context_sent_by_ref.get(record.bean_ref),
                 context_received_monotonic_ns=context_received_ns,
                 context_embedded_with_evidence=context_embedded_by_ref.get(
                     record.bean_ref, False
@@ -1281,23 +1253,19 @@ class SorterService:
                 and bean_ref not in self._planned
             ):
                 previous = self._pending_registry_recovery.get(bean_ref)
-                self._pending_registry_recovery[bean_ref] = (
-                    _PendingRegistryRecovery(
-                        record=(
-                            record
-                            if previous is None
-                            or record.revision >= previous.record.revision
-                            else previous.record
-                        ),
-                        # Give the already-sent acknowledged local message one
-                        # scheduler quantum to arrive. This delay applies only
-                        # when its bounded delivery retries were exhausted;
-                        # normal direct decisions do not wait for it.
-                        due_monotonic_ns=(
-                            received_monotonic_ns or time.monotonic_ns()
-                        )
-                        + 5_000_000,
-                    )
+                self._pending_registry_recovery[bean_ref] = _PendingRegistryRecovery(
+                    record=(
+                        record
+                        if previous is None
+                        or record.revision >= previous.record.revision
+                        else previous.record
+                    ),
+                    # Give the already-sent acknowledged local message one
+                    # scheduler quantum to arrive. This delay applies only
+                    # when its bounded delivery retries were exhausted;
+                    # normal direct decisions do not wait for it.
+                    due_monotonic_ns=(received_monotonic_ns or time.monotonic_ns())
+                    + 5_000_000,
                 )
                 continue
             record = self._with_direct_evidence(record)
@@ -1306,14 +1274,10 @@ class SorterService:
             cached_context = self._sorting_contexts.get(bean_ref)
             context_path = cached_context is not None
             context_sent_ns = (
-                None
-                if cached_context is None
-                else cached_context.sent_monotonic_ns
+                None if cached_context is None else cached_context.sent_monotonic_ns
             )
             context_received_ns = (
-                None
-                if cached_context is None
-                else cached_context.received_monotonic_ns
+                None if cached_context is None else cached_context.received_monotonic_ns
             )
             if cached_context is not None:
                 record = _merge_sorting_context(
@@ -1355,6 +1319,8 @@ class SorterService:
     ) -> None:
         self._mark_gc_activity()
         decision_started_ns = time.monotonic_ns()
+        if record.prediction is not None:
+            self.display_gates = tuple(p.gate for p in record.prediction.gates)
         arrival_monotonic_ns = arrival_monotonic_ns or decision_started_ns
         if record.decision is not None:
             self._remember_planned(record.bean_ref)
@@ -1448,9 +1414,7 @@ class SorterService:
                 fallback = pool_classification_evidence(
                     evidence,
                     deadline_fallback=True,
-                    timestamp_ns=session.monotonic_to_source_ns(
-                        arrival_monotonic_ns
-                    ),
+                    timestamp_ns=session.monotonic_to_source_ns(arrival_monotonic_ns),
                 )
                 if direct_path or registry is None:
                     record = replace(
@@ -1471,9 +1435,7 @@ class SorterService:
                     classification = pooled_for_ensemble(
                         record.enrichments, ensemble_id
                     )
-                if classification is not None and _is_deadline_fallback(
-                    classification
-                ):
+                if classification is not None and _is_deadline_fallback(classification):
                     self.deadline_fallbacks += 1
         if classification is None:
             return
@@ -1533,6 +1495,30 @@ class SorterService:
         close_timestamp = prediction.crossing_timestamp_ns + round(
             self.settings.close_lag_ms * 1_000_000
         )
+        windows = ()
+        unmapped = False
+        if prediction.nozzle_map_sha256 and gates:
+            windows = tuple(
+                GateWindow(
+                    p.gate.index,
+                    p.crossing_timestamp_ns,
+                    p.crossing_timestamp_ns - round(self.settings.open_lead_ms * 1e6),
+                    p.crossing_timestamp_ns + round(self.settings.close_lag_ms * 1e6),
+                    p.gate.valve_channel,
+                )
+                for p in prediction.gates
+                if p.gate.index in gates and p.crossing_timestamp_ns is not None
+            )
+            if len(windows) != len(gates):
+                raise ValueError("Measured nozzle selection lacks per-nozzle timing")
+            open_timestamp = min(w.open_timestamp_ns for w in windows)
+            close_timestamp = max(w.close_timestamp_ns for w in windows)
+            required_open_timestamp = open_timestamp
+            if self.actuation_endpoint and any(
+                w.valve_channel is None for w in windows
+            ):
+                unmapped = True
+                gates, windows = (), ()
         reason = "category accepted"
         low_confidence_defect = (
             category in self.settings.reject_categories
@@ -1552,6 +1538,8 @@ class SorterService:
             )
         elif should_sort:
             reason = f"reject category {category}"
+        if unmapped:
+            reason = "physical actuation blocked: measured nozzles have no explicit valve-channel mapping"
         if classification.kind == CLASSIFICATION_POOLED:
             reason += (
                 f"; classification {'deadline fallback' if deadline_fallback else 'pooled'} "
@@ -1565,14 +1553,13 @@ class SorterService:
             # event reaches this process. Use the scheduler's actual arrival
             # time as the final safety gate and reuse the clock snapshot below.
             session = self._session(record.bean_ref.run_id, registry)
-            observed_source_ns = session.monotonic_to_source_ns(
-                arrival_monotonic_ns
-            )
+            observed_source_ns = session.monotonic_to_source_ns(arrival_monotonic_ns)
             notice_ns = open_timestamp - observed_source_ns
         minimum_notice_ns = round(self.settings.minimum_notice_ms * 1_000_000)
         additional_notice_ns = max(0, minimum_notice_ns - notice_ns)
         if gates and notice_ns < round(self.settings.minimum_notice_ms * 1_000_000):
             gates = ()
+            windows = ()
             reason = "classification arrived too late for safe actuation"
             open_timestamp = decision_timestamp
             close_timestamp = decision_timestamp
@@ -1586,8 +1573,12 @@ class SorterService:
             policy_version=self.settings.policy_version,
             reason=reason,
             close_timestamp_ns=max(decision_timestamp, close_timestamp),
-            crossing_timestamp_ns=prediction.crossing_timestamp_ns,
+            crossing_timestamp_ns=min(w.crossing_timestamp_ns for w in windows)
+            if windows
+            else prediction.crossing_timestamp_ns,
             based_on_revision=record.revision,
+            gate_windows=windows,
+            nozzle_map_sha256=prediction.nozzle_map_sha256,
             timing_marks_ns={
                 **_run_clock_timing_marks(clock_session),
                 "sorter_event_received_monotonic_ns": arrival_monotonic_ns,
@@ -1596,7 +1587,11 @@ class SorterService:
                 "sorter_decision_request_monotonic_ns": time.monotonic_ns(),
                 "sorter_observed_source_ns": observed_source_ns,
                 "required_gate_open_source_ns": required_open_timestamp,
-                "predicted_crossing_source_ns": prediction.crossing_timestamp_ns,
+                "predicted_crossing_source_ns": min(
+                    w.crossing_timestamp_ns for w in windows
+                )
+                if windows
+                else prediction.crossing_timestamp_ns,
                 "available_notice_ns": notice_ns,
                 "minimum_notice_ns": minimum_notice_ns,
                 "additional_notice_required_ns": additional_notice_ns,
@@ -1605,9 +1600,7 @@ class SorterService:
                 "classification_deadline_fallback": int(deadline_fallback),
                 "classification_pooled_source_ns": classification.timestamp_ns,
                 "classification_direct_path": int(direct_path),
-                "direct_result_send_monotonic_ns": int(
-                    direct_sent_monotonic_ns or 0
-                ),
+                "direct_result_send_monotonic_ns": int(direct_sent_monotonic_ns or 0),
                 "sorter_direct_received_monotonic_ns": int(
                     direct_received_monotonic_ns or 0
                 ),
@@ -1672,12 +1665,10 @@ class SorterService:
 
     def _ensemble_receive_timeout_ms(self) -> int:
         deadlines = [
-            item.deadline_monotonic_ns
-            for item in self._awaiting_ensemble.values()
+            item.deadline_monotonic_ns for item in self._awaiting_ensemble.values()
         ]
         deadlines.extend(
-            item.due_monotonic_ns
-            for item in self._pending_registry_recovery.values()
+            item.due_monotonic_ns for item in self._pending_registry_recovery.values()
         )
         if not deadlines:
             return 100
@@ -1699,9 +1690,7 @@ class SorterService:
             if bean_ref in self._planned:
                 continue
             self.registry_recovery_decisions += 1
-            original_evidence = evidence_for_ensemble(
-                pending.record.enrichments
-            )
+            original_evidence = evidence_for_ensemble(pending.record.enrichments)
             record = self._with_direct_evidence(pending.record)
             refreshed_evidence = evidence_for_ensemble(record.enrichments)
             sent_ns, direct_received_ns = self._direct_delivery_timing(record)
@@ -1718,9 +1707,7 @@ class SorterService:
                     0,
                     len(refreshed_evidence) - len(original_evidence),
                 ),
-                "registry_recovery_context_refreshed": int(
-                    cached_context is not None
-                ),
+                "registry_recovery_context_refreshed": int(cached_context is not None),
             }
             self._consider(
                 record,
@@ -1731,9 +1718,7 @@ class SorterService:
                 direct_received_monotonic_ns=direct_received_ns,
                 context_path=cached_context is not None,
                 context_sent_monotonic_ns=(
-                    None
-                    if cached_context is None
-                    else cached_context.sent_monotonic_ns
+                    None if cached_context is None else cached_context.sent_monotonic_ns
                 ),
                 context_received_monotonic_ns=(
                     None
@@ -1766,16 +1751,10 @@ class SorterService:
                     arrival_monotonic_ns=now_ns,
                     force_deadline_fallback=True,
                     direct_path=pending.direct_path,
-                    direct_sent_monotonic_ns=(
-                        pending.direct_sent_monotonic_ns
-                    ),
-                    direct_received_monotonic_ns=(
-                        pending.direct_received_monotonic_ns
-                    ),
+                    direct_sent_monotonic_ns=(pending.direct_sent_monotonic_ns),
+                    direct_received_monotonic_ns=(pending.direct_received_monotonic_ns),
                     context_path=pending.context_path,
-                    context_sent_monotonic_ns=(
-                        pending.context_sent_monotonic_ns
-                    ),
+                    context_sent_monotonic_ns=(pending.context_sent_monotonic_ns),
                     context_received_monotonic_ns=(
                         pending.context_received_monotonic_ns
                     ),
@@ -1802,8 +1781,7 @@ class SorterService:
         except RegistryRemoteError as exc:
             if not (
                 exc.error_type == "ValueError"
-                and "unknown registry operation: add_enrichments"
-                in exc.remote_message
+                and "unknown registry operation: add_enrichments" in exc.remote_message
             ):
                 raise
             records = tuple(
@@ -1837,9 +1815,7 @@ class SorterService:
         classification_basis: Enrichment | None = None,
     ) -> None:
         self._awaiting_prediction.discard(record.bean_ref)
-        decision_timestamp = max(
-            record.track.timestamp_ns, classification_timestamp_ns
-        )
+        decision_timestamp = max(record.track.timestamp_ns, classification_timestamp_ns)
         decision = SortingDecision(
             decision_id=f"sort:{record.bean_ref.run_id}:{record.bean_ref.sequence}",
             source="beano-sorter",
@@ -1856,9 +1832,7 @@ class SorterService:
             crossing_timestamp_ns=None,
             based_on_revision=record.revision,
             timing_marks_ns={
-                **_run_clock_timing_marks(
-                    self._sessions.get(record.bean_ref.run_id)
-                ),
+                **_run_clock_timing_marks(self._sessions.get(record.bean_ref.run_id)),
                 "sorter_event_received_monotonic_ns": (
                     arrival_monotonic_ns or time.monotonic_ns()
                 ),
@@ -1889,7 +1863,9 @@ class SorterService:
             self._audit_queue.put(audit)
         else:
             if registry is None:
-                raise RuntimeError("a Registry client is required for synchronous audit")
+                raise RuntimeError(
+                    "a Registry client is required for synchronous audit"
+                )
             self._persist_audit(audit, registry)
 
     def _audit_loop(self) -> None:
@@ -1925,7 +1901,18 @@ class SorterService:
                             and pending.opened_source_ns is not None
                             and decision is not None
                         ):
-                            self._set_gates(decision.gate_indices, False)
+                            active = (
+                                tuple(
+                                    w.gate_index
+                                    for w, (opened, closed) in zip(
+                                        decision.gate_windows, pending.window_results
+                                    )
+                                    if opened is not None and closed is None
+                                )
+                                if decision.gate_windows
+                                else decision.gate_indices
+                            )
+                            self._set_gates(active, False)
                     self._emit("error", record, detail=str(exc))
                 finally:
                     self._audit_queue.task_done()
@@ -1957,8 +1944,7 @@ class SorterService:
                 record.bean_ref,
                 pool,
                 event_id=(
-                    f"sorter-finalize:{pool.result_id}:"
-                    f"{sample_count}:{int(fallback)}"
+                    f"sorter-finalize:{pool.result_id}:{sample_count}:{int(fallback)}"
                 ),
             )
         decision = replace(
@@ -2127,9 +2113,7 @@ class SorterService:
                         str(exc),
                     )
                     publisher.close()
-                    publisher = ZeroMQActuationPlanPublisher(
-                        self.actuation_endpoint
-                    )
+                    publisher = ZeroMQActuationPlanPublisher(self.actuation_endpoint)
                 finally:
                     self._external_actuation_queue.task_done()
         finally:
@@ -2172,6 +2156,28 @@ class SorterService:
                         decision = record.decision
                         if decision is None:
                             self._pending.pop(decision_id, None)
+                            continue
+                        if decision.gate_windows:
+                            scheduled, changes, result, deadline = (
+                                _advance_nozzle_windows(scheduled, now_monotonic_ns)
+                            )
+                            for gate, active in changes:
+                                self._set_gates((gate,), active)
+                            if any(active for _, active in changes):
+                                opened_records.append(record)
+                            if result is not None:
+                                self._pending.pop(decision_id, None)
+                                audits.append(
+                                    _ActuationAudit(record.bean_ref, record, result)
+                                )
+                            else:
+                                self._pending[decision_id] = scheduled
+                                if deadline is not None:
+                                    next_deadline_ns = (
+                                        deadline
+                                        if next_deadline_ns is None
+                                        else min(next_deadline_ns, deadline)
+                                    )
                             continue
                         if scheduled.open_monotonic_ns is None:
                             scheduled = _pending_actuation(
@@ -2256,8 +2262,7 @@ class SorterService:
                         if next_deadline_ns is None
                         else max(
                             0.0,
-                            (next_deadline_ns - time.monotonic_ns())
-                            / 1_000_000_000.0,
+                            (next_deadline_ns - time.monotonic_ns()) / 1_000_000_000.0,
                         )
                     )
                     self._actuator_condition.wait(timeout=timeout)
@@ -2403,9 +2408,7 @@ def _run_clock_timing_marks(session: RunSession | None) -> dict[str, int]:
         "run_clock_source_ns": session.clock_source_timestamp_ns,
         "run_clock_monotonic_ns": session.clock_monotonic_ns,
         "run_clock_epoch": session.revision,
-        "run_clock_scale_ppb": round(
-            session.playback_scale * 1_000_000_000
-        ),
+        "run_clock_scale_ppb": round(session.playback_scale * 1_000_000_000),
     }
 
 
@@ -2420,14 +2423,34 @@ def _select_gate_indices(
     allow_adjacent_pair: bool,
 ) -> tuple[tuple[int, ...], float | None]:
     individual = tuple(
-        item.gate.index for item in gates if item.probability >= threshold
+        item.gate.index
+        for item in gates
+        if item.probability >= threshold
+        and (item.gate.nozzle_id is None or item.crossing_timestamp_ns is not None)
     )
     if individual or not allow_adjacent_pair or len(gates) < 2:
         return individual, None
     candidates = tuple(
         (left.probability + right.probability, left.gate.index, right.gate.index)
         for left, right in pairwise(gates)
-        if right.gate.index == left.gate.index + 1
+        if (right.gate.index == left.gate.index + 1 or left.gate.nozzle_id is not None)
+        and (
+            left.gate.line_y_mm == right.gate.line_y_mm
+            or (
+                left.gate.line_y_mm is not None
+                and right.gate.line_y_mm is not None
+                and math.isclose(
+                    left.gate.line_y_mm, right.gate.line_y_mm, rel_tol=0, abs_tol=1e-9
+                )
+            )
+        )
+        and (
+            left.gate.nozzle_id is None
+            or (
+                left.crossing_timestamp_ns is not None
+                and right.crossing_timestamp_ns is not None
+            )
+        )
     )
     if not candidates:
         return (), None
@@ -2466,10 +2489,68 @@ def _pending_actuation(
     )
 
 
+def _advance_nozzle_windows(pending, now_ns):
+    """Advance independently timed valves; emit one aggregate bean audit."""
+    decision, session = pending.record.decision, pending.session
+    results = list(
+        pending.window_results or ((None, None),) * len(decision.gate_windows)
+    )
+    changes, deadlines = [], []
+    now_source = session.monotonic_to_source_ns(now_ns)
+    for i, window in enumerate(decision.gate_windows):
+        opened, closed = results[i]
+        open_ns = session.source_to_monotonic_ns(window.open_timestamp_ns)
+        close_ns = session.source_to_monotonic_ns(window.close_timestamp_ns)
+        if session.target_fps <= 0:
+            open_ns = close_ns = now_ns
+        if opened is None and open_ns is not None and now_ns >= open_ns:
+            opened = now_source
+            changes.append((window.gate_index, True))
+        if (
+            opened is not None
+            and closed is None
+            and close_ns is not None
+            and now_ns >= close_ns
+        ):
+            closed = now_source
+            changes.append((window.gate_index, False))
+        results[i] = (opened, closed)
+        target = open_ns if opened is None else close_ns if closed is None else None
+        if target is not None:
+            deadlines.append(target)
+    opened_values = [a for a, _ in results if a is not None]
+    updated = replace(
+        pending,
+        window_results=tuple(results),
+        opened_source_ns=min(opened_values) if opened_values else None,
+    )
+    audit = None
+    if all(b is not None for _, b in results):
+        success = all(
+            a <= w.crossing_timestamp_ns <= b
+            for w, (a, b) in zip(decision.gate_windows, results)
+        )
+        audit = ActuationResult(
+            decision.decision_id,
+            "virtual-actuator-deadline",
+            min(a for a, _ in results),
+            max(b for _, b in results),
+            success,
+            "Per-nozzle timing: "
+            + "; ".join(
+                f"N{w.gate_index} open={a} crossing={w.crossing_timestamp_ns} close={b}"
+                for w, (a, b) in zip(decision.gate_windows, results)
+            ),
+        )
+    return updated, changes, audit, min(deadlines) if deadlines else None
+
+
 def _external_actuation_plan(pending: _PendingActuation) -> ActuationPlan:
     decision = pending.record.decision
     if decision is None or decision.crossing_timestamp_ns is None:
         raise ValueError("external actuation requires a predicted crossing")
+    if decision.nozzle_map_sha256 and not decision.gate_windows:
+        raise ValueError("Measured nozzle actuation requires per-nozzle windows")
     if pending.open_monotonic_ns is None or pending.close_monotonic_ns is None:
         raise ValueError("external actuation requires a running replay clock")
     crossing_monotonic_ns = pending.session.source_to_monotonic_ns(
@@ -2482,10 +2563,35 @@ def _external_actuation_plan(pending: _PendingActuation) -> ActuationPlan:
         if decision.close_timestamp_ns is not None
         else decision.actuation_timestamp_ns
     )
+    from .actuation_transport import ActuationPulse
+
+    pulses = ()
+    if decision.gate_windows:
+        if any(w.valve_channel is None for w in decision.gate_windows):
+            raise ValueError(
+                "Physical nozzle actuation requires explicit valve channels"
+            )
+        pulses = tuple(
+            ActuationPulse(
+                w.valve_channel - 10,
+                w.gate_index,
+                pending.session.source_to_monotonic_ns(w.open_timestamp_ns),
+                pending.session.source_to_monotonic_ns(w.close_timestamp_ns),
+                pending.session.source_to_monotonic_ns(w.crossing_timestamp_ns),
+                w.open_timestamp_ns,
+                w.close_timestamp_ns,
+                w.crossing_timestamp_ns,
+            )
+            for w in decision.gate_windows
+        )
     plan = ActuationPlan(
         decision_id=decision.decision_id,
         bean_ref=pending.record.bean_ref,
-        gate_indices=decision.gate_indices,
+        gate_indices=tuple(p.gate_index for p in pulses)
+        if pulses
+        else decision.gate_indices,
+        pulses=pulses,
+        nozzle_map_sha256=decision.nozzle_map_sha256,
         open_monotonic_ns=pending.open_monotonic_ns,
         close_monotonic_ns=pending.close_monotonic_ns,
         crossing_monotonic_ns=crossing_monotonic_ns,
@@ -2494,9 +2600,7 @@ def _external_actuation_plan(pending: _PendingActuation) -> ActuationPlan:
         crossing_source_ns=decision.crossing_timestamp_ns,
         run_clock_source_ns=pending.session.clock_source_timestamp_ns,
         run_clock_monotonic_ns=pending.session.clock_monotonic_ns,
-        run_clock_scale_ppb=round(
-            pending.session.playback_scale * 1_000_000_000
-        ),
+        run_clock_scale_ppb=round(pending.session.playback_scale * 1_000_000_000),
     )
     plan.validate()
     return plan

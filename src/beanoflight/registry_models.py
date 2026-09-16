@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -118,6 +118,15 @@ class Enrichment:
 
 
 @dataclass(frozen=True, slots=True)
+class GateWindow:
+    gate_index: int
+    crossing_timestamp_ns: int
+    open_timestamp_ns: int
+    close_timestamp_ns: int
+    valve_channel: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SortingDecision:
     """A proposed or acknowledged gate action for one bean."""
 
@@ -133,6 +142,8 @@ class SortingDecision:
     crossing_timestamp_ns: int | None = None
     based_on_revision: int = 0
     timing_marks_ns: dict[str, int] = field(default_factory=dict)
+    gate_windows: tuple[GateWindow, ...] = ()
+    nozzle_map_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,10 +284,27 @@ def prediction_to_dict(prediction: CrossingPrediction) -> dict[str, object]:
                 "left_mm": item.gate.left_mm,
                 "right_mm": item.gate.right_mm,
                 "probability": item.probability,
+                **(
+                    {
+                        **asdict(item.gate),
+                        "crossing_timestamp_ns": item.crossing_timestamp_ns,
+                        "seconds_until_crossing": item.seconds_until_crossing,
+                        "x_mean_mm": item.x_mean_mm,
+                        "x_std_mm": item.x_std_mm,
+                        "time_std_ms": item.time_std_ms,
+                    }
+                    if prediction.nozzle_map_sha256
+                    else {}
+                ),
             }
             for item in prediction.gates
         ],
         "selected_gate_indices": list(prediction.selected_gate_indices),
+        **(
+            {"nozzle_map_sha256": prediction.nozzle_map_sha256}
+            if prediction.nozzle_map_sha256
+            else {}
+        ),
     }
 
 
@@ -287,8 +315,19 @@ def prediction_from_dict(value: Mapping[str, object]) -> CrossingPrediction:
                 index=int(item["index"]),
                 left_mm=float(item["left_mm"]),
                 right_mm=float(item["right_mm"]),
+                centre_x_mm=_optional_number(item, "centre_x_mm", float),
+                line_y_mm=_optional_number(item, "line_y_mm", float),
+                nozzle_id=_optional_number(item, "nozzle_id", int),
+                valve_channel=_optional_number(item, "valve_channel", int),
             ),
             probability=float(item["probability"]),
+            crossing_timestamp_ns=_optional_number(item, "crossing_timestamp_ns", int),
+            seconds_until_crossing=_optional_number(
+                item, "seconds_until_crossing", float
+            ),
+            x_mean_mm=_optional_number(item, "x_mean_mm", float),
+            x_std_mm=_optional_number(item, "x_std_mm", float),
+            time_std_ms=_optional_number(item, "time_std_ms", float),
         )
         for item in (_mapping(raw) for raw in _sequence(value["gates"]))
     )
@@ -302,7 +341,12 @@ def prediction_from_dict(value: Mapping[str, object]) -> CrossingPrediction:
         time_std_ms=float(value["time_std_ms"]),
         gates=gates,
         selected_gate_indices=_int_tuple(value["selected_gate_indices"]),
+        nozzle_map_sha256=value.get("nozzle_map_sha256"),
     )
+
+
+def _optional_number(value, key, kind):
+    return None if value.get(key) is None else kind(value[key])
 
 
 def enrichment_to_dict(enrichment: Enrichment) -> dict[str, object]:
@@ -344,6 +388,14 @@ def decision_to_dict(decision: SortingDecision) -> dict[str, object]:
         "crossing_timestamp_ns": decision.crossing_timestamp_ns,
         "based_on_revision": decision.based_on_revision,
         "timing_marks_ns": dict(decision.timing_marks_ns),
+        **(
+            {
+                "gate_windows": [asdict(window) for window in decision.gate_windows],
+                "nozzle_map_sha256": decision.nozzle_map_sha256,
+            }
+            if decision.nozzle_map_sha256
+            else {}
+        ),
     }
 
 
@@ -368,6 +420,11 @@ def decision_from_dict(value: Mapping[str, object]) -> SortingDecision:
         ),
         based_on_revision=int(value.get("based_on_revision", 0)),
         timing_marks_ns=_timing_marks(value.get("timing_marks_ns", {})),
+        gate_windows=tuple(
+            GateWindow(**dict(_mapping(item)))
+            for item in _sequence(value.get("gate_windows", []))
+        ),
+        nozzle_map_sha256=value.get("nozzle_map_sha256"),
     )
 
 

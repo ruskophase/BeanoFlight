@@ -30,9 +30,7 @@ from .registry_zmq import ZeroMQRegistryClient
 from .runtime_priority import lower_current_thread_priority
 
 FIRMWARE_PROTOCOL = "beano-actuator-v1"
-DEFAULT_ESP32_PORT = (
-    "/dev/serial/by-path/platform-3610000.usb-usb-0:2.1:1.0"
-)
+DEFAULT_ESP32_PORT = "/dev/serial/by-path/platform-3610000.usb-usb-0:2.1:1.0"
 GATE_INDICES = tuple(range(-10, 11))
 GATE_GPIOS = (
     1,
@@ -189,14 +187,15 @@ class ESP32ActuatorService:
         self.activity = activity
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
-        self._plans: queue.PriorityQueue[_QueuedHardwarePlan] = (
-            queue.PriorityQueue(maxsize=256)
+        self._plans: queue.PriorityQueue[_QueuedHardwarePlan] = queue.PriorityQueue(
+            maxsize=256
         )
         self._tests: queue.Queue[int] = queue.Queue(maxsize=4)
         self._results: queue.Queue[_ResultAudit] = queue.Queue(maxsize=256)
         self._accepted_decisions: set[str] = set()
         self._accepted_lock = threading.Lock()
         self._pending: dict[int, _PendingHardwarePlan] = {}
+        self._pulse_results: dict[str, tuple[ActuationPlan, list[ActuationResult]]] = {}
         self._request_plans: dict[int, int] = {}
         self._clock_samples: deque[tuple[int, int]] = deque(maxlen=32)
         self._clock_offset_ns: int | None = None
@@ -255,9 +254,8 @@ class ESP32ActuatorService:
         if drain:
             deadline = time.monotonic() + 2.0
             while (
-                (not self._plans.empty() or not self._results.empty())
-                and time.monotonic() < deadline
-            ):
+                not self._plans.empty() or not self._results.empty()
+            ) and time.monotonic() < deadline:
                 self._stop.wait(0.01)
         self._stop.set()
         for thread in self._threads:
@@ -272,7 +270,10 @@ class ESP32ActuatorService:
             if not self.connected or not self.synchronized:
                 self.plans_rejected += 1
                 return False, "ESP32 is not connected and clock-synchronized"
-            if plan.open_monotonic_ns - time.monotonic_ns() < self.minimum_board_notice_ns:
+            if (
+                plan.open_monotonic_ns - time.monotonic_ns()
+                < self.minimum_board_notice_ns
+            ):
                 self.plans_rejected += 1
                 return False, "plan reached actuator below its minimum notice"
             try:
@@ -440,44 +441,55 @@ class ESP32ActuatorService:
             except queue.Empty:
                 return sent
             try:
-                plan = queued.plan
-                sequence = self._allocate_plan()
-                request = self._allocate_request()
-                offset = self._clock_offset_ns
-                open_us = (plan.open_monotonic_ns - offset) // 1_000
-                close_us = (plan.close_monotonic_ns - offset) // 1_000
-                mask = gate_indices_to_mask(plan.gate_indices)
-                pending = _PendingHardwarePlan(
-                    plan,
-                    sequence,
-                    offset,
-                    queued.admitted_monotonic_ns,
-                    time.monotonic_ns(),
-                    open_us,
-                    close_us,
-                )
-                self._pending[sequence] = pending
-                self._request_plans[request] = sequence
-                serial.write(
-                    encode_protocol_line(
-                        "SCHEDULE",
-                        request,
+                parent = queued.plan
+                if parent.pulses:
+                    self._pulse_results[parent.decision_id] = (parent, [])
+                commands = []
+                # Register every pulse before writing: a link failure must
+                # fail/audit unsent pulses as well as already submitted ones.
+                for plan in parent.pulse_plans():
+                    sequence = self._allocate_plan()
+                    request = self._allocate_request()
+                    offset = self._clock_offset_ns
+                    open_us = (plan.open_monotonic_ns - offset) // 1_000
+                    close_us = (plan.close_monotonic_ns - offset) // 1_000
+                    mask = gate_indices_to_mask(plan.gate_indices)
+                    self._pending[sequence] = _PendingHardwarePlan(
+                        plan,
                         sequence,
-                        f"{mask:08X}",
+                        offset,
+                        queued.admitted_monotonic_ns,
+                        time.monotonic_ns(),
                         open_us,
                         close_us,
                     )
-                )
-                sent += 1
-                self.plans_scheduled += 1
-                self._emit(
-                    "scheduled",
-                    plan,
-                    detail=(
-                        f"board plan {sequence} · gates {plan.gate_indices} · "
-                        f"notice {(plan.open_monotonic_ns - time.monotonic_ns()) / 1_000_000:.2f} ms"
-                    ),
-                )
+                    self._request_plans[request] = sequence
+                    commands.append(
+                        (
+                            plan,
+                            sequence,
+                            encode_protocol_line(
+                                "SCHEDULE",
+                                request,
+                                sequence,
+                                f"{mask:08X}",
+                                open_us,
+                                close_us,
+                            ),
+                        )
+                    )
+                for plan, sequence, command in commands:
+                    serial.write(command)
+                    sent += 1
+                    self.plans_scheduled += 1
+                    self._emit(
+                        "scheduled",
+                        plan,
+                        detail=(
+                            f"board plan {sequence} · gates {plan.gate_indices} · "
+                            f"notice {(plan.open_monotonic_ns - time.monotonic_ns()) / 1_000_000:.2f} ms"
+                        ),
+                    )
             finally:
                 self._plans.task_done()
         return sent
@@ -555,9 +567,7 @@ class ESP32ActuatorService:
             if pending is None:
                 return
             if command == "OPEN":
-                self._pending[sequence] = replace(
-                    pending, opened_board_us=board_us
-                )
+                self._pending[sequence] = replace(pending, opened_board_us=board_us)
                 self._emit("opened", pending.plan)
             else:
                 self._complete_plan(sequence, board_us)
@@ -614,7 +624,7 @@ class ESP32ActuatorService:
                 f"close error {(actual_close_host_ns - pending.plan.close_monotonic_ns) / 1_000_000:.3f} ms"
             ),
         )
-        self._results.put(_ResultAudit(pending.plan, result))
+        self._record_pulse_result(pending.plan, result)
         self.cycles_completed += int(success)
         self.cycles_failed += int(not success)
         self._emit("closed", pending.plan, detail=result.detail)
@@ -624,8 +634,9 @@ class ESP32ActuatorService:
         expired = tuple(
             sequence
             for sequence, pending in self._pending.items()
-            if not pending.acknowledged
-            and now_ns >= pending.plan.close_monotonic_ns + 5_000_000
+            if now_ns
+            >= pending.plan.close_monotonic_ns
+            + (50_000_000 if pending.acknowledged else 5_000_000)
         )
         for sequence in expired:
             self._fail_plan(
@@ -655,9 +666,31 @@ class ESP32ActuatorService:
             success=False,
             detail=detail,
         )
-        self._results.put(_ResultAudit(plan, result))
+        self._record_pulse_result(plan, result)
         self.cycles_failed += 1
         self._emit("failed", plan, detail=detail)
+
+    def _record_pulse_result(self, plan, result):
+        group = self._pulse_results.get(plan.decision_id)
+        if group is None:
+            self._results.put(_ResultAudit(plan, result))
+            return
+        parent, results = group
+        results.append(
+            replace(result, detail=f"outputs {plan.gate_indices}: {result.detail}")
+        )
+        if len(results) < len(parent.pulses):
+            return
+        self._pulse_results.pop(plan.decision_id)
+        combined = ActuationResult(
+            parent.decision_id,
+            "esp32-s2-gptimer",
+            min(r.actual_open_timestamp_ns for r in results),
+            max(r.actual_close_timestamp_ns for r in results),
+            all(r.success for r in results),
+            "Per-nozzle pulse results: " + " | ".join(r.detail for r in results),
+        )
+        self._results.put(_ResultAudit(parent, combined))
 
     def _audit_loop(self) -> None:
         lower_current_thread_priority()

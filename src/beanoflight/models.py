@@ -84,9 +84,15 @@ class Gate:
     index: int
     left_mm: float
     right_mm: float
+    centre_x_mm: float | None = None
+    line_y_mm: float | None = None
+    nozzle_id: int | None = None
+    valve_channel: int | None = None
 
     @property
     def label(self) -> str:
+        if self.nozzle_id is not None:
+            return f"N{self.nozzle_id}"
         return f"G{self.index:+d}" if self.index else "G0"
 
 
@@ -94,6 +100,11 @@ class Gate:
 class GateProbability:
     gate: Gate
     probability: float
+    crossing_timestamp_ns: int | None = None
+    seconds_until_crossing: float | None = None
+    x_mean_mm: float | None = None
+    x_std_mm: float | None = None
+    time_std_ms: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +118,7 @@ class CrossingPrediction:
     time_std_ms: float
     gates: tuple[GateProbability, ...]
     selected_gate_indices: tuple[int, ...]
+    nozzle_map_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

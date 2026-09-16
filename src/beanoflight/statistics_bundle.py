@@ -27,7 +27,7 @@ from .background import parse_background_frame_indices
 from .calibration import MetricPlaneCalibration, find_pinkplane_homography
 from .detection import DetectorSettings, RawGreenDetector
 from .models import BeanRef, TrackStatus
-from .prediction import GateLayout
+from .nozzle_map import resolve_gate_layout
 from .source import MMapRawVideoSource, SourceError
 from .statistics_features import (
     component_crop_mask,
@@ -144,6 +144,7 @@ def parser() -> argparse.ArgumentParser:
         help="human-confirmed empty zero-based frames (default: 2,8,14)",
     )
     result.add_argument("--homography", type=Path)
+    result.add_argument("--nozzle-map", type=Path)
     result.add_argument("--output-root", type=Path)
     result.add_argument("--crop-size", type=int, default=320)
     result.add_argument("--samples-per-bean", type=int, default=3)
@@ -180,6 +181,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 output,
                 settings=settings,
                 homography_path=arguments.homography,
+                nozzle_map_path=arguments.nozzle_map,
                 overwrite=arguments.overwrite,
                 progress=lambda completed, total, samples, _name=resolved.name: print(
                     f"{_name}: frame {completed}/{total}, "
@@ -197,6 +199,7 @@ def build_statistics_bundle(
     *,
     settings: BundleSettings | None = None,
     homography_path: Path | None = None,
+    nozzle_map_path: Path | None = None,
     overwrite: bool = False,
     progress=None,
 ) -> dict[str, object]:
@@ -270,7 +273,7 @@ def build_statistics_bundle(
             RawGreenDetector(detector_settings),
             background,
             tracker_settings=TrackerSettings(),
-            gate_layout=GateLayout(calibration.sorting_line_y()),
+            gate_layout=resolve_gate_layout(calibration, nozzle_map_path),
             positions_mapper=positions_mapper,
         )
         total = min(
@@ -561,6 +564,7 @@ def build_statistics_bundle(
             options,
             frames_processed,
         )
+        provenance["nozzle_layout"] = engine.gate_layout.to_dict()
         files = _file_inventory(temporary)
         manifest = {
             "schema": SCHEMA,

@@ -101,7 +101,10 @@ class SimulationStackTests(unittest.TestCase):
                     60,
                     100,
                     100,
-                    time.monotonic_ns(),
+                    # This is a wiring/integration test, not a latency
+                    # benchmark. Arm ahead of fixture/crop setup so machine
+                    # load cannot intentionally trigger the late-sort guard.
+                    time.monotonic_ns() + 500_000_000,
                     False,
                     time.time_ns(),
                     time.time_ns(),
@@ -186,12 +189,8 @@ class SimulationStackTests(unittest.TestCase):
                 1,
             )
             self.assertGreater(
-                result.decision.timing_marks_ns[
-                    "sorter_direct_received_monotonic_ns"
-                ],
-                result.decision.timing_marks_ns[
-                    "direct_result_send_monotonic_ns"
-                ],
+                result.decision.timing_marks_ns["sorter_direct_received_monotonic_ns"],
+                result.decision.timing_marks_ns["direct_result_send_monotonic_ns"],
             )
 
             dispatcher.close()

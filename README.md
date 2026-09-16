@@ -4,12 +4,18 @@ BeanoFlight is the CamL bean-identification, tracking, and flight-prediction
 application for the Beano sorting rig. It reads the calibrated lossless video
 and exact timestamp manifest produced by BeanoFastCap, converts undistorted
 image positions into millimetres using PinkPlane's 9.16 mm hole grid, assigns
-stable bean IDs, and predicts where and when each bean will cross a virtual
-sorting line.
+stable bean IDs, and predicts where and when each bean will reach measured
+nozzle zones (or the original virtual sorting line).
 
 The current release is deliberately a human-verification and system-simulation
 tool. Its ESP32-S2 output is restricted to low-current gate-indicator LEDs; it
 does not drive physical valves.
+
+Version 0.2 adds independent PinkPlane nozzle-map loading for review, replay
+and live prediction. Use **Load nozzle map** in BeanoFlight, or pass
+`--nozzle-map /path/to/nozzle-map.json` to `beano-flight`, `beano-system-test`
+or the statistics-bundle command. See [Measured Nozzle Layouts](docs/nozzle-layouts.md)
+for geometry validation, zone probabilities, timing and output mapping.
 
 For calibrated per-batch colour, silhouette, apparent-size and volume-proxy
 analysis, see [Offline Statistics Bundles](docs/statistics-bundle.md). Direct-

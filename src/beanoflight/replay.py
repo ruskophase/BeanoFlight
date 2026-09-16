@@ -903,6 +903,7 @@ class ReplayRunner:
             created_timestamp_ns=created_ns,
             updated_timestamp_ns=created_ns,
             settings={
+                "nozzle_layout": self.engine.gate_layout.to_dict(),
                 "crop_size_px": (
                     None
                     if self.crop_selector is None

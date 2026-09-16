@@ -44,6 +44,7 @@ class SorterApp(tk.Tk):
         self.service: SorterService | None = None
         self._activities: queue.Queue[SorterActivity] = queue.Queue(maxsize=256)
         self._gate_items: dict[int, int] = {}
+        self._layout_gates = ()
         self._displayed_gate_states: dict[int, bool] = {}
         self._activity_display_enabled = threading.Event()
 
@@ -59,9 +60,7 @@ class SorterApp(tk.Tk):
         self.ensemble_reserve_var = tk.StringVar(
             value=str(defaults.ensemble_deadline_reserve_ms)
         )
-        self.adjacent_pair_var = tk.BooleanVar(
-            value=defaults.allow_adjacent_gate_pair
-        )
+        self.adjacent_pair_var = tk.BooleanVar(value=defaults.allow_adjacent_gate_pair)
         self.status_var = tk.StringVar(value="Stopped")
         self.counts_var = tk.StringVar(
             value="decisions 0 · actuations 0 · low-confidence defects 0 · errors 0"
@@ -114,7 +113,11 @@ class SorterApp(tk.Tk):
             variable=self.adjacent_pair_var,
         ).grid(row=2, column=6, columnspan=2, sticky=tk.W, pady=(8, 0))
 
-        gates = ttk.LabelFrame(self, text="Virtual sorting line", padding=10)
+        gates = ttk.LabelFrame(
+            self,
+            text="Logical nozzle/gate activity (schematic, not to scale)",
+            padding=10,
+        )
         gates.pack(fill=tk.X, padx=10, pady=(0, 10))
         self.canvas = tk.Canvas(
             gates, height=155, background="#171c22", highlightthickness=0
@@ -145,9 +148,7 @@ class SorterApp(tk.Tk):
                 open_lead_ms=float(self.lead_var.get()),
                 close_lag_ms=float(self.lag_var.get()),
                 minimum_notice_ms=float(self.notice_var.get()),
-                ensemble_deadline_reserve_ms=float(
-                    self.ensemble_reserve_var.get()
-                ),
+                ensemble_deadline_reserve_ms=float(self.ensemble_reserve_var.get()),
                 allow_adjacent_gate_pair=self.adjacent_pair_var.get(),
             )
             settings.validate()
@@ -189,7 +190,8 @@ class SorterApp(tk.Tk):
         self.canvas.delete("all")
         self._gate_items.clear()
         width = max(1, self.canvas.winfo_width())
-        indices = tuple(range(-10, 11))
+        indices = tuple(g.index for g in self._layout_gates) or tuple(range(-10, 11))
+        labels = {g.index: g.label for g in self._layout_gates}
         spacing = width / (len(indices) + 1)
         for offset, gate in enumerate(indices, start=1):
             x = round(offset * spacing)
@@ -205,7 +207,7 @@ class SorterApp(tk.Tk):
             self.canvas.create_text(
                 x,
                 112,
-                text="G0" if gate == 0 else f"G{gate:+d}",
+                text=labels.get(gate, "G0" if gate == 0 else f"G{gate:+d}"),
                 fill="#dce3ea",
             )
             self._gate_items[gate] = item
@@ -251,6 +253,9 @@ class SorterApp(tk.Tk):
                 self.activity.configure(state=tk.DISABLED)
         service = self.service
         if service is not None:
+            if service.display_gates != self._layout_gates:
+                self._layout_gates = service.display_gates
+                self._draw_gates()
             self._update_gate_states(service.gate_states)
             gc_stats = service.garbage_collection_statistics()
             gc_detail = (
@@ -328,12 +333,8 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="BeanoFlight sorting simulation GUI")
     result.add_argument("--registry", default=DEFAULT_COMMAND_ENDPOINT)
     result.add_argument("--events", default=DEFAULT_EVENT_ENDPOINT)
-    result.add_argument(
-        "--classifications", default=DEFAULT_DIRECT_EVIDENCE_ENDPOINT
-    )
-    result.add_argument(
-        "--sorting-contexts", default=DEFAULT_SORTING_CONTEXT_ENDPOINT
-    )
+    result.add_argument("--classifications", default=DEFAULT_DIRECT_EVIDENCE_ENDPOINT)
+    result.add_argument("--sorting-contexts", default=DEFAULT_SORTING_CONTEXT_ENDPOINT)
     result.add_argument(
         "--actuator",
         default="",
@@ -379,9 +380,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         classification_endpoint=arguments.classifications,
         sorting_context_endpoint=arguments.sorting_contexts,
         actuation_endpoint=arguments.actuator,
-        animate_gates=(
-            arguments.gate_animation and not arguments.no_gate_animation
-        ),
+        animate_gates=(arguments.gate_animation and not arguments.no_gate_animation),
         show_activity=arguments.activity_log and not arguments.no_activity_log,
         suppress_cyclic_gc=arguments.suppress_cyclic_gc,
     ).mainloop()

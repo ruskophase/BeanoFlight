@@ -47,6 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--nozzle-map",
+        type=Path,
+        help="Measured CamL v2 nozzle map; omitted means explicit virtual layout",
+    )
+    parser.add_argument(
         "--sorting-contexts",
         default=DEFAULT_SORTING_CONTEXT_ENDPOINT,
         help="real-time track/prediction context endpoint for BeanoSorter",
@@ -66,6 +71,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         homography_path=args.homography,
         hole_pitch_mm=args.hole_pitch_mm,
         sorting_offset_mm=args.sorting_offset_mm,
+        nozzle_map_path=args.nozzle_map,
         performance_mode=args.performance_mode,
         sorting_context_endpoint=args.sorting_contexts,
     )

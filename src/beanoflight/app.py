@@ -36,7 +36,7 @@ from .detection import (
 from .display import draw_birth_margins, render_analysis, render_pipeline_stage
 from .inference_transport import DEFAULT_CROP_ENDPOINT
 from .models import FrameAnalysis, PipelineStage
-from .prediction import GateLayout
+from .nozzle_map import resolve_gate_layout
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
 from .registry_zmq import ZeroMQRegistryClient
 from .replay import (
@@ -274,6 +274,7 @@ class BeanoFlightApp(tk.Tk):
         homography_path: Path | None = None,
         hole_pitch_mm: float = 9.16,
         sorting_offset_mm: float = 30.0,
+        nozzle_map_path: Path | None = None,
         performance_mode: bool = False,
         sorting_context_endpoint: str = DEFAULT_SORTING_CONTEXT_ENDPOINT,
     ) -> None:
@@ -286,6 +287,8 @@ class BeanoFlightApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.hole_pitch_mm = hole_pitch_mm
         self.sorting_offset_mm = sorting_offset_mm
+        self.nozzle_map_path = nozzle_map_path
+        self.gate_layout = None
         self.explicit_homography = homography_path
         self.performance_mode = bool(performance_mode)
         self.sorting_context_endpoint = sorting_context_endpoint
@@ -315,6 +318,11 @@ class BeanoFlightApp(tk.Tk):
         self.status_var = tk.StringVar(value="Open a CamL recording to begin.")
         self.source_var = tk.StringVar(value="No recording loaded")
         self.calibration_var = tk.StringVar(value="No metric calibration")
+        self.layout_var = tk.StringVar(
+            value="Virtual layout"
+            if nozzle_map_path is None
+            else f"Nozzle map selected: {nozzle_map_path.name}"
+        )
         self.mode_var = tk.StringVar(
             value="Simulation" if self.performance_mode else "Review"
         )
@@ -343,9 +351,7 @@ class BeanoFlightApp(tk.Tk):
         self.emergency_microbatch_var = tk.BooleanVar(value=True)
         self.drop_stale_frames_var = tk.BooleanVar(value=True)
         self.maximum_frame_age_var = tk.StringVar(value="30")
-        self.background_frames_var = tk.StringVar(
-            value=DEFAULT_BACKGROUND_FRAMES_TEXT
-        )
+        self.background_frames_var = tk.StringVar(value=DEFAULT_BACKGROUND_FRAMES_TEXT)
         self.registry_endpoint_var = tk.StringVar(value=DEFAULT_COMMAND_ENDPOINT)
         self.inference_endpoint_var = tk.StringVar(value=DEFAULT_CROP_ENDPOINT)
 
@@ -397,6 +403,15 @@ class BeanoFlightApp(tk.Tk):
         )
         mode.pack(side=tk.LEFT, padx=(5, 12))
         mode.bind("<<ComboboxSelected>>", lambda _event: self._mode_changed())
+        layout_bar = ttk.Frame(self, padding=(10, 0))
+        layout_bar.pack(fill=tk.X)
+        ttk.Button(
+            layout_bar, text="Load nozzle map…", command=self.select_nozzle_map
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            layout_bar, text="Use virtual layout", command=self.use_virtual_layout
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Label(layout_bar, textvariable=self.layout_var).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="Analyse clip", command=self.analyse_clip).pack(
             side=tk.LEFT
         )
@@ -1016,16 +1031,103 @@ class BeanoFlightApp(tk.Tk):
                 image_size_px=(self.source.metadata.width, self.source.metadata.height),
                 hole_pitch_mm=self.hole_pitch_mm,
             )
-        except CalibrationError as exc:
+            layout = resolve_gate_layout(
+                calibration, self.nozzle_map_path, self.sorting_offset_mm
+            )
+        except (CalibrationError, ValueError) as exc:
             self.calibration = None
+            self.gate_layout = None
+            self.layout_var.set(f"Selected layout rejected; analysis disabled: {exc}")
             self.calibration_var.set(f"Metric calibration rejected: {exc}")
             messagebox.showwarning("Metric calibration", str(exc), parent=self)
             return
         self.calibration = calibration
-        self.calibration_var.set(
-            f"metric plane RMS {calibration.rms_error_mm:.3f} mm; "
-            f"sorting line y={calibration.sorting_line_y(self.sorting_offset_mm):.2f} mm"
+        self.gate_layout = layout
+        self._describe_layout()
+
+    def _describe_layout(self):
+        if self.gate_layout is not None:
+            layout = self.gate_layout
+            description = (
+                f"measured nozzle y={min(g.line_y_mm for g in layout.gates):.2f}–"
+                f"{max(g.line_y_mm for g in layout.gates):.2f} mm"
+                if layout.measured_gates
+                else f"virtual sorting line y={layout.line_y_mm:.2f} mm"
+            )
+            if self.calibration is not None:
+                self.calibration_var.set(
+                    f"metric plane RMS {self.calibration.rms_error_mm:.3f} mm; {description}"
+                )
+            self.layout_var.set(
+                f"Measured CamL nozzle map: {self.nozzle_map_path.name} · {len(self.gate_layout.gates)} nozzles"
+                if self.gate_layout.measured_gates
+                else "Virtual layout · uniform 5 mm zones · no measured nozzle positions"
+            )
+
+    def select_nozzle_map(self):
+        if self._worker is not None and self._worker.is_alive():
+            messagebox.showinfo(
+                "Nozzle layout",
+                "Stop the run and wait for it to finish before changing geometry.",
+                parent=self,
+            )
+            return
+        selected = filedialog.askopenfilename(
+            title="Load measured nozzle map", filetypes=(("Nozzle map", "*.json"),)
         )
+        if not selected:
+            return
+        try:
+            calibration = self.calibration
+            if calibration is None:
+                if self.source is None:
+                    raise ValueError(
+                        "Load a recording and its metric calibration first"
+                    )
+                path = self.explicit_homography or find_pinkplane_homography(
+                    self.source.path
+                )
+                if path is None:
+                    raise ValueError("Load the recording's metric calibration first")
+                calibration = MetricPlaneCalibration.from_pinkplane(
+                    path,
+                    image_size_px=(
+                        self.source.metadata.width,
+                        self.source.metadata.height,
+                    ),
+                    hole_pitch_mm=self.hole_pitch_mm,
+                )
+            layout = resolve_gate_layout(
+                calibration, Path(selected), self.sorting_offset_mm
+            )
+        except ValueError as exc:
+            messagebox.showerror("Nozzle map rejected", str(exc), parent=self)
+            return
+        self.nozzle_map_path, self.gate_layout = Path(selected), layout
+        self.calibration = calibration
+        self._describe_layout()
+        self._invalidate_run("Nozzle map changed; start a new analysis/run.")
+        self._refresh_display()
+
+    def use_virtual_layout(self):
+        if self._worker is not None and self._worker.is_alive():
+            messagebox.showinfo(
+                "Nozzle layout", "Stop the run before changing geometry.", parent=self
+            )
+            return
+        self.nozzle_map_path = None
+        self.gate_layout = None
+        self.layout_var.set(
+            "Virtual layout selected; load a recording and metric calibration"
+        )
+        if self.source is not None:
+            path = self.explicit_homography or find_pinkplane_homography(
+                self.source.path
+            )
+            if path is not None:
+                self._load_calibration(path)
+        self._describe_layout()
+        self._invalidate_run("Virtual layout selected explicitly; reanalyse the clip.")
 
     def apply_settings(self) -> None:
         try:
@@ -1237,6 +1339,7 @@ class BeanoFlightApp(tk.Tk):
         settings = self.detector_settings
         background = self.background.copy()
         calibration = self.calibration
+        layout = self.gate_layout
         source_path = self.source.path
         prefer_raw = self.source_prefer_raw
         generation = self._generation
@@ -1249,7 +1352,6 @@ class BeanoFlightApp(tk.Tk):
                 source = open_replay_source(
                     source_path, prefer_raw=prefer_raw, cache_frames=1
                 )
-                layout = GateLayout(calibration.sorting_line_y(self.sorting_offset_mm))
                 engine = AnalysisEngine(
                     calibration,
                     BeanDetector(settings),
@@ -1322,9 +1424,7 @@ class BeanoFlightApp(tk.Tk):
                 maximum_frames=int(self.maximum_frames_var.get()),
                 drop_stale_frames=self.drop_stale_frames_var.get(),
                 maximum_frame_age_ms=float(self.maximum_frame_age_var.get()),
-                emergency_microbatch_enabled=(
-                    self.emergency_microbatch_var.get()
-                ),
+                emergency_microbatch_enabled=(self.emergency_microbatch_var.get()),
             )
             replay_settings.validate()
         except ValueError as exc:
@@ -1356,6 +1456,7 @@ class BeanoFlightApp(tk.Tk):
         settings = self.detector_settings
         background = self.background.copy()
         calibration = self.calibration
+        layout = self.gate_layout
         source_path = self.source.path
         prefer_raw = self.source_prefer_raw
         generation = self._generation
@@ -1377,9 +1478,7 @@ class BeanoFlightApp(tk.Tk):
                     detector = RawGreenDetector(settings)
 
                     def positions_mapper(points):
-                        return calibration.pixels_to_mm(
-                            source.undistort_points(points)
-                        )
+                        return calibration.pixels_to_mm(source.undistort_points(points))
 
                     deferred_crop_extractor = source.prepare_crop
                     stereo_crop_extractor = None
@@ -1401,7 +1500,6 @@ class BeanoFlightApp(tk.Tk):
                     stereo_crop_extractor = None
                 registry = ZeroMQRegistryClient(registry_endpoint, timeout_ms=2_000)
                 registry.ping()
-                layout = GateLayout(calibration.sorting_line_y(self.sorting_offset_mm))
                 engine = AnalysisEngine(
                     calibration,
                     detector,
@@ -1528,7 +1626,7 @@ class BeanoFlightApp(tk.Tk):
         if self.source is None or self.background is None:
             messagebox.showinfo("Analysis", "Open a recording first.", parent=self)
             return False
-        if self.calibration is None:
+        if self.calibration is None or self.gate_layout is None:
             messagebox.showinfo(
                 "Analysis",
                 "Load the recording's PinkPlane v2 homography first.",
@@ -1599,9 +1697,7 @@ class BeanoFlightApp(tk.Tk):
                 self.current_index = analysis.frame_index
                 self.frame_var.set(self.current_index)
                 if self.calibration is not None:
-                    layout = GateLayout(
-                        self.calibration.sorting_line_y(self.sorting_offset_mm)
-                    )
+                    layout = self.gate_layout
                     self.image_pane.set_bgr(
                         render_analysis(
                             frame,
@@ -1734,7 +1830,7 @@ class BeanoFlightApp(tk.Tk):
             and self.calibration is not None
         ):
             analysis = self.run.frames[self.current_index]
-            layout = GateLayout(self.calibration.sorting_line_y(self.sorting_offset_mm))
+            layout = self.gate_layout
             self.image_pane.set_bgr(
                 render_analysis(
                     frame,
@@ -1798,7 +1894,7 @@ class BeanoFlightApp(tk.Tk):
                 gate, probability, eta = (
                     best.gate.label,
                     f"{best.probability:.0%}",
-                    f"{prediction.seconds_until_crossing * 1000:.0f}ms",
+                    f"{(best.seconds_until_crossing if best.seconds_until_crossing is not None else prediction.seconds_until_crossing) * 1000:.0f}ms",
                 )
             else:
                 gate = probability = eta = "—"

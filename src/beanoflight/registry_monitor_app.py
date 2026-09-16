@@ -14,22 +14,26 @@ from .registry_monitor import RegistryMonitorSnapshot, RegistryMonitorWorker
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
 
 
-def _gate_labels(indices: tuple[int, ...]) -> str:
-    return ",".join("G0" if value == 0 else f"G{value:+d}" for value in indices)
+def _gate_labels(indices: tuple[int, ...], measured: bool = False) -> str:
+    return ",".join(
+        f"N{value}" if measured else "G0" if value == 0 else f"G{value:+d}"
+        for value in indices
+    )
 
 
 def actuation_display(record: BeanRecord) -> str:
     decision = record.decision
     result = record.actuation
+    measured = bool(getattr(decision, "nozzle_map_sha256", None))
     if result is not None:
         label = "OK" if result.success else "FAIL"
         gates = () if decision is None else decision.gate_indices
-        return f"{label} {_gate_labels(gates)}".strip()
+        return f"{label} {_gate_labels(gates, measured)}".strip()
     if decision is None:
         return "Awaiting"
     if not decision.gate_indices:
         return "Not required"
-    return f"Scheduled {_gate_labels(decision.gate_indices)}"
+    return f"Scheduled {_gate_labels(decision.gate_indices, measured)}"
 
 
 class RegistryMonitorApp(tk.Tk):

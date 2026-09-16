@@ -101,6 +101,27 @@
     ].join("");
     const complete = (counts.beans_without_samples || 0) === 0;
     document.getElementById("quality-banner").innerHTML = `<div class="notice ${complete ? "good" : "warn"}"><span class="notice-mark">${complete ? "✓" : "!"}</span><div><strong>${complete ? "Every confirmed bean has statistics" : "Some confirmed beans have no statistics"}</strong><span>${number.format(counts.beans_with_two_samples || 0)} have two samples; ${number.format(counts.beans_with_one_sample || 0)} use the explicit one-sample fallback; ${number.format(counts.beans_without_samples || 0)} have none.</span></div></div>`;
+    renderRateMetrics("summary-rate-metrics");
+  }
+
+  function renderRateMetrics(targetId) {
+    const runtime = summary.runtime || {};
+    const run = runtime.summary || {};
+    const outcome = runtime.outcome || {};
+    const timed = beans.map(bean => bean.time).filter(finite);
+    const trackSpan = timed.length > 1 ? Math.max(...timed) - Math.min(...timed) : null;
+    const usesRunDuration = finite(run.elapsed_seconds) && run.elapsed_seconds > 0;
+    const elapsed = usesRunDuration ? run.elapsed_seconds : trackSpan;
+    const durationLabel = usesRunDuration ? "full run seconds" : "tracked-bean span seconds";
+    const confirmedBeans = counts.confirmed_beans || beans.length;
+    const inferenceJobs = finite(outcome.jobs_completed) ? outcome.jobs_completed : null;
+    const measurements = finite(counts.derived_observations) ? counts.derived_observations : null;
+    const rate = value => finite(value) && finite(elapsed) && elapsed > 0 ? value / elapsed : null;
+    document.getElementById(targetId).innerHTML = [
+      metric("Confirmed beans / second", finite(rate(confirmedBeans)) ? `${fmt(rate(confirmedBeans), 3)} /s` : "—", `${number.format(confirmedBeans)} beans over ${fmt(elapsed)} ${durationLabel}`),
+      metric("Inferences / second", finite(rate(inferenceJobs)) ? `${fmt(rate(inferenceJobs), 3)} /s` : "—", inferenceJobs == null ? "No completed-inference counter attached" : `${number.format(inferenceJobs)} completed inference jobs over ${fmt(elapsed)} seconds`),
+      metric("Measurements / second", finite(rate(measurements)) ? `${fmt(rate(measurements), 3)} /s` : "—", measurements == null ? "No statistics-observation counter attached" : `${number.format(measurements)} retained statistical observations over ${fmt(elapsed)} seconds`),
+    ].join("");
   }
 
   function renderStereoMetrics() {
@@ -127,6 +148,7 @@
       metric("Enrichment fallbacks", number.format(counts.beans_with_enrichment_fallback || 0), "Beans with a geometry-only observation", counts.beans_with_enrichment_fallback ? "warn" : "good"),
     ];
     document.getElementById("health-metrics").innerHTML = health.join("");
+    renderRateMetrics("health-rate-metrics");
     const target = document.getElementById("runtime-content");
     if (!runtime) {
       target.innerHTML = '<div class="notice warn"><span class="notice-mark">i</span><div><strong>No performance report attached</strong><span>Measurement completeness is available, but frame-rate, deadline, thermal, and pipeline-pressure evidence was not supplied when this bundle was generated.</span></div></div>' + captureTable(sourceStats);

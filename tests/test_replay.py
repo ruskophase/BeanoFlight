@@ -4,11 +4,13 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 from beanoflight.crop import CropPayload
 from beanoflight.models import BeanRef, FrameAnalysis, TrackSnapshot, TrackStatus
+from beanoflight.prediction import GateLayout
 from beanoflight.registry_models import InferenceJob, InferenceStatus, RunState
 from beanoflight.replay import (
     MAXIMUM_REPLAY_FRAMES,
@@ -65,6 +67,8 @@ class FakeLiveSource(FakeSequentialSource):
 
 
 class FakeEngine:
+    gate_layout = GateLayout(70.0)
+
     def __init__(self):
         self.tracker = type("Tracker", (), {"run_id": "buffered-run"})()
         self.last_registry_revisions = {}
@@ -196,9 +200,7 @@ class ReplayBufferTests(unittest.TestCase):
                     ),
                 },
             )
-            payloads.append(
-                CropPayload(job, np.zeros((4, 4, 3), dtype=np.uint8))
-            )
+            payloads.append(CropPayload(job, np.zeros((4, 4, 3), dtype=np.uint8)))
 
         groups = _emergency_microbatch_groups(
             tuple(payloads),
@@ -209,9 +211,7 @@ class ReplayBufferTests(unittest.TestCase):
         )
 
         self.assertEqual(tuple(len(group) for group in groups), (2, 3))
-        self.assertEqual(
-            [item.job.bean_ref.sequence for item in groups[0]], [1, 2]
-        )
+        self.assertEqual([item.job.bean_ref.sequence for item in groups[0]], [1, 2])
         self.assertTrue(
             all(
                 item.job.timing_marks_ns["emergency_microbatch"] == 1
@@ -219,9 +219,7 @@ class ReplayBufferTests(unittest.TestCase):
             )
         )
         self.assertEqual(
-            groups[1][0].job.timing_marks_ns[
-                "emergency_microbatch_remainder"
-            ],
+            groups[1][0].job.timing_marks_ns["emergency_microbatch_remainder"],
             1,
         )
 
@@ -440,23 +438,27 @@ class ReplayBufferTests(unittest.TestCase):
     def test_live_runner_uses_capture_clock_without_replay_pacing(self):
         source = FakeLiveSource(frame_count=3)
         registry = FakeRegistry(source)
-        started = time.monotonic()
-        summary = ReplayRunner(
-            source,
-            FakeEngine(),
-            registry,
-            settings=ReplaySettings(
-                target_fps=60,
-                prebuffer_frames=0,
-                maximum_frames=3,
-            ),
-        ).run()
-
-        self.assertLess(time.monotonic() - started, 0.04)
+        cancellation = threading.Event()
+        # Check pacing directly: wall time also includes startup GC/telemetry
+        # and varies with unrelated tests and machine load.
+        with patch.object(cancellation, "wait", wraps=cancellation.wait) as wait:
+            summary = ReplayRunner(
+                source,
+                FakeEngine(),
+                registry,
+                settings=ReplaySettings(
+                    target_fps=60,
+                    prebuffer_frames=0,
+                    maximum_frames=3,
+                ),
+            ).run(stop=cancellation)
+        wait.assert_not_called()
         self.assertTrue(summary.clock_synchronized)
         self.assertEqual(summary.frames_processed, 3)
         running = next(
-            session for session in registry.sessions if session.state == RunState.RUNNING
+            session
+            for session in registry.sessions
+            if session.state == RunState.RUNNING
         )
         self.assertEqual(
             running.settings["clock_contract"]["version"], "fastcap-live-v1"
@@ -480,7 +482,9 @@ class ReplayBufferTests(unittest.TestCase):
         ).run()
 
         running = next(
-            session for session in registry.sessions if session.state == RunState.RUNNING
+            session
+            for session in registry.sessions
+            if session.state == RunState.RUNNING
         )
         self.assertTrue(summary.clock_synchronized)
         self.assertEqual(summary.clock_anchor_attempts, 1)
@@ -515,8 +519,7 @@ class ReplayBufferTests(unittest.TestCase):
         self.assertEqual(
             [int(item["first_frame_index"]) for item in summary.stale_skip_events],
             sorted(
-                int(item["first_frame_index"])
-                for item in summary.stale_skip_events
+                int(item["first_frame_index"]) for item in summary.stale_skip_events
             ),
         )
         self.assertGreater(summary.max_frame_age_ms, 0)

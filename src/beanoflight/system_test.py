@@ -25,7 +25,7 @@ from .detection import (
 )
 from .inference_transport import DEFAULT_CROP_ENDPOINT
 from .live_statistics import LiveStatisticsCollector, LiveStatisticsSettings
-from .prediction import GateLayout
+from .nozzle_map import resolve_gate_layout
 from .registry_service import DEFAULT_COMMAND_ENDPOINT
 from .registry_zmq import ZeroMQRegistryClient
 from .replay import (
@@ -62,6 +62,11 @@ def parser() -> argparse.ArgumentParser:
         help="3 human-confirmed empty zero-based frame indices",
     )
     result.add_argument("--homography", type=Path)
+    result.add_argument(
+        "--nozzle-map",
+        type=Path,
+        help="Measured nozzle map, shared by live and replay; otherwise virtual layout",
+    )
     input_mode = result.add_mutually_exclusive_group()
     input_mode.add_argument("--prefer-raw", action="store_true")
     input_mode.add_argument(
@@ -435,8 +440,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             detector,
             background,
             tracker_settings=TrackerSettings(),
-            gate_layout=GateLayout(
-                calibration.sorting_line_y(arguments.sorting_offset_mm)
+            gate_layout=resolve_gate_layout(
+                calibration, arguments.nozzle_map, arguments.sorting_offset_mm
             ),
             registry=registry,
             positions_mapper=(

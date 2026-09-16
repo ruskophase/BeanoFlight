@@ -15,7 +15,9 @@ from .calibration import MetricPlaneCalibration
 from .detection import BeanDetector
 from .events import EventBus
 from .models import AnalysisTimings, BeanRef, FrameAnalysis, Observation
+from .nozzle_map import resolve_gate_layout
 from .prediction import GateLayout, TrajectoryPredictor
+from .registry_models import prediction_to_dict
 from .source import RecordingVideoSource
 from .tracking import TrackerSettings, TrackManager
 
@@ -39,6 +41,7 @@ class AnalysisRun:
     background: BackgroundProvenance = field(
         default_factory=lambda: BackgroundProvenance("unspecified", ())
     )
+    nozzle_layout: dict = field(default_factory=dict)
 
     @property
     def mean_processing_ms(self) -> float:
@@ -63,6 +66,7 @@ class AnalysisEngine:
         *,
         tracker_settings: TrackerSettings | None = None,
         gate_layout: GateLayout | None = None,
+        nozzle_map_path: Path | None = None,
         events: EventBus | None = None,
         registry: RegistryWriter | None = None,
         position_mapper: PositionMapper | None = None,
@@ -72,7 +76,13 @@ class AnalysisEngine:
         self.detector = detector
         self.background_bgr = background_bgr
         self.tracker_settings = tracker_settings or TrackerSettings()
-        self.gate_layout = gate_layout or GateLayout(calibration.sorting_line_y())
+        if gate_layout is not None and nozzle_map_path is not None:
+            raise ValueError(
+                "Supply either a resolved layout or a nozzle map, not both"
+            )
+        self.gate_layout = gate_layout or resolve_gate_layout(
+            calibration, nozzle_map_path
+        )
         self.events = events
         self.registry = registry
         self.position_mapper = position_mapper or calibration.pixel_to_mm
@@ -221,6 +231,7 @@ def analyse_source(
         exact_timestamps=source.metadata.exact_timestamps,
         frames=tuple(frames),
         background=background_provenance or BackgroundProvenance("unspecified", ()),
+        nozzle_layout=engine.gate_layout.to_dict(),
     )
 
 
@@ -232,6 +243,7 @@ def export_run_json(run: AnalysisRun, path: Path) -> None:
         "run_id": run.run_id,
         "source_path": str(run.source_path),
         "exact_timestamps": run.exact_timestamps,
+        "nozzle_layout": run.nozzle_layout,
         "background": {
             "method": run.background.method,
             "frame_indices": list(run.background.frame_indices),
@@ -274,6 +286,7 @@ def _frame_json(frame: FrameAnalysis) -> dict[str, object]:
         "predictions": [
             {
                 "bean_id": str(prediction.bean_ref),
+                "prediction": prediction_to_dict(prediction),
                 "line_y_mm": prediction.line_y_mm,
                 "crossing_timestamp_ns": prediction.crossing_timestamp_ns,
                 "x_mean_mm": prediction.x_mean_mm,
