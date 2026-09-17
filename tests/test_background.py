@@ -7,13 +7,28 @@ import numpy as np
 
 from beanoflight.analysis import AnalysisRun, export_run_json
 from beanoflight.background import (
+    DEFAULT_BACKGROUND_FRAMES_TEXT,
     BackgroundProvenance,
+    parse_background_frame_indices,
     stratified_random_candidates,
 )
 from beanoflight.detection import temporal_median_background
 
 
 class BackgroundSelectionTests(unittest.TestCase):
+    def test_manual_background_default_and_recording_bounds(self):
+        self.assertEqual(DEFAULT_BACKGROUND_FRAMES_TEXT, "43,222,347")
+        self.assertEqual(
+            parse_background_frame_indices(
+                DEFAULT_BACKGROUND_FRAMES_TEXT,
+                frame_count=601,
+            ),
+            (43, 222, 347),
+        )
+        for invalid in ("43,222", "43,43,347", "43,-1,347", "43,222,601"):
+            with self.assertRaises(ValueError):
+                parse_background_frame_indices(invalid, frame_count=601)
+
     def test_first_candidate_pass_covers_even_temporal_strata(self):
         indices = stratified_random_candidates(1_100, 11, seed=12345)
         self.assertEqual(len(indices), 44)

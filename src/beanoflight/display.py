@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
+from itertools import pairwise
 
 import cv2
 import numpy as np
 
 from .calibration import CalibrationError, MetricPlaneCalibration
-from .models import CrossingPrediction, FrameAnalysis, PipelineStage, TrackSnapshot, TrackStatus
+from .models import (
+    CrossingPrediction,
+    FrameAnalysis,
+    PipelineStage,
+    TrackSnapshot,
+    TrackStatus,
+)
 from .prediction import GateLayout
-
 
 STATUS_COLOURS = {
     TrackStatus.TENTATIVE: (30, 200, 255),
@@ -33,7 +40,9 @@ def render_pipeline_stage(stage: PipelineStage) -> np.ndarray:
     panel_height = 16 + line_height * len(lines)
     panel_width = min(
         rendered.shape[1],
-        max(430, max((len(line) for line in lines), default=1) * round(font_scale * 14)),
+        max(
+            430, max((len(line) for line in lines), default=1) * round(font_scale * 14)
+        ),
     )
     overlay = rendered.copy()
     cv2.rectangle(overlay, (0, 0), (panel_width, panel_height), (5, 8, 12), -1)
@@ -65,19 +74,28 @@ def render_analysis(
     right_birth_margin_px: int = 0,
 ) -> np.ndarray:
     height, width = frame_bgr.shape[:2]
-    line_centre = calibration.mm_to_pixel((0.0, layout.line_y_mm))
-    output_height = max(height + 80, int(math.ceil(line_centre[1] + 80)))
+    line_centre = max(
+        (
+            calibration.mm_to_pixel(
+                (
+                    gate.centre_x_mm or 0.0,
+                    layout.line_y_mm if gate.line_y_mm is None else gate.line_y_mm,
+                )
+            )
+            for gate in layout.gates
+        ),
+        key=lambda p: p[1],
+    )
+    output_height = max(height + 80, math.ceil(line_centre[1] + 80))
     output_height = min(max(output_height, height), height * 2)
     rendered = np.full((output_height, width, 3), (13, 16, 20), dtype=np.uint8)
     rendered[:height] = frame_bgr
-    draw_birth_margins(
-        rendered[:height], left_birth_margin_px, right_birth_margin_px
-    )
+    draw_birth_margins(rendered[:height], left_birth_margin_px, right_birth_margin_px)
     if output_height > height:
         cv2.line(rendered, (0, height), (width - 1, height), (90, 100, 112), 1)
         cv2.putText(
             rendered,
-            "VIRTUAL REGION BELOW PHYSICAL FoV",
+            "PROJECTED REGION BELOW PHYSICAL FoV",
             (12, height + 24),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.52,
@@ -85,7 +103,9 @@ def render_analysis(
             1,
             cv2.LINE_AA,
         )
-    prediction_by_id = {prediction.bean_ref: prediction for prediction in analysis.predictions}
+    prediction_by_id = {
+        prediction.bean_ref: prediction for prediction in analysis.predictions
+    }
     _draw_gates(rendered, calibration, layout, tuple(analysis.predictions))
     assigned_centres = {
         track.history[-1].detection.centroid_px
@@ -99,7 +119,11 @@ def render_analysis(
         detection = rejection.observation.detection
         x, y, component_width, component_height = detection.bbox_px
         rejection_label = (
-            "EDGE-REJECTED" if "margin" in rejection.reason else "BIRTH-REJECTED"
+            "TOP-PENDING"
+            if rejection.reason.startswith("top entry pending")
+            else "EDGE-REJECTED"
+            if "margin" in rejection.reason
+            else "BIRTH-REJECTED"
         )
         cv2.rectangle(
             rendered,
@@ -113,7 +137,9 @@ def render_analysis(
             f"{rejection_label}: {rejection.reason.upper()}",
             (
                 x + 4,
-                y - 7 if y >= 45 else min(rendered.shape[0] - 10, y + component_height + 20),
+                y - 7
+                if y >= 45
+                else min(rendered.shape[0] - 10, y + component_height + 20),
             ),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.43,
@@ -186,9 +212,7 @@ def draw_birth_margins(
         cv2.rectangle(
             overlay, (boundary, 0), (width - 1, height - 1), (20, 35, 150), -1
         )
-        cv2.line(
-            image_bgr, (boundary, 0), (boundary, height - 1), (40, 70, 255), 2
-        )
+        cv2.line(image_bgr, (boundary, 0), (boundary, height - 1), (40, 70, 255), 2)
     cv2.addWeighted(overlay, 0.32, image_bgr, 0.68, 0.0, image_bgr)
     label_y = min(height - 8, 24)
     if left > 0:
@@ -227,6 +251,19 @@ def _draw_track(
     calibration: MetricPlaneCalibration,
     gravity: float,
 ) -> None:
+    if prediction is not None and prediction.nozzle_map_sha256:
+        future = [p for p in prediction.gates if p.crossing_timestamp_ns is not None]
+        if future:
+            best = max(future, key=lambda p: p.probability)
+            prediction = replace(
+                prediction,
+                line_y_mm=best.gate.line_y_mm,
+                crossing_timestamp_ns=best.crossing_timestamp_ns,
+                seconds_until_crossing=best.seconds_until_crossing,
+                x_mean_mm=best.x_mean_mm,
+                x_std_mm=best.x_std_mm,
+                time_std_ms=best.time_std_ms,
+            )
     colour = STATUS_COLOURS[track.status]
     x, y, width, height = track.last_bbox_px
     cv2.rectangle(image, (x, y), (x + width - 1, y + height - 1), colour, 2)
@@ -235,7 +272,9 @@ def _draw_track(
         for item in track.history
     ]
     if len(measured) >= 2:
-        cv2.polylines(image, [np.asarray(measured, np.int32)], False, colour, 2, cv2.LINE_AA)
+        cv2.polylines(
+            image, [np.asarray(measured, np.int32)], False, colour, 2, cv2.LINE_AA
+        )
     if measured:
         cv2.circle(image, measured[-1], 4, (30, 255, 255), -1, cv2.LINE_AA)
         cv2.putText(
@@ -305,14 +344,17 @@ def _draw_gates(
         for gate_index in prediction.selected_gate_indices
     }
     for gate in layout.gates:
-        left = calibration.mm_to_pixel((gate.left_mm, layout.line_y_mm))
-        right = calibration.mm_to_pixel((gate.right_mm, layout.line_y_mm))
+        gate_y = layout.line_y_mm if gate.line_y_mm is None else gate.line_y_mm
+        left = calibration.mm_to_pixel((gate.left_mm, gate_y))
+        right = calibration.mm_to_pixel((gate.right_mm, gate_y))
         y = round((left[1] + right[1]) * 0.5)
         x1, x2 = sorted((round(left[0]), round(right[0])))
         colour = (35, 95, 190) if gate.index in selected else (65, 72, 82)
         cv2.rectangle(image, (x1, y - 8), (x2, y + 8), colour, -1)
         cv2.rectangle(image, (x1, y - 8), (x2, y + 8), (180, 190, 205), 1)
-        if gate.index % 2 == 0 and 0 <= x1 < image.shape[1]:
+        if (
+            gate.nozzle_id is not None or gate.index % 2 == 0
+        ) and 0 <= x1 < image.shape[1]:
             cv2.putText(
                 image,
                 gate.label,
@@ -323,6 +365,8 @@ def _draw_gates(
                 1,
                 cv2.LINE_AA,
             )
+    if layout.measured_gates:
+        return
     line_left = calibration.mm_to_pixel((layout.gates[0].left_mm, layout.line_y_mm))
     line_right = calibration.mm_to_pixel((layout.gates[-1].right_mm, layout.line_y_mm))
     cv2.line(
@@ -338,6 +382,6 @@ def _draw_gates(
 def _draw_dashed_polyline(
     image: np.ndarray, points: list[tuple[int, int]], colour: tuple[int, int, int]
 ) -> None:
-    for index, (first, second) in enumerate(zip(points, points[1:])):
+    for index, (first, second) in enumerate(pairwise(points)):
         if index % 2 == 0:
             cv2.line(image, first, second, colour, 2, cv2.LINE_AA)

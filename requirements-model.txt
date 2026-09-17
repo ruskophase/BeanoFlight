@@ -1,0 +1,4 @@
+# Isolated timing-model training/export environment; not needed at runtime.
+torch==2.5.1
+torchvision==0.20.1
+onnx==1.17.0
