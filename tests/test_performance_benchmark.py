@@ -28,9 +28,7 @@ class PerformanceBenchmarkTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            def list_records_page(
-                self, *, run_id, after_sequence, limit
-            ):
+            def list_records_page(self, *, run_id, after_sequence, limit):
                 self.calls.append((run_id, after_sequence, limit))
                 return tuple(
                     record
@@ -84,6 +82,19 @@ class PerformanceBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(arguments.inference_backend, "mock")
         self.assertEqual(str(arguments.inference_engine), "/tmp/test.engine")
+
+    def test_measured_nozzle_map_can_be_selected(self):
+        options = [
+            "/recording",
+            "--background-frames",
+            "1,2,3",
+            "--nozzle-map",
+            "/map.json",
+        ]
+        benchmark = benchmark_parser().parse_args(options)
+        system_test = system_test_parser().parse_args(options)
+        self.assertEqual(str(benchmark.nozzle_map), "/map.json")
+        self.assertEqual(benchmark.nozzle_map, system_test.nozzle_map)
 
     def test_statistics_pressure_controls_are_shared_by_benchmark_and_runner(self):
         options = [
@@ -318,9 +329,9 @@ class PerformanceBenchmarkTests(unittest.TestCase):
         ]
 
         simulated = _scenario_summaries(runs, 60.0)["full"]
-        hardware = _scenario_summaries(
-            runs, 60.0, require_successful_actuations=True
-        )["full"]
+        hardware = _scenario_summaries(runs, 60.0, require_successful_actuations=True)[
+            "full"
+        ]
 
         self.assertTrue(simulated["passed"])
         self.assertFalse(hardware["all_outcomes_complete"])

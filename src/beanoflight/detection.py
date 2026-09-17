@@ -21,7 +21,7 @@ class DetectorSettings:
     processing_scale: float = 0.5
     blur_kernel: int = 5
     threshold: int = 22
-    close_kernel: int = 5
+    close_kernel: int = 3
     close_iterations: int = 1
     open_kernel: int = 3
     open_iterations: int = 1

@@ -20,6 +20,9 @@
   const counts = summary.counts || {};
   const distributions = summary.distributions || {};
   const dark = summary.dark_bean_screen || {};
+  const hasPhotos = payload.image_policy?.images_available === true;
+  const areaUnit = hasPhotos ? "mm²" : "px²";
+  const volumeUnit = hasPhotos ? "mm³" : "px³";
   const number = new Intl.NumberFormat("en-ZA");
   const decimal = new Intl.NumberFormat("en-ZA", { maximumFractionDigits: 2 });
   const chartState = new WeakMap();
@@ -100,7 +103,7 @@
       metric("Dark review set", number.format(candidates), `${pct(candidates, total)} at mean − 2 SD`),
     ].join("");
     const complete = (counts.beans_without_samples || 0) === 0;
-    document.getElementById("quality-banner").innerHTML = `<div class="notice ${complete ? "good" : "warn"}"><span class="notice-mark">${complete ? "✓" : "!"}</span><div><strong>${complete ? "Every confirmed bean has statistics" : "Some confirmed beans have no statistics"}</strong><span>${number.format(counts.beans_with_two_samples || 0)} have two samples; ${number.format(counts.beans_with_one_sample || 0)} use the explicit one-sample fallback; ${number.format(counts.beans_without_samples || 0)} have none.</span></div></div>`;
+    document.getElementById("quality-banner").innerHTML = `${payload.classification === "test" ? '<div class="notice warn"><span class="notice-mark">!</span><div><strong>Test recording only</strong><span>Calibration witness did not pass for this run. Review these measurements and photographs as exploratory evidence, not production validation.</span></div></div>' : ""}<div class="notice ${complete ? "good" : "warn"}"><span class="notice-mark">${complete ? "✓" : "!"}</span><div><strong>${complete ? "Every confirmed bean has statistics" : "Some confirmed beans have no statistics"}</strong><span>${number.format(counts.beans_with_two_samples || 0)} have two samples; ${number.format(counts.beans_with_one_sample || 0)} use the explicit one-sample fallback; ${number.format(counts.beans_without_samples || 0)} have none.</span></div></div>`;
     renderRateMetrics("summary-rate-metrics");
   }
 
@@ -151,7 +154,7 @@
     renderRateMetrics("health-rate-metrics");
     const target = document.getElementById("runtime-content");
     if (!runtime) {
-      target.innerHTML = '<div class="notice warn"><span class="notice-mark">i</span><div><strong>No performance report attached</strong><span>Measurement completeness is available, but frame-rate, deadline, thermal, and pipeline-pressure evidence was not supplied when this bundle was generated.</span></div></div>' + captureTable(sourceStats);
+      target.innerHTML = hasPhotos ? '<div class="notice warn"><span class="notice-mark">i</span><div><strong>Offline extraction only</strong><span>This bundle includes calibrated measurements from the recording, not a live pipeline acceptance report.</span></div></div>' + captureTable(sourceStats) : '<div class="notice warn"><span class="notice-mark">i</span><div><strong>No performance report attached</strong><span>Measurement completeness is available, but frame-rate, deadline, thermal, and pipeline-pressure evidence was not supplied when this bundle was generated.</span></div></div>' + captureTable(sourceStats);
       return;
     }
     const run = runtime.summary || {};
@@ -191,9 +194,9 @@
       lab: { title: "Lab a* × b* colour plane", eyebrow: "Appearance relationship", page: "appearance", explanation: "a* runs green to red and b* runs blue to yellow. Click the nearest bean or drag a rectangle to create a colour-region selection." },
       chroma: { title: "Approximate Lab chroma", eyebrow: "Colour intensity", page: "appearance", explanation: "Chroma measures distance from neutral grey in the a*/b* plane. Higher values represent a stronger colour cast." },
       outlier: { title: "Appearance outlier score", eyebrow: "Multivariate appearance", page: "appearance", explanation: "This robust score combines L*, a*, and b*. High values identify beans unlike the centre of this batch without assigning a defect class." },
-      volume: { title: "Equivalent-sphere volume proxy", eyebrow: "Relative projected size", page: "size", explanation: "The pixel³ proxy is derived from projected area. Selection tiles report both this volume proxy and projected area so the two quantities remain distinct." },
+      volume: { title: "Equivalent-sphere volume proxy", eyebrow: "Relative projected size", page: "size", explanation: `The ${volumeUnit} proxy is derived from projected area. Selection tiles report both this volume proxy and projected area so the two quantities remain distinct.` },
       area: { title: "Projected area proxy", eyebrow: "Projected footprint", page: "size", explanation: "This is the geometric mean of CamL and CamR areas where both are available, with an explicit one-view fallback." },
-      "area-scatter": { title: "CamL area × CamR area", eyebrow: "Two-view geometry", page: "size", explanation: "Paired selection tiles show CamL and CamR mean-colour swatches alongside their separate projected areas. These are numerical view summaries, not retained photographs." },
+      "area-scatter": { title: "CamL area × CamR area", eyebrow: "Two-view geometry", page: "size", explanation: hasPhotos ? "Paired selections show calibrated CamL/CamR photographs and small mean-colour swatches alongside each view's projected area." : "Paired selection tiles show CamL and CamR mean-colour swatches alongside their separate projected areas. These are numerical view summaries, not retained photographs." },
       "area-ratio": { title: "CamR / CamL area ratio", eyebrow: "Stereo geometry agreement", page: "stereo", explanation: "A ratio near 1 indicates similar silhouette area. Paired tiles expose each camera's measurements for human comparison." },
       "lightness-delta": { title: "CamR − CamL lightness", eyebrow: "Stereo colour agreement", page: "stereo", explanation: "A value near zero indicates similar reconstructed mean lightness. Paired CamL/CamR swatches and per-view Lab values make systematic and isolated differences reviewable." },
       throughput: { title: "Confirmed beans per second", eyebrow: "Batch delivery rate", page: "timeline", explanation: "Each bar represents one elapsed second. Selecting it identifies the exact bean tracks first observed in that interval." },
@@ -244,11 +247,11 @@
     } else if (standaloneChart === "outlier") {
       histogram(id, "outlier_score", { xLabel: "Robust appearance outlier score", colour: "#9d5b4a", bins: 72, chartId: "outlier" });
     } else if (standaloneChart === "volume") {
-      histogram(id, "volume_proxy", { xLabel: "Equivalent-sphere volume proxy (pixel³)", colour: "#32779a", bins: 72, chartId: "volume" });
+      histogram(id, "volume_proxy", { xLabel: `Equivalent-sphere volume proxy (${volumeUnit})`, colour: "#32779a", bins: 72, chartId: "volume" });
     } else if (standaloneChart === "area") {
-      histogram(id, "projected_area", { xLabel: "Projected area proxy (pixel²)", colour: "#5f8466", bins: 72, chartId: "area" });
+      histogram(id, "projected_area", { xLabel: `Projected area proxy (${areaUnit})`, colour: "#5f8466", bins: 72, chartId: "area" });
     } else if (standaloneChart === "area-scatter") {
-      scatter(id, "caml_area", "camr_area", { xLabel: "CamL projected area (pixel²)", yLabel: "CamR projected area (pixel²)", colour: "#315f82", diagonal: true, paired: true, radius: 2, chartId: "area-scatter" });
+      scatter(id, "caml_area", "camr_area", { xLabel: `CamL projected area (${areaUnit})`, yLabel: `CamR projected area (${areaUnit})`, colour: "#315f82", diagonal: true, paired: true, radius: 2, chartId: "area-scatter" });
     } else if (standaloneChart === "area-ratio") {
       histogram(id, "area_ratio", { xLabel: "CamR area / CamL area", colour: "#44835b", marker: { value: 1, label: "equal area" }, paired: true, bins: 72, chartId: "area-ratio" });
     } else if (standaloneChart === "lightness-delta") {
@@ -278,13 +281,13 @@
     requestAnimationFrame(() => {
       if (name === "overview") {
         histogram("overview-lightness", "lightness", { xLabel: "Approximate Lab L*", colour: "#b97937", interactive: true, bins: 36, chartId: "lightness" });
-        histogram("overview-size", "volume_proxy", { xLabel: "Volume proxy (pixel³)", colour: "#397c61", interactive: true, bins: 36, chartId: "volume" });
+        histogram("overview-size", "volume_proxy", { xLabel: `Volume proxy (${volumeUnit})`, colour: "#397c61", interactive: true, bins: 36, chartId: "volume" });
       } else if (name === "appearance") {
         renderAppearanceCharts();
       } else if (name === "size") {
-        histogram("volume-chart", "volume_proxy", { xLabel: "Equivalent-sphere volume proxy (pixel³)", colour: "#32779a", chartId: "volume" });
-        scatter("area-scatter", "caml_area", "camr_area", { xLabel: "CamL projected area (pixel²)", yLabel: "CamR projected area (pixel²)", colour: "#315f82", diagonal: true, paired: true, chartId: "area-scatter" });
-        histogram("area-chart", "projected_area", { xLabel: "Projected area proxy (pixel²)", colour: "#5f8466", chartId: "area" });
+        histogram("volume-chart", "volume_proxy", { xLabel: `Equivalent-sphere volume proxy (${volumeUnit})`, colour: "#32779a", chartId: "volume" });
+        scatter("area-scatter", "caml_area", "camr_area", { xLabel: `CamL projected area (${areaUnit})`, yLabel: `CamR projected area (${areaUnit})`, colour: "#315f82", diagonal: true, paired: true, chartId: "area-scatter" });
+        histogram("area-chart", "projected_area", { xLabel: `Projected area proxy (${areaUnit})`, colour: "#5f8466", chartId: "area" });
       } else if (name === "stereo") {
         histogram("ratio-chart", "area_ratio", { xLabel: "CamR area / CamL area", colour: "#44835b", marker: { value: 1, label: "equal area" }, paired: true, chartId: "area-ratio" });
         histogram("delta-chart", "lightness_delta", { xLabel: "CamR L* − CamL L*", colour: "#a15d83", marker: { value: 0, label: "equal lightness" }, paired: true, chartId: "lightness-delta" });
@@ -563,7 +566,7 @@
   function renderSelectionSummary(detailBean = null) {
     const target = document.getElementById("selection-summary");
     if (detailBean) {
-      target.innerHTML = `<strong>Bean ${escapeHtml(detailBean.sequence)} details</strong><br>Combined: L* ${fmt(detailBean.lightness)} · a* ${fmt(detailBean.lab_a)} · b* ${fmt(detailBean.lab_b)} · chroma ${fmt(detailBean.chroma)}<br>CamL: L* ${fmt(detailBean.caml_lightness)} · a* ${fmt(detailBean.caml_lab_a)} · b* ${fmt(detailBean.caml_lab_b)} · area ${fmt(detailBean.caml_area)} px²<br>CamR: L* ${fmt(detailBean.camr_lightness)} · a* ${fmt(detailBean.camr_lab_a)} · b* ${fmt(detailBean.camr_lab_b)} · area ${fmt(detailBean.camr_area)} px²<br>Volume proxy ${compact(detailBean.volume_proxy)} px³ · area ratio ${fmt(detailBean.area_ratio)} · L* Δ ${fmt(detailBean.lightness_delta)}<br>${detailBean.sample_count || 0} sample(s) · ${detailBean.measurement_views || 0} view(s) minimum${detailBean.sensor_edge ? " · sensor-edge flag" : ""}${detailBean.enrichment_fallback ? " · enrichment fallback" : ""}`;
+      target.innerHTML = `<strong>Bean ${escapeHtml(detailBean.sequence)} details</strong><br>Combined: L* ${fmt(detailBean.lightness)} · a* ${fmt(detailBean.lab_a)} · b* ${fmt(detailBean.lab_b)} · chroma ${fmt(detailBean.chroma)}<br>CamL: L* ${fmt(detailBean.caml_lightness)} · a* ${fmt(detailBean.caml_lab_a)} · b* ${fmt(detailBean.caml_lab_b)} · area ${fmt(detailBean.caml_area)} ${areaUnit}<br>CamR: L* ${fmt(detailBean.camr_lightness)} · a* ${fmt(detailBean.camr_lab_a)} · b* ${fmt(detailBean.camr_lab_b)} · area ${fmt(detailBean.camr_area)} ${areaUnit}<br>Volume proxy ${compact(detailBean.volume_proxy)} ${volumeUnit} · area ratio ${fmt(detailBean.area_ratio)} · L* Δ ${fmt(detailBean.lightness_delta)}<br>${detailBean.sample_count || 0} sample(s) · ${detailBean.measurement_views || 0} view(s) minimum${detailBean.sensor_edge ? " · sensor-edge flag" : ""}${detailBean.enrichment_fallback ? " · enrichment fallback" : ""}`;
       return;
     }
     target.textContent = selected.length ? `Mean L* ${fmt(mean(selected.map(bean => bean.lightness)))} · median volume proxy ${compact(quantile(selected.map(bean => bean.volume_proxy), .5))} · ${selected.filter(bean => bean.dark_2sd).length} original 2-SD dark candidates` : "No beans in this selection.";
@@ -690,10 +693,10 @@
   function renderBeanModal() {
     const bean = selected[modalBeanIndex];
     if (!bean) return;
-    const colourView = selectionContext.paired
+    const colourView = hasPhotos ? `<div class="modal-photo-pair"><figure><img src="${escapeHtml(bean.photo_CamL)}" alt="CamL calibrated crop of bean ${escapeHtml(bean.sequence)}"><figcaption>CamL <i style="background:${beanColour(bean, "caml")}"></i></figcaption></figure><figure><img src="${escapeHtml(bean.photo_CamR)}" alt="CamR calibrated crop of bean ${escapeHtml(bean.sequence)}"><figcaption>CamR <i style="background:${beanColour(bean, "camr")}"></i></figcaption></figure></div>` : selectionContext.paired
       ? `<div class="modal-view paired"><div class="modal-view-half" style="background:${beanColour(bean, "caml")}"><strong>CamL view</strong></div><div class="modal-view-half" style="background:${beanColour(bean, "camr")}"><strong>CamR view</strong></div></div>`
       : `<div class="modal-view" style="background:${beanColour(bean)}"></div>`;
-    document.getElementById("modal-content").innerHTML = `<div class="modal-heading"><p class="eyebrow">Numerical live evidence · ${escapeHtml(selectionContext.chart)}</p><h2 id="modal-bean-title">Bean #${escapeHtml(bean.sequence)}</h2><p>${escapeHtml(bean.bean_id)}</p></div>${colourView}<div class="modal-data"><div><strong>Combined Lab</strong><span>L* ${fmt(bean.lightness)} · a* ${fmt(bean.lab_a)} · b* ${fmt(bean.lab_b)} · C* ${fmt(bean.chroma)}</span></div><div><strong>CamL Lab</strong><span>L* ${fmt(bean.caml_lightness)} · a* ${fmt(bean.caml_lab_a)} · b* ${fmt(bean.caml_lab_b)} · C* ${fmt(bean.caml_chroma)}</span></div><div><strong>CamR Lab</strong><span>L* ${fmt(bean.camr_lightness)} · a* ${fmt(bean.camr_lab_a)} · b* ${fmt(bean.camr_lab_b)} · C* ${fmt(bean.camr_chroma)}</span></div><div><strong>Projected geometry</strong><span>Area ${fmt(bean.projected_area)} px² · volume ${compact(bean.volume_proxy)} px³</span></div><div><strong>Stereo agreement</strong><span>Area ratio ${fmt(bean.area_ratio)} · L* Δ ${fmt(bean.lightness_delta)}</span></div><div><strong>Capture quality</strong><span>${bean.sample_count || 0} sample(s) · ${bean.measurement_views || 0} view(s)${bean.sensor_edge ? " · sensor edge" : ""}${bean.enrichment_fallback ? " · fallback" : ""}</span></div></div>`;
+    document.getElementById("modal-content").innerHTML = `<div class="modal-heading"><p class="eyebrow">${hasPhotos ? "Calibrated paired photographs" : "Numerical live evidence"} · ${escapeHtml(selectionContext.chart)}</p><h2 id="modal-bean-title">Bean #${escapeHtml(bean.sequence)}</h2><p>${escapeHtml(bean.bean_id)}</p></div>${colourView}<div class="modal-data"><div><strong>Combined Lab</strong><span>L* ${fmt(bean.lightness)} · a* ${fmt(bean.lab_a)} · b* ${fmt(bean.lab_b)} · C* ${fmt(bean.chroma)}</span></div><div><strong>CamL Lab</strong><span>L* ${fmt(bean.caml_lightness)} · a* ${fmt(bean.caml_lab_a)} · b* ${fmt(bean.caml_lab_b)} · C* ${fmt(bean.caml_chroma)}</span></div><div><strong>CamR Lab</strong><span>L* ${fmt(bean.camr_lightness)} · a* ${fmt(bean.camr_lab_a)} · b* ${fmt(bean.camr_lab_b)} · C* ${fmt(bean.camr_chroma)}</span></div><div><strong>Projected geometry</strong><span>Area ${fmt(bean.projected_area)} ${areaUnit} · volume ${compact(bean.volume_proxy)} ${volumeUnit}</span></div><div><strong>Stereo agreement</strong><span>Area ratio ${fmt(bean.area_ratio)} · L* Δ ${fmt(bean.lightness_delta)}</span></div><div><strong>Capture quality</strong><span>${bean.sample_count || 0} sample(s) · ${bean.measurement_views || 0} view(s)${bean.sensor_edge ? " · sensor edge" : ""}${bean.enrichment_fallback ? " · fallback" : ""}</span></div></div>`;
     document.getElementById("modal-prev").disabled = modalBeanIndex === 0;
     document.getElementById("modal-next").disabled = modalBeanIndex === selected.length - 1;
     updateModalReviewCheckbox(bean);
@@ -712,11 +715,11 @@
   }
   function galleryMetricLines(bean) {
     const metricName = selectionContext.metric;
-    if (metricName === "volume_proxy") return [`Volume ${compact(bean.volume_proxy)} px³`, `Projected area ${fmt(bean.projected_area)} px²`];
-    if (metricName === "projected_area") return [`Projected area ${fmt(bean.projected_area)} px²`, `Volume ${compact(bean.volume_proxy)} px³`];
-    if (metricName === "area_ratio") return [`CamL ${fmt(bean.caml_area)} · CamR ${fmt(bean.camr_area)} px²`, `Area ratio ${fmt(bean.area_ratio)}`];
+    if (metricName === "volume_proxy") return [`Volume ${compact(bean.volume_proxy)} ${volumeUnit}`, `Projected area ${fmt(bean.projected_area)} ${areaUnit}`];
+    if (metricName === "projected_area") return [`Projected area ${fmt(bean.projected_area)} ${areaUnit}`, `Volume ${compact(bean.volume_proxy)} ${volumeUnit}`];
+    if (metricName === "area_ratio") return [`CamL ${fmt(bean.caml_area)} · CamR ${fmt(bean.camr_area)} ${areaUnit}`, `Area ratio ${fmt(bean.area_ratio)}`];
     if (metricName === "lightness_delta") return [`CamL L* ${fmt(bean.caml_lightness)} · CamR L* ${fmt(bean.camr_lightness)}`, `Lightness Δ ${fmt(bean.lightness_delta)}`];
-    if (metricName === "caml_area,camr_area") return [`CamL ${fmt(bean.caml_area)} · CamR ${fmt(bean.camr_area)} px²`, `Ratio ${fmt(bean.area_ratio)} · volume ${compact(bean.volume_proxy)}`];
+    if (metricName === "caml_area,camr_area") return [`CamL ${fmt(bean.caml_area)} · CamR ${fmt(bean.camr_area)} ${areaUnit}`, `Ratio ${fmt(bean.area_ratio)} · volume ${compact(bean.volume_proxy)}`];
     if (metricName === "time") return [`Elapsed ${fmt(bean.time)} s · frame ${bean.first_frame ?? "—"}`, `L* ${fmt(bean.lightness)} · volume ${compact(bean.volume_proxy)}`];
     if (metricName === "time,lightness") return [`Elapsed ${fmt(bean.time)} s`, `L* ${fmt(bean.lightness)}`];
     if (metricName === "chroma") return [`Chroma ${fmt(bean.chroma)}`, `L* ${fmt(bean.lightness)} · a* ${fmt(bean.lab_a)} · b* ${fmt(bean.lab_b)}`];
@@ -724,6 +727,7 @@
     return [`L* ${fmt(bean.lightness)} · a* ${fmt(bean.lab_a)} · b* ${fmt(bean.lab_b)}`, `${bean.sample_count || 0} sample${bean.sample_count === 1 ? "" : "s"}${bean.dark_2sd ? " · dark screen" : ""}`];
   }
   function selectionSwatch(bean) {
+    if (hasPhotos) return `<div class="photo-pair"><div><img loading="lazy" src="${escapeHtml(bean.photo_CamL)}" alt="CamL bean ${escapeHtml(bean.sequence)}"><span>CamL</span></div><div><img loading="lazy" src="${escapeHtml(bean.photo_CamR)}" alt="CamR bean ${escapeHtml(bean.sequence)}"><span>CamR</span></div></div><div class="mini-swatches"><i style="background:${beanColour(bean, "caml")}"></i><i style="background:${beanColour(bean, "camr")}"></i></div>`;
     if (!selectionContext.paired) return `<div class="swatch" style="background:${beanColour(bean)}"></div>`;
     return `<div class="paired-swatches"><div class="paired-swatch" style="background:${beanColour(bean, "caml")}"><span>CamL</span></div><div class="paired-swatch" style="background:${beanColour(bean, "camr")}"><span>CamR</span></div></div>`;
   }
@@ -806,7 +810,8 @@
     const visible = chosen.slice(0, 250);
     document.getElementById("collection-list").innerHTML = visible.map(bean => {
       const sources = collection.entries[bean.bean_id]?.sources || [];
-      return `<div class="collection-row"><div class="collection-swatch" style="background:${beanColour(bean)}"></div><div><strong>#${escapeHtml(bean.sequence)} · ${escapeHtml(bean.bean_id)}</strong><span>${escapeHtml(sources.join(" · "))}</span></div><button class="remove-cart-item" data-remove-bean="${escapeHtml(bean.bean_id)}" aria-label="Remove bean ${escapeHtml(bean.sequence)}">×</button></div>`;
+      const preview = hasPhotos ? `<div class="collection-photos"><img src="${escapeHtml(bean.photo_CamL)}" alt="CamL"><img src="${escapeHtml(bean.photo_CamR)}" alt="CamR"><i style="background:${beanColour(bean)}"></i></div>` : `<div class="collection-swatch" style="background:${beanColour(bean)}"></div>`;
+      return `<div class="collection-row">${preview}<div><strong>#${escapeHtml(bean.sequence)} · ${escapeHtml(bean.bean_id)}</strong><span>${escapeHtml(sources.join(" · "))}</span></div><button class="remove-cart-item" data-remove-bean="${escapeHtml(bean.bean_id)}" aria-label="Remove bean ${escapeHtml(bean.sequence)}">×</button></div>`;
     }).join("") + (chosen.length > visible.length ? `<div class="collection-more">${number.format(chosen.length - visible.length)} additional beans are included in exports.</div>` : "");
     document.querySelectorAll("[data-remove-bean]").forEach(button => button.addEventListener("click", () => {
       delete collection.entries[button.dataset.removeBean];

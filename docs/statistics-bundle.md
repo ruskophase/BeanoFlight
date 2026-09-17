@@ -20,6 +20,62 @@ Multiple recording paths may be supplied. The command writes one atomic,
 self-contained directory per recording. Existing bundles are protected unless
 `--overwrite` is explicit.
 
+Add `--save-bean-photos` to retain a calibrated CamL/CamR JPEG pair for each
+successfully sampled, confirmed bean. The representative sample prefers the
+middle field-of-view band. `beans.csv` and `beans.jsonl` link to the photographs;
+`photos/index.json` records their bean IDs, sample indices and exact source
+frame indices/timestamps. The bundle manifest hashes the photographs too.
+Open `dashboard/index.html` for the full interactive statistics dashboard:
+appearance, size/volume, stereo agreement, batch timeline and capture health.
+Every chart selection opens bean tiles with both calibrated photographs and
+small CamL/CamR mean-colour swatches. The enlarged view and review collection
+allow selected pairs to be inspected and exported with their measurements and
+photo paths. It works directly from disk without a web server or network
+connection, and uses the offline bundle's own bean IDs rather than attempting
+to match a separate replay run.
+This is offline export from RAW, not extra disk I/O on the live sorting path.
+Beans with no valid sample have no fabricated photo. JPEGs are review images;
+numerical statistics are computed from the calibrated arrays before encoding.
+
+For an older photo-bearing bundle that lacks this dashboard, run
+`beano-statistics-dashboard /path/to/statistics-bundle`. This installs or
+upgrades the dashboard assets and refreshes the existing bundle manifest; it does not
+reprocess RAW frames or replace the measurements or photographs.
+
+## Neighbouring-bean segmentation diagnostics
+
+Run `beano-segmentation-study /path/to/recording` to replay the statistics
+observations for beans #120, #1197, #1403 and #1550, a deterministic set of
+measurement outliers and ordinary controls. It compares blur, threshold and
+closing settings against the original RAW masks, saves per-view photo/mask
+montages and writes an aggregate report under
+`postprocess/segmentation-study-v2/`. It does not change the source recording,
+statistics bundle or live detector. Existing study outputs are protected.
+
+The report distinguishes *separating two shapes* from knowing which separated
+shape belongs to a tracked bean. No setting should be promoted solely because
+it reduces apparent size outliers; identity, control-bean stability and
+cross-frame/cross-camera consistency require separate validation. Actual
+occlusion remains an unresolved case rather than an assumed successful split.
+The production and offline detector closing-kernel default is now 3×3, following
+review of the thirteen additional tracks in the 2026-09-16 recording. To
+compare against the previous behavior, use `--detector-close-kernel 5` and a
+separate `--output-root`; the manifest records the chosen kernel.
+Use `beano-segmentation-compare /path/to/original-bundle
+/path/to/close3-bundle /path/to/new-comparison-dir` to compare complete
+replays without equating split tracks to original bean IDs.
+Use `beano-segmentation-review /path/to/original-bundle
+/path/to/close3-bundle /path/to/new-review-dir` to export the experimental
+tracks left unmatched by a one-to-one temporal/position match as paired
+CamL/CamR photographs. The HTML gallery and CSV/JSON indices include source
+frame IDs and nearby original tracks. These are candidates for human review,
+not confirmed newly detected physical beans.
+`beano-segmentation-synthetic /path/to/recording` adds a known-answer stress
+test: isolated recorded RAW silhouettes are composited at controlled,
+non-overlapping gaps onto the recorded empty background. The synthetic score
+tests separation and mask overlap; it cannot validate natural occlusion or
+track identity by itself.
+
 ## Contents
 
 - `beans.csv` and `beans.jsonl` contain robust per-track medians, track/sample

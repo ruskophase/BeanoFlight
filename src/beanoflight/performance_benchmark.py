@@ -55,6 +55,11 @@ def parser() -> argparse.ArgumentParser:
         help="3 human-confirmed empty zero-based frame indices",
     )
     result.add_argument(
+        "--nozzle-map",
+        type=Path,
+        help="measured PinkPlane nozzle layout shared with live and replay",
+    )
+    result.add_argument(
         "--live",
         action="store_true",
         help="benchmark real synchronized camera frames without recording",
@@ -147,9 +152,7 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--statistics-queue-capacity", type=int, default=24)
     result.add_argument("--statistics-primary-reserve", type=int, default=8)
-    result.add_argument(
-        "--statistics-workers", type=int, choices=(1, 2), default=1
-    )
+    result.add_argument("--statistics-workers", type=int, choices=(1, 2), default=1)
     result.add_argument("--statistics-start-budget-ms", type=float, default=10.0)
     result.add_argument("--database", type=Path)
     result.add_argument("--output", type=Path)
@@ -246,7 +249,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.prebuffer_frames:
             raise SystemExit("live validation requires --prebuffer-frames 0")
         if arguments.target_fps <= 0 or arguments.background_samples < 3:
-            raise SystemExit("live FPS must be positive and background samples at least 3")
+            raise SystemExit(
+                "live FPS must be positive and background samples at least 3"
+            )
         if arguments.bean_start_delay < 0 or arguments.pair_threshold_us < 0:
             raise SystemExit("live timing values cannot be negative")
         from .live_source import resolve_live_calibration_pack
@@ -376,9 +381,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             interval_seconds=arguments.telemetry_interval_seconds,
             watched_pids=watched_pids,
             maximum_temperature_c=(
-                arguments.maximum_temperature_c
-                if arguments.endurance_minutes
-                else None
+                arguments.maximum_temperature_c if arguments.endurance_minutes else None
             ),
         )
         telemetry.start()
@@ -394,7 +397,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         for scenario in arguments.scenarios:
             repeat = 0
             while not stop_runs and (
-                (endurance_deadline is not None and time.monotonic() < endurance_deadline)
+                (
+                    endurance_deadline is not None
+                    and time.monotonic() < endurance_deadline
+                )
                 or (endurance_deadline is None and repeat < arguments.repeats)
             ):
                 repeat += 1
@@ -485,17 +491,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         if acceptance is not None and thermal_abort_detail:
             acceptance["checks"]["thermal_limit_not_reached"] = False
             acceptance["passed"] = False
+        recording_metadata = (
+            json.loads(
+                (arguments.recording / "recording.json").read_text(encoding="utf-8")
+            )
+            if arguments.recording is not None
+            and (arguments.recording / "recording.json").is_file()
+            else {}
+        )
+        test_override = bool(
+            arguments.live_test_override
+            or recording_metadata.get("test_override", False)
+        )
         report = {
             "schema": "beanoflight-performance-benchmark/v3",
             "recording": (
-                None if arguments.recording is None else str(arguments.recording.resolve())
+                None
+                if arguments.recording is None
+                else str(arguments.recording.resolve())
             ),
             "live_camera_input": arguments.live,
-            "classification": (
-                "test" if arguments.live_test_override else "production"
+            "classification": "test"
+            if test_override
+            else recording_metadata.get("classification", "production"),
+            "test_override": test_override,
+            "production_valid": (
+                not test_override and recording_metadata.get("production_valid", True)
             ),
-            "test_override": arguments.live_test_override,
-            "production_valid": not arguments.live_test_override,
+            "nozzle_map": (
+                None
+                if arguments.nozzle_map is None
+                else str(arguments.nozzle_map.resolve())
+            ),
             "calibration_pack": (
                 None
                 if arguments.calibration_pack is None
@@ -526,9 +553,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if arguments.statistics_output_root is None
                     else str(arguments.statistics_output_root.resolve())
                 ),
-                "zero_sample_fallback_crop_size_px": (
-                    arguments.statistics_crop_size
-                ),
+                "zero_sample_fallback_crop_size_px": (arguments.statistics_crop_size),
                 "queue_capacity": arguments.statistics_queue_capacity,
                 "primary_queue_reserve": arguments.statistics_primary_reserve,
                 "worker_count": arguments.statistics_workers,
@@ -562,8 +587,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(encoded, end="")
         if acceptance is not None:
             print(
-                "Soak acceptance: "
-                + ("PASS" if acceptance["passed"] else "FAIL"),
+                "Soak acceptance: " + ("PASS" if acceptance["passed"] else "FAIL"),
                 flush=True,
             )
         if thermal_abort_detail:
@@ -760,6 +784,8 @@ def _run_replay(
                 "--optimized-raw",
             )
         )
+    if arguments.nozzle_map is not None:
+        command.extend(("--nozzle-map", str(arguments.nozzle_map)))
     if scenario == "core":
         command.append("--no-crops")
     if arguments.no_adaptive_edge_resize:
@@ -834,9 +860,7 @@ def _run_replay(
     stdout = "".join(stdout_lines)
     stderr = "".join(stderr_lines)
     if replay.returncode:
-        raise RuntimeError(
-            f"{scenario} replay failed ({replay.returncode}): {stderr}"
-        )
+        raise RuntimeError(f"{scenario} replay failed ({replay.returncode}): {stderr}")
     marker = stdout.rfind("\n{")
     if marker < 0:
         raise RuntimeError(f"{scenario} replay did not return a JSON summary")
@@ -1005,9 +1029,7 @@ def _wait_for_outcome(
         ),
         "stereo_pairing": {
             "maximum_synchronization_delta_ns": max(sync_deltas_ns, default=0),
-            "refinement_distance_px": summarize_samples(
-                refinement_distances_px
-            ),
+            "refinement_distance_px": summarize_samples(refinement_distances_px),
         },
         "classification_pooled": len(pooled),
         "classification_decision_bases": len(decision_bases),
@@ -1181,9 +1203,7 @@ def _clock_consistency(records, session) -> dict[str, object]:
                 if int(actual.get(key, -1)) != value
             }
             if not expected:
-                differences["run_clock_epoch"] = int(
-                    actual.get("run_clock_epoch", -1)
-                )
+                differences["run_clock_epoch"] = int(actual.get("run_clock_epoch", -1))
             if differences and len(job_mismatches) < 20:
                 job_mismatches.append(
                     {
@@ -1201,9 +1221,7 @@ def _clock_consistency(records, session) -> dict[str, object]:
                 if int(actual.get(key, -1)) != value
             }
             if not expected:
-                differences["run_clock_epoch"] = int(
-                    actual.get("run_clock_epoch", -1)
-                )
+                differences["run_clock_epoch"] = int(actual.get("run_clock_epoch", -1))
             if differences and len(decision_mismatches) < 20:
                 decision_mismatches.append(
                     {
@@ -1222,9 +1240,9 @@ def _clock_consistency(records, session) -> dict[str, object]:
             )
             actual_epoch = int(inference.get("clock_epoch", -1))
             consistent = bool(inference.get("clock_consistent", False))
-            if (
-                actual_epoch not in contracts or not consistent
-            ) and len(evidence_mismatches) < 20:
+            if (actual_epoch not in contracts or not consistent) and len(
+                evidence_mismatches
+            ) < 20:
                 evidence_mismatches.append(
                     {
                         "result_id": enrichment.result_id,
@@ -1289,10 +1307,13 @@ def _identity_continuity(records) -> dict[str, object]:
             if x_residual > 4.0 or y_residual > 10.0:
                 continue
             if earlier.prediction is not None and later.prediction is not None:
-                crossing_delta_ms = abs(
-                    earlier.prediction.crossing_timestamp_ns
-                    - later.prediction.crossing_timestamp_ns
-                ) / 1_000_000.0
+                crossing_delta_ms = (
+                    abs(
+                        earlier.prediction.crossing_timestamp_ns
+                        - later.prediction.crossing_timestamp_ns
+                    )
+                    / 1_000_000.0
+                )
                 if crossing_delta_ms > 30.0:
                     continue
             else:
@@ -1351,12 +1372,10 @@ def _soak_acceptance(
             for run in selected
         ),
         "zero_skipped_frames": all(
-            int(run["summary"].get("frames_skipped", 0)) == 0
-            for run in selected
+            int(run["summary"].get("frames_skipped", 0)) == 0 for run in selected
         ),
         "zero_missed_frame_deadlines": all(
-            int(run["summary"].get("missed_deadlines", 0)) == 0
-            for run in selected
+            int(run["summary"].get("missed_deadlines", 0)) == 0 for run in selected
         ),
         "zero_crop_or_job_drops": all(
             int(run["summary"].get("crops_dropped", 0)) == 0
@@ -1388,11 +1407,7 @@ def _soak_acceptance(
             for run in selected
         ),
         "zero_late_decisions": all(
-            int(
-                run["outcome"]["timing_ledger"]
-                .get("results", {})
-                .get("too_late", 0)
-            )
+            int(run["outcome"]["timing_ledger"].get("results", {}).get("too_late", 0))
             == 0
             for run in selected
         ),
@@ -1409,24 +1424,17 @@ def _soak_acceptance(
         "expected_bean_count": expected_beans is None
         or all(value == expected_beans for value in bean_counts),
         "minimum_evidence_met": bool(per_run_minimum_samples)
-        and all(
-            value >= minimum_samples_per_bean
-            for value in per_run_minimum_samples
-        ),
+        and all(value >= minimum_samples_per_bean for value in per_run_minimum_samples),
         "three_sample_rate_met": bool(per_run_three_sample_rates)
         and all(
-            value >= minimum_three_sample_rate
-            for value in per_run_three_sample_rates
+            value >= minimum_three_sample_rate for value in per_run_three_sample_rates
         ),
         "clock_start_synchronized": all(
-            bool(run["summary"].get("clock_synchronized", False))
-            for run in selected
+            bool(run["summary"].get("clock_synchronized", False)) for run in selected
         ),
         "clock_propagation_consistent": all(
             bool(
-                run["outcome"]
-                .get("clock_consistency", {})
-                .get("all_consistent", False)
+                run["outcome"].get("clock_consistency", {}).get("all_consistent", False)
             )
             for run in selected
         ),
@@ -1455,8 +1463,7 @@ def _soak_acceptance(
                 for run in selected
             ],
             "clock_anchor_misses": [
-                int(run["summary"].get("clock_anchor_misses", 0))
-                for run in selected
+                int(run["summary"].get("clock_anchor_misses", 0)) for run in selected
             ],
             "registry_transport_retries": [
                 int(run["outcome"].get("registry_transport_retries", 0))
@@ -1508,9 +1515,7 @@ def _scenario_summaries(
             )
             for run in selected
         )
-        statistics_complete = all(
-            _statistics_capture_complete(run) for run in selected
-        )
+        statistics_complete = all(_statistics_capture_complete(run) for run in selected)
         scenarios[scenario] = {
             "fps": summarize_samples(fps),
             "source_timeline_fps": summarize_samples(timeline_fps),

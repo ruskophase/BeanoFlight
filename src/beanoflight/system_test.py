@@ -273,6 +273,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     if arguments.live_test_override and not arguments.live:
         raise SystemExit("--live-test-override requires --live")
+    recording_metadata = {}
+    if arguments.recording is not None:
+        metadata_path = arguments.recording / "recording.json"
+        if metadata_path.is_file():
+            recording_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    test_material = bool(
+        arguments.live_test_override
+        or recording_metadata.get("test_override")
+        or recording_metadata.get("classification") == "test"
+    )
     if arguments.live:
         if arguments.recording is not None:
             raise SystemExit("recording must be omitted with --live")
@@ -464,13 +474,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                 output_root / f"{stamp}-{engine.tracker.run_id[:8]}",
                 settings=statistics_settings,
                 provenance={
-                    "classification": (
-                        "test" if arguments.live_test_override else "production"
-                    ),
+                    "classification": "test" if test_material else "production",
+                    "source_test_override": test_material,
                     "live_test_override": arguments.live_test_override,
                     "source_path": str(source.path),
                     "source_kind": source.source_kind,
-                    "calibration_or_recording": str(source.path),
+                    "calibration_or_recording": str(
+                        arguments.recording / "calibration"
+                        if arguments.recording is not None
+                        and (arguments.recording / "calibration").is_dir()
+                        else source.path
+                    ),
                     "homography": str(calibration_path),
                     "metric_plane": calibration.to_json(),
                     "background": {
@@ -528,9 +542,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "name": "headless-system-test",
                 "optimized_raw": arguments.optimized_raw or arguments.live,
                 "live_camera_input": arguments.live,
-                "classification": (
-                    "test" if arguments.live_test_override else "production"
-                ),
+                "classification": "test" if test_material else "production",
+                "source_test_override": test_material,
                 "live_test_override": arguments.live_test_override,
                 "crops_enabled": not arguments.no_crops,
                 "stereo_crops": stereo_crop_extractor is not None,

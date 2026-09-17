@@ -5,13 +5,15 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-
 from beanoflight.detection import DetectorSettings
+from beanoflight.models import BeanRef
 from beanoflight.statistics_bundle import (
     BundleSettings,
     _paired_features,
     _per_frame_workload,
+    _photo_jpeg,
     _score_appearance_outliers,
+    _write_bean_photos,
     _write_charts,
 )
 from beanoflight.statistics_features import (
@@ -23,6 +25,36 @@ from beanoflight.statistics_features import (
 
 
 class StatisticsFeatureTests(unittest.TestCase):
+    def test_default_closing_kernel_matches_live_detector(self):
+        self.assertEqual(BundleSettings().detector_close_kernel, 3)
+        self.assertEqual(DetectorSettings().close_kernel, 3)
+
+    def test_per_bean_photos_are_linked_and_tentative_photos_excluded(self):
+        import json
+
+        ref, tentative = BeanRef("photos", 1), BeanRef("photos", 2)
+        image = np.full((80, 80, 3), (40, 70, 110), dtype=np.uint8)
+        sample = {
+            "CamL": _photo_jpeg(image),
+            "CamR": _photo_jpeg(image),
+            "frame_index": 12,
+            "right_frame_index": 13,
+            "timestamp_ns": 99,
+            "sample_index": 2,
+        }
+        beans = [{"bean_id": str(ref)}, {"bean_id": "no-sample"}]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_bean_photos(root, beans, {ref: sample, tentative: sample})
+            self.assertEqual(len(list((root / "photos").glob("*.jpg"))), 2)
+            self.assertEqual(
+                cv2.imread(str(root / beans[0]["photo_CamL"])).shape, image.shape
+            )
+            self.assertNotIn("photo_CamL", beans[1])
+            index = json.loads((root / "photos/index.json").read_text())
+            self.assertEqual(index["photos"][0]["right_frame_index"], 13)
+            self.assertEqual(index["photos"][0]["bean_id"], str(ref))
+
     def test_foreground_component_is_aligned_to_native_crop(self):
         background = np.zeros((80, 100), dtype=np.uint8)
         current = background.copy()
@@ -59,9 +91,7 @@ class StatisticsFeatureTests(unittest.TestCase):
         mask = np.zeros((120, 120), dtype=np.uint8)
         cv2.ellipse(mask, (60, 60), (24, 14), 25, 0, 360, 255, -1)
         image[mask > 0] = (40, 120, 210)
-        measurement = extract_view_features(
-            image, mask, area_scale_mm2_per_px=0.01
-        )
+        measurement = extract_view_features(image, mask, area_scale_mm2_per_px=0.01)
 
         self.assertAlmostEqual(measurement.values["mean_b"], 40.0, delta=0.5)
         self.assertAlmostEqual(measurement.values["mean_g"], 120.0, delta=0.5)
@@ -93,8 +123,12 @@ class StatisticsFeatureTests(unittest.TestCase):
         right = dict(left)
         paired = _paired_features(left, right, 3.0)
 
-        self.assertAlmostEqual(paired["equivalent_sphere_volume_proxy_mm3"], 4.0 / 3.0 * math.pi * 8.0)
-        self.assertAlmostEqual(paired["rotational_ellipsoid_volume_proxy_mm3"], math.pi / 6.0 * 6.0 * 16.0)
+        self.assertAlmostEqual(
+            paired["equivalent_sphere_volume_proxy_mm3"], 4.0 / 3.0 * math.pi * 8.0
+        )
+        self.assertAlmostEqual(
+            paired["rotational_ellipsoid_volume_proxy_mm3"], math.pi / 6.0 * 6.0 * 16.0
+        )
         self.assertEqual(paired["projected_area_ratio_camr_to_caml"], 1.0)
 
 
@@ -104,6 +138,8 @@ class StatisticsBundleTests(unittest.TestCase):
             BundleSettings(crop_size_px=319).validate()
         with self.assertRaises(ValueError):
             BundleSettings(samples_per_bean=4).validate()
+        with self.assertRaises(ValueError):
+            BundleSettings(detector_close_kernel=4).validate()
 
     def test_outlier_score_ranks_distinct_appearance(self):
         beans = []

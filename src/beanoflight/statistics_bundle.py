@@ -38,6 +38,7 @@ from .statistics_features import (
     paired_features,
     robust_median,
 )
+from .statistics_photo_dashboard import install_photo_dashboard
 from .tracking import TrackerSettings
 
 SCHEMA = "beanoflight-statistics-bundle/v1"
@@ -106,6 +107,8 @@ class BundleSettings:
     samples_per_bean: int = 3
     maximum_frames: int | None = None
     progress_every: int = 600
+    save_bean_photos: bool = False
+    detector_close_kernel: int = 3
 
     def validate(self) -> None:
         if not self.background_indices:
@@ -114,6 +117,7 @@ class BundleSettings:
             raise ValueError("crop size must be an even integer of at least 64")
         if not 1 <= self.samples_per_bean <= 3:
             raise ValueError("samples per bean must be between one and three")
+        DetectorSettings().updated(close_kernel=self.detector_close_kernel)
         if self.maximum_frames is not None and self.maximum_frames <= 0:
             raise ValueError("maximum frames must be positive")
         if self.progress_every <= 0:
@@ -151,6 +155,15 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--maximum-frames", type=int)
     result.add_argument("--progress-every", type=int, default=600)
     result.add_argument("--overwrite", action="store_true")
+    result.add_argument(
+        "--detector-close-kernel", type=int, default=3,
+        help="offline RAW detector closing kernel (odd; default 3)",
+    )
+    result.add_argument(
+        "--save-bean-photos",
+        action="store_true",
+        help="Export calibrated CamL/CamR JPEG crops for every sampled confirmed bean",
+    )
     return result
 
 
@@ -162,6 +175,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         samples_per_bean=arguments.samples_per_bean,
         maximum_frames=arguments.maximum_frames,
         progress_every=arguments.progress_every,
+        save_bean_photos=arguments.save_bean_photos,
+        detector_close_kernel=arguments.detector_close_kernel,
     )
     try:
         settings.validate()
@@ -227,16 +242,19 @@ def build_statistics_bundle(
     samples_by_ref: dict[BeanRef, list[dict[str, Any]]] = defaultdict(list)
     bands_by_ref: dict[BeanRef, set[int]] = defaultdict(set)
     representatives: dict[BeanRef, bytes] = {}
+    photo_samples: dict[BeanRef, dict[str, Any]] = {}
     feature_times: list[float] = []
     feature_cpu_times: list[float] = []
     materialization_times: list[float] = []
     sampling_failures: dict[str, int] = defaultdict(int)
     frames_processed = 0
-    detector_settings = DetectorSettings()
+    detector_settings = DetectorSettings().updated(
+        close_kernel=options.detector_close_kernel
+    )
     right_mask_settings = detector_settings.updated(
         blur_kernel=5,
         threshold=22,
-        close_kernel=5,
+        close_kernel=options.detector_close_kernel,
         close_iterations=1,
         open_kernel=3,
         open_iterations=1,
@@ -496,6 +514,15 @@ def build_statistics_bundle(
                         representatives[track.bean_ref] = _representative_jpeg(
                             left_image, right_image, left_mask, right_mask
                         )
+                        if options.save_bean_photos:
+                            photo_samples[track.bean_ref] = {
+                                "CamL": _photo_jpeg(left_image),
+                                "CamR": _photo_jpeg(right_image),
+                                "frame_index": frame_index,
+                                "right_frame_index": prepared.pair.right_frame_index,
+                                "timestamp_ns": timestamp_ns,
+                                "sample_index": row["sample_index"],
+                            }
             finally:
                 source.release_frame(frame)
             if progress is not None and (
@@ -525,6 +552,8 @@ def build_statistics_bundle(
         }
         beans = _aggregate_beans(confirmed_samples, track_info)
         _score_appearance_outliers(beans)
+        if options.save_bean_photos:
+            _write_bean_photos(temporary, beans, photo_samples)
 
         charts = temporary / "charts"
         outliers = temporary / "outliers"
@@ -552,9 +581,22 @@ def build_statistics_bundle(
             sampling_failures,
             source.stereo_statistics(),
         )
+        summary["bean_photos"] = {
+            "enabled": options.save_bean_photos,
+            "beans_with_photos": sum(bool(bean.get("photo_CamL")) for bean in beans),
+            "processing": "calibrated sRGB; representative sample, middle band preferred",
+        }
+        if options.save_bean_photos:
+            summary["photo_dashboard"] = install_photo_dashboard(
+                temporary, beans=beans, source_fps=source.metadata.fps,
+                summary=summary, recording_path=recording,
+            )
         _write_json(temporary / "summary.json", summary)
         (temporary / "README.md").write_text(
-            _bundle_readme(recording.name), encoding="utf-8"
+            _bundle_readme(
+                recording.name, has_photo_dashboard=options.save_bean_photos
+            ),
+            encoding="utf-8",
         )
         provenance = _provenance(
             recording,
@@ -876,6 +918,8 @@ def _provenance(
             "crop_processing": "calibrated",
             "crop_size_px": settings.crop_size_px,
             "maximum_samples_per_bean": settings.samples_per_bean,
+            "save_bean_photos": settings.save_bean_photos,
+            "detector_close_kernel": settings.detector_close_kernel,
             "sampling_bands": ["top", "middle", "bottom"],
             "feature_kernel_pre_warmed": True,
             "frames_processed": frames_processed,
@@ -926,12 +970,18 @@ def _definitions() -> dict[str, str]:
     }
 
 
-def _bundle_readme(recording_name: str) -> str:
+def _bundle_readme(recording_name: str, *, has_photo_dashboard: bool = False) -> str:
+    dashboard = (
+        "Open `dashboard/index.html` for interactive appearance, size/volume, "
+        "stereo, timeline and review-collection charts with paired bean photos.\n\n"
+        if has_photo_dashboard
+        else ""
+    )
     return f"""# BeanoFlight Statistics Bundle
 
 Source recording: `{recording_name}`
 
-Open `charts/appearance-distributions.png`, `charts/size-and-volume.png`,
+{dashboard}Open `charts/appearance-distributions.png`, `charts/size-and-volume.png`,
 `charts/view-agreement.png`, and `outliers/contact-sheet.png` first.
 
 - `beans.csv` / `beans.jsonl`: robust per-track medians and outlier scores.
@@ -1456,6 +1506,48 @@ def _warm_feature_kernel() -> None:
     cv2.ellipse(mask, (32, 32), (12, 8), 0, 0, 360, 255, -1)
     image[mask > 0] = (60, 110, 180)
     extract_view_features(image, mask, area_scale_mm2_per_px=0.01)
+
+
+def _photo_jpeg(image: np.ndarray) -> bytes:
+    ok, encoded = cv2.imencode(".jpg", image, (cv2.IMWRITE_JPEG_QUALITY, 95))
+    if not ok:
+        raise RuntimeError("could not encode bean photograph")
+    return encoded.tobytes()
+
+
+def _write_bean_photos(root: Path, beans, samples) -> None:
+    """Link only confirmed bean rows; never publish orphan tentative-track photos."""
+    photos = root / "photos"
+    photos.mkdir()
+    by_id = {str(ref): (ref, sample) for ref, sample in samples.items()}
+    index = []
+    for bean in beans:
+        item = by_id.get(str(bean["bean_id"]))
+        if item is None:
+            continue
+        ref, sample = item
+        metadata = {
+            "bean_id": str(ref),
+            **{
+                key: sample[key]
+                for key in (
+                    "frame_index",
+                    "right_frame_index",
+                    "timestamp_ns",
+                    "sample_index",
+                )
+            },
+        }
+        for camera in ("CamL", "CamR"):
+            relative = f"photos/bean-{ref.sequence:06d}-{camera}.jpg"
+            (root / relative).write_bytes(sample[camera])
+            bean[f"photo_{camera}"] = relative
+            metadata[camera] = relative
+        bean["photo_frame_index"] = sample["frame_index"]
+        index.append(metadata)
+    _write_json(
+        photos / "index.json", {"schema": "beanoflight-bean-photos/v1", "photos": index}
+    )
 
 
 def _representative_jpeg(

@@ -151,6 +151,12 @@ h2 { font-family: Georgia, "Times New Roman", serif; font-size: 21px; font-weigh
 .paired-swatch { height: 67px; position: relative; }
 .paired-swatch span { background: rgba(15, 35, 24, .68); bottom: 4px; color: white; font-size: 8px; font-weight: 800; left: 4px; letter-spacing: .06em; padding: 2px 4px; position: absolute; z-index: 1; }
 .paired-swatch::after { background: linear-gradient(135deg, rgba(255,255,255,.2), transparent 55%, rgba(0,0,0,.08)); content: ""; inset: 0; position: absolute; }
+.photo-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; background: #e8eee9; }
+.photo-pair > div { height: 92px; position: relative; overflow: hidden; }
+.photo-pair img { width: 100%; height: 100%; object-fit: contain; }
+.photo-pair span { position: absolute; left: 3px; bottom: 3px; padding: 2px 4px; background: rgba(15,35,24,.75); color: white; font-size: 8px; }
+.mini-swatches { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; height: 9px; margin-top: 2px; }
+.mini-swatches i { display: block; }
 .bean-info { padding: 8px; }
 .bean-info strong { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bean-info span { color: var(--muted); display: block; font-size: 9px; margin-top: 3px; }
@@ -169,6 +175,9 @@ h2 { font-family: Georgia, "Times New Roman", serif; font-size: 21px; font-weigh
 .collection-list { border-top: 1px solid var(--line); }
 .collection-row { align-items: center; border-bottom: 1px solid var(--line); display: grid; gap: 10px; grid-template-columns: 38px minmax(0, 1fr) auto; padding: 10px 2px; }
 .collection-swatch { border: 1px solid rgba(0,0,0,.09); border-radius: 5px; height: 34px; width: 38px; }
+.collection-photos { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; width: 38px; height: 39px; background: #e8eee9; }
+.collection-photos img { width: 100%; height: 34px; object-fit: contain; }
+.collection-photos i { grid-column: 1 / -1; height: 4px; }
 .collection-row strong, .collection-row span { display: block; }
 .collection-row strong { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
 .collection-row span { color: var(--muted); font-size: 9px; line-height: 1.35; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -200,6 +209,11 @@ body.collection-docked .standalone-main { margin-right: 500px; }
 .modal-view.paired { display: grid; grid-template-columns: 1fr 1fr; }
 .modal-view-half { position: relative; }
 .modal-view-half strong { background: rgba(15,35,24,.72); bottom: 12px; color: white; font-size: 11px; left: 12px; letter-spacing: .08em; padding: 5px 7px; position: absolute; text-transform: uppercase; }
+.modal-photo-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.modal-photo-pair figure { margin: 0; background: #e8eee9; border-radius: 8px; overflow: hidden; }
+.modal-photo-pair img { display: block; width: 100%; height: min(43vh, 410px); object-fit: contain; }
+.modal-photo-pair figcaption { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; font-size: 11px; font-weight: 700; }
+.modal-photo-pair i { display: block; width: 42px; height: 12px; border-radius: 3px; border: 1px solid #ffffff; }
 .modal-data { display: grid; gap: 8px; grid-template-columns: repeat(3, 1fr); margin-top: 17px; }
 .modal-data div { background: var(--paper); border-radius: 7px; padding: 10px 12px; }
 .modal-data strong, .modal-data span { display: block; }
