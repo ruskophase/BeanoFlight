@@ -69,9 +69,12 @@ simulation immediately, but external actuation is blocked if any selected
 nozzle lacks an explicit channel assignment. Geometry cannot establish wiring.
 
 Before enabling external outputs, verify the rig's actual wiring and populate
-`valve_channel` on a copy of the map: unique integers 0–20 are **output-mask bit
-numbers, not GPIO numbers**. The current firmware convention maps these bits
-to gate indices -10 through +10 (`gate_index = valve_channel - 10`). Nozzle IDs
+`valve_channel` on a copy of the map: unique integers 0–20 are **legacy logical
+channel numbers, not GPIO numbers**. They map to gate indices -10 through +10
+(`gate_index = valve_channel - 10`). The current three-channel breakout supports
+only channel 9 (-V1, GPIO1), 10 (V0, GPIO2) and 11 (+V1, GPIO3), with left/right
+defined as viewed by CamL. BeanoActuator translates those logical gates to USB
+mask bits 0, 1 and 2; other channels are rejected by the hardware service. Nozzle IDs
 and left-to-right order are not assumed to be electrical channel numbers.
 Load the amended file as a new map; its checksum changes.
 
@@ -79,9 +82,10 @@ Restart Flight, Registry, Sorter and Actuator together after this software
 upgrade. Measured multi-window output plans use a new v2 transport message;
 older actuator software rejects that message instead of flattening the
 windows. The existing firmware SCHEDULE command is used once per selected
-nozzle, with one aggregate decision/result audit. No firmware flash is required
-for this protocol change. The current hardware support remains LED-only;
-this feature does not commission or authorize pneumatic-valve operation.
+nozzle, with one aggregate decision/result audit. The three-channel breakout
+mapping requires the matching `beano-actuator-v3-3valve` firmware and updated
+host; the previous firmware is incompatible. The breakout has LEDs and FETs,
+but valves remain disconnected for bench testing.
 
 ## Reproducibility
 

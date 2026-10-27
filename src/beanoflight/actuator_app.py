@@ -12,6 +12,7 @@ from .actuation_transport import DEFAULT_ACTUATION_ENDPOINT
 from .esp32_actuator import (
     DEFAULT_ESP32_PORT,
     GATE_GPIO_MAP,
+    GATE_LABELS,
     ActuatorActivity,
     ESP32ActuatorService,
 )
@@ -58,9 +59,9 @@ class ActuatorApp(tk.Tk):
         ttk.Button(controls, text="Reconnect", command=self.start_service).grid(
             row=1, column=1, padx=4
         )
-        ttk.Button(controls, text="Test LEDs", command=self._test_leds).grid(
-            row=1, column=2, padx=4
-        )
+        ttk.Button(
+            controls, text="Test outputs (50 ms, 500 ms apart)", command=self._test_leds
+        ).grid(row=1, column=2, padx=4)
         ttk.Checkbutton(
             controls,
             text="Show activity log",
@@ -68,12 +69,14 @@ class ActuatorApp(tk.Tk):
         ).grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
         controls.columnconfigure(0, weight=1)
 
-        mapping = ttk.LabelFrame(self, text="Gate-to-GPIO mapping", padding=10)
+        mapping = ttk.LabelFrame(
+            self, text="Valve channels — left to right as viewed by CamL", padding=10
+        )
         mapping.pack(fill=tk.X, padx=10, pady=(0, 10))
         for offset, (gate, gpio) in enumerate(GATE_GPIO_MAP.items()):
             ttk.Label(
                 mapping,
-                text=f"G{gate:+d} → GPIO{gpio}" if gate else f"G0 → GPIO{gpio}",
+                text=f"{GATE_LABELS[gate]} → GPIO{gpio}",
                 width=14,
             ).grid(row=offset // 7, column=offset % 7, sticky=tk.W, pady=2)
 
@@ -109,8 +112,8 @@ class ActuatorApp(tk.Tk):
     def _test_leds(self) -> None:
         if self.service is None or not self.service.request_led_test():
             messagebox.showwarning(
-                "ESP32 LED test",
-                "The ESP32 must be connected and clock-synchronized first.",
+                "ESP32 output test",
+                "The valve ESP32 must be connected, synchronized and idle.",
                 parent=self,
             )
 
@@ -176,12 +179,29 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--plans", default=DEFAULT_ACTUATION_ENDPOINT)
     result.add_argument("--serial", default=DEFAULT_ESP32_PORT)
     result.add_argument("--no-activity-log", action="store_true")
+    result.add_argument("--headless", action="store_true", help="Run the USB service and WebGUI bridge without a window")
     return result
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     arguments = parser().parse_args(argv)
     apply_latency_thread_profile()
+    if arguments.headless:
+        service = ESP32ActuatorService(
+            registry_endpoint=arguments.registry,
+            actuation_endpoint=arguments.plans,
+            serial_port=arguments.serial,
+        )
+        service.start()
+        try:
+            while not service._stop.wait(0.5):
+                if service.startup_error:
+                    raise RuntimeError(service.startup_error)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            service.close(drain=False)
+        return
     ActuatorApp(
         registry_endpoint=arguments.registry,
         actuation_endpoint=arguments.plans,

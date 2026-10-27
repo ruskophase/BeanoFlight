@@ -29,37 +29,28 @@ from .registry_service import DEFAULT_COMMAND_ENDPOINT
 from .registry_zmq import ZeroMQRegistryClient
 from .runtime_priority import lower_current_thread_priority
 
-FIRMWARE_PROTOCOL = "beano-actuator-v1"
+FIRMWARE_PROTOCOL = "beano-actuator-v3-3valve"
+CONTROL_SCHEMA = "beano-valve-control/v1"
+DEFAULT_CONTROL_ENDPOINT = "tcp://127.0.0.1:5592"
 DEFAULT_ESP32_PORT = "/dev/serial/by-path/platform-3610000.usb-usb-0:2.1:1.0"
-GATE_INDICES = tuple(range(-10, 11))
-GATE_GPIOS = (
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-    8,
-    9,
-    10,
-    11,
-    12,
-    13,
-    14,
-    16,
-    17,
-    18,
-    21,
-    33,
-    34,
-    35,
-)
+# Left to right as viewed by CamL. Only these channels are populated.
+GATE_INDICES = (-1, 0, 1)
+GATE_GPIOS = (1, 2, 3)
 GATE_GPIO_MAP = dict(zip(GATE_INDICES, GATE_GPIOS))
+GATE_MASK_MAP = {gate: 1 << bit for bit, gate in enumerate(GATE_INDICES)}
+GATE_LABELS = {-1: "-V1", 0: "V0", 1: "+V1"}
 
 
 class ESP32ProtocolError(RuntimeError):
     pass
+
+
+@dataclass
+class _ControlRequest:
+    command: str
+    deadline_ns: int
+    done: threading.Event = field(default_factory=threading.Event)
+    error: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,11 +169,15 @@ class ESP32ActuatorService:
         actuation_endpoint: str = DEFAULT_ACTUATION_ENDPOINT,
         serial_port: str = DEFAULT_ESP32_PORT,
         minimum_board_notice_ms: float = 0.3,
+        control_endpoint: str | None = None,
         activity: Callable[[ActuatorActivity], None] | None = None,
     ) -> None:
         self.registry_endpoint = registry_endpoint
         self.actuation_endpoint = actuation_endpoint
         self.serial_port = serial_port
+        self.control_endpoint = control_endpoint or os.getenv(
+            "BEANO_VALVE_CONTROL_ENDPOINT", DEFAULT_CONTROL_ENDPOINT
+        )
         self.minimum_board_notice_ns = round(minimum_board_notice_ms * 1_000_000)
         self.activity = activity
         self._stop = threading.Event()
@@ -190,7 +185,11 @@ class ESP32ActuatorService:
         self._plans: queue.PriorityQueue[_QueuedHardwarePlan] = queue.PriorityQueue(
             maxsize=256
         )
-        self._tests: queue.Queue[int] = queue.Queue(maxsize=4)
+        self._controls: queue.Queue[_ControlRequest] = queue.Queue(maxsize=4)
+        self._control_pending: dict[int, _ControlRequest] = {}
+        self._test_reserved = False
+        self._test_active = False
+        self._stop_reserved = False
         self._results: queue.Queue[_ResultAudit] = queue.Queue(maxsize=256)
         self._accepted_decisions: set[str] = set()
         self._accepted_lock = threading.Lock()
@@ -220,7 +219,7 @@ class ESP32ActuatorService:
     def gate_states(self) -> dict[int, bool]:
         with self._state_lock:
             mask = self._gate_mask
-        return {gate: bool(mask & (1 << (gate + 10))) for gate in GATE_INDICES}
+        return {gate: bool(mask & bit) for gate, bit in GATE_MASK_MAP.items()}
 
     @property
     def clock_offset_ns(self) -> int | None:
@@ -236,19 +235,88 @@ class ESP32ActuatorService:
         for name, target in (
             ("beano-actuator-plan-and-esp32-io", self._io_loop),
             ("beano-actuator-registry-audit", self._audit_loop),
+            ("beano-actuator-web-control", self._control_loop),
         ):
             thread = threading.Thread(target=target, name=name, daemon=True)
             self._threads.append(thread)
             thread.start()
 
-    def request_led_test(self, *, interval_ms: int = 80) -> bool:
-        if not self.connected or not self.synchronized:
-            return False
+    def request_led_test(self) -> bool:
         try:
-            self._tests.put_nowait(max(20, min(500, int(interval_ms))))
-        except queue.Full:
+            self._queue_control("TEST")
+        except ESP32ProtocolError:
             return False
         return True
+
+    def control_status(self) -> dict:
+        return {
+            "connected": self.connected,
+            "synchronized": self.synchronized,
+            "testing": self._test_active or self._test_reserved,
+            "busy": bool(self._pending) or not self._plans.empty() or self._stop_reserved,
+            "gate_states": self.gate_states,
+            "pulse_ms": 50,
+            "spacing_ms": 500,
+        }
+
+    def _queue_control(self, command: str, *, deadline_ns: int | None = None) -> _ControlRequest:
+        with self._accepted_lock:
+            if not self.connected or not self.synchronized:
+                raise ESP32ProtocolError("Valve ESP32 is not connected and synchronized")
+            if command == "TEST" and (
+                self._test_active or self._test_reserved or self._stop_reserved
+                or self._pending or not self._plans.empty()
+            ):
+                raise ESP32ProtocolError("Valve outputs are busy")
+            deadline = time.monotonic_ns() + 1_000_000_000
+            request = _ControlRequest(command, min(deadline, deadline_ns or deadline))
+            try:
+                self._controls.put_nowait(request)
+            except queue.Full as exc:
+                raise ESP32ProtocolError("Valve command queue is full") from exc
+            if command == "TEST":
+                self._test_reserved = True
+            else:
+                self._stop_reserved = True
+            return request
+
+    def _control_loop(self) -> None:
+        # Keep USB ownership in _io_loop. This local RPC accepts only fixed
+        # operations and acknowledges a test only after the firmware ACK.
+        socket = zmq.Context.instance().socket(zmq.REP)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.MAXMSGSIZE, 4096)
+        try:
+            socket.bind(self.control_endpoint)
+            while not self._stop.is_set():
+                if not socket.poll(100, zmq.POLLIN):
+                    continue
+                try:
+                    message = socket.recv_json()
+                    if not isinstance(message, dict) or message.get("schema") != CONTROL_SCHEMA:
+                        raise ESP32ProtocolError("Invalid valve control message")
+                    action = message.get("action")
+                    if action not in {"status", "test", "stop"}:
+                        raise ESP32ProtocolError("Unknown valve control action")
+                    if action != "status":
+                        deadline_ns = message.get("deadline_ns", 0)
+                        if not isinstance(deadline_ns, int) or time.monotonic_ns() >= deadline_ns:
+                            raise ESP32ProtocolError("Valve control request expired; not executed")
+                        request = self._queue_control(
+                            "TEST" if action == "test" else "ALL_OFF", deadline_ns=deadline_ns
+                        )
+                        if not request.done.wait(1.2):
+                            raise ESP32ProtocolError("Valve command acknowledgement timed out; not retried")
+                        if request.error:
+                            raise ESP32ProtocolError(request.error)
+                    reply = {"schema": CONTROL_SCHEMA, "ok": True, **self.control_status()}
+                except (ValueError, TypeError, ESP32ProtocolError) as exc:
+                    reply = {"schema": CONTROL_SCHEMA, "ok": False, "error": str(exc)}
+                socket.send_json(reply)
+        except zmq.ZMQError as exc:
+            self._emit("error", detail=f"Valve web control unavailable: {exc}")
+        finally:
+            socket.close(0)
 
     def close(self, *, drain: bool = True) -> None:
         if drain:
@@ -270,6 +338,14 @@ class ESP32ActuatorService:
             if not self.connected or not self.synchronized:
                 self.plans_rejected += 1
                 return False, "ESP32 is not connected and clock-synchronized"
+            if self._test_reserved or self._test_active or self._stop_reserved:
+                self.plans_rejected += 1
+                return False, "Valve test or stop is in progress"
+            try:
+                gate_indices_to_mask(plan.gate_indices)
+            except ESP32ProtocolError as exc:
+                self.plans_rejected += 1
+                return False, str(exc)
             if (
                 plan.open_monotonic_ns - time.monotonic_ns()
                 < self.minimum_board_notice_ns
@@ -342,6 +418,7 @@ class ESP32ActuatorService:
                 try:
                     # A ZeroMQ arrival wakes the kernel poll and the admitted
                     # plan enters USB before routine serial input is handled.
+                    self._send_control_requests(serial)
                     plans_sent = self._send_queued_plans(serial)
                     for line in serial.read_lines(0.0):
                         try:
@@ -352,7 +429,6 @@ class ESP32ActuatorService:
                             if _looks_like_protocol_message(line):
                                 self.protocol_errors += 1
                             self._emit("ignored", detail=str(exc))
-                    self._send_test_requests(serial)
                     now_ns = time.monotonic_ns()
                     # A SCHEDULE command also feeds the board watchdog. Avoid
                     # putting routine clock traffic immediately ahead of urgent
@@ -374,6 +450,7 @@ class ESP32ActuatorService:
                     self.protocol_errors += 1
                     self._emit("error", detail=str(exc))
                     self._fail_pending(f"ESP32 link lost: {exc}")
+                    self._fail_controls(f"ESP32 link lost: {exc}")
                     if serial.fd is not None:
                         try:
                             poller.unregister(serial.fd)
@@ -412,27 +489,67 @@ class ESP32ActuatorService:
             self.connected = False
             self.synchronized = False
             receiver.close()
+            self._fail_controls("Actuator stopped")
 
-    def _send_test_requests(self, serial: _SerialCDC) -> None:
-        for _index in range(4):
-            try:
-                interval_ms = self._tests.get_nowait()
-            except queue.Empty:
-                return
-            try:
-                serial.write(
-                    encode_protocol_line(
-                        "TEST",
-                        self._allocate_request(),
-                        interval_ms,
-                    )
-                )
-                self._emit("test", detail=f"LED chase {interval_ms} ms per gate")
-            finally:
-                self._tests.task_done()
+    def _finish_control(self, request: _ControlRequest, error: str = "") -> None:
+        request.error = error
+        if request.command == "TEST":
+            self._test_reserved = False
+        else:
+            self._stop_reserved = False
+        request.done.set()
+        self._emit("error" if error else "control", detail=error or f"{request.command} acknowledged")
+
+    def _send_control_requests(self, serial: _SerialCDC) -> None:
+        with self._accepted_lock:
+            for request_id, request in tuple(self._control_pending.items()):
+                if time.monotonic_ns() >= request.deadline_ns:
+                    self._control_pending.pop(request_id)
+                    self._finish_control(request, "Valve command acknowledgement timed out; not retried")
+            for _ in range(4):
+                try:
+                    request = self._controls.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if time.monotonic_ns() >= request.deadline_ns:
+                        self._finish_control(request, "Valve command expired before sending")
+                        continue
+                    if request.command == "TEST" and self._stop_reserved:
+                        self._finish_control(request, "Valve test cancelled by STOP ALL")
+                        continue
+                    if request.command == "ALL_OFF":
+                        self._fail_pending("Stopped by operator")
+                        while True:
+                            try:
+                                queued = self._plans.get_nowait()
+                            except queue.Empty:
+                                break
+                            self._queue_failed_result(queued.plan, "Stopped by operator")
+                            self._plans.task_done()
+                    request_id = self._allocate_request()
+                    self._control_pending[request_id] = request
+                    serial.write(encode_protocol_line(request.command, request_id))
+                finally:
+                    self._controls.task_done()
+
+    def _fail_controls(self, detail: str) -> None:
+        with self._accepted_lock:
+            for request in self._control_pending.values():
+                self._finish_control(request, detail)
+            self._control_pending.clear()
+            while True:
+                try:
+                    request = self._controls.get_nowait()
+                except queue.Empty:
+                    break
+                self._finish_control(request, detail)
+                self._controls.task_done()
+            self._test_active = self._test_reserved = self._stop_reserved = False
 
     def _send_queued_plans(self, serial: _SerialCDC) -> int:
-        if not self.synchronized or self._clock_offset_ns is None:
+        if (not self.synchronized or self._clock_offset_ns is None
+                or self._test_active or self._test_reserved or self._stop_reserved):
             return 0
         sent = 0
         for _index in range(32):
@@ -503,10 +620,13 @@ class ESP32ActuatorService:
             self._emit("ready", detail=f"firmware {fields[1]} boot {fields[2]}")
             return
         if command == "PONG":
-            if len(fields) not in {4, 6}:
+            if len(fields) != 8:
                 raise ESP32ProtocolError("invalid PONG")
-            if len(fields) == 6 and fields[4] != FIRMWARE_PROTOCOL:
+            if fields[4] != FIRMWARE_PROTOCOL:
                 raise ESP32ProtocolError("unexpected ESP32 firmware identity")
+            with self._state_lock:
+                self._gate_mask = int(fields[6], 16)
+                self._test_active = fields[7] == "1"
             host_send_ns = int(fields[2]) * 1_000
             board_ns = int(fields[3]) * 1_000
             rtt_ns = max(0, received_ns - host_send_ns)
@@ -515,7 +635,7 @@ class ESP32ActuatorService:
             best = min(self._clock_samples, key=lambda item: item[0])
             self._clock_rtt_ns, self._clock_offset_ns = best
             self.synchronized = len(self._clock_samples) >= 3
-            if len(fields) == 6 and len(self._clock_samples) == 1:
+            if len(self._clock_samples) == 1:
                 self._emit(
                     "ready",
                     detail=f"firmware {fields[4]} boot {fields[5]}",
@@ -525,6 +645,14 @@ class ESP32ActuatorService:
             if len(fields) < 5:
                 raise ESP32ProtocolError("invalid ACK")
             request = int(fields[1])
+            control = self._control_pending.pop(request, None)
+            if control is not None:
+                self._test_active = control.command == "TEST"
+                if control.command == "ALL_OFF":
+                    with self._state_lock:
+                        self._gate_mask = 0
+                self._finish_control(control)
+                return
             plan_sequence = self._request_plans.pop(request, None)
             if plan_sequence is not None and plan_sequence in self._pending:
                 self._pending[plan_sequence] = replace(
@@ -537,6 +665,10 @@ class ESP32ActuatorService:
             if len(fields) < 4:
                 raise ESP32ProtocolError("invalid ERR")
             request = int(fields[1])
+            control = self._control_pending.pop(request, None)
+            if control is not None:
+                self._finish_control(control, f"Valve ESP32 rejected {control.command}: {fields[2]}")
+                return
             plan_sequence = self._request_plans.pop(request, None)
             if plan_sequence is not None:
                 pending = self._pending.get(plan_sequence)
@@ -575,6 +707,7 @@ class ESP32ActuatorService:
         if command == "WATCHDOG":
             with self._state_lock:
                 self._gate_mask = 0
+            self._fail_controls("ESP32 watchdog forced every gate off")
             self._fail_pending("ESP32 watchdog forced every gate off")
             self._emit("watchdog", detail="all outputs forced off")
             return
@@ -759,7 +892,7 @@ def gate_indices_to_mask(gates: tuple[int, ...]) -> int:
     for gate in gates:
         if gate not in GATE_GPIO_MAP:
             raise ESP32ProtocolError(f"gate {gate} has no ESP32 GPIO")
-        mask |= 1 << (gate + 10)
+        mask |= GATE_MASK_MAP[gate]
     return mask
 
 

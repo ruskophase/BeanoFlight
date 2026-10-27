@@ -6,6 +6,8 @@
 #include <string.h>
 #include <stdarg.h>
 
+#include "valve_test.h"
+
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
 #include "esp_attr.h"
@@ -17,8 +19,8 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#define PROTOCOL_VERSION "beano-actuator-v1"
-#define GATE_COUNT 21
+#define PROTOCOL_VERSION "beano-actuator-v3-3valve"
+#define GATE_COUNT 3
 #define MAX_PLANS 64
 #define EVENT_QUEUE_LENGTH 128
 #define TIMER_TICK_US 100
@@ -55,8 +57,8 @@ typedef struct {
 } gate_event_t;
 
 static const gpio_num_t gate_gpios[GATE_COUNT] = {
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-    12, 13, 14, 16, 17, 18, 21, 33, 34, 35,
+    // Mask bits 0, 1, 2: -V1 (CamL left), V0 (centre), +V1 (CamL right).
+    1, 2, 3,
 };
 
 static gate_plan_t plans[MAX_PLANS];
@@ -67,7 +69,7 @@ static QueueHandle_t event_queue;
 static SemaphoreHandle_t print_mutex;
 static volatile uint64_t last_contact_us;
 static volatile bool watchdog_tripped;
-static volatile bool led_test_active;
+static valve_test_t valve_test;
 static uint32_t boot_id;
 
 static uint32_t crc32_bytes(const uint8_t *data, size_t length)
@@ -150,6 +152,15 @@ static bool IRAM_ATTR timer_alarm(
     uint64_t now_us = (uint64_t)esp_timer_get_time();
     BaseType_t wake = pdFALSE;
     portENTER_CRITICAL_ISR(&schedule_mux);
+    if (valve_test.active) {
+        uint32_t mask = valve_test_mask(&valve_test, now_us);
+        for (int gate = 0; gate < GATE_COUNT; ++gate) {
+            if ((mask ^ active_gate_mask) & (1U << gate)) {
+                set_gate_level_isr(gate, (mask & (1U << gate)) != 0);
+            }
+        }
+        active_gate_mask = mask;
+    }
     for (int index = 0; index < MAX_PLANS; ++index) {
         gate_plan_t *plan = &plans[index];
         if (plan->state == PLAN_SCHEDULED && now_us >= plan->open_us) {
@@ -185,14 +196,14 @@ static uint32_t force_all_off(bool *had_work)
     bool work;
     portENTER_CRITICAL(&schedule_mux);
     previous = active_gate_mask;
-    work = previous != 0 || led_test_active;
+    work = previous != 0 || valve_test.active;
     for (int index = 0; index < MAX_PLANS; ++index) {
         work = work || plans[index].state != PLAN_UNUSED;
         plans[index].state = PLAN_UNUSED;
     }
     memset(gate_references, 0, sizeof(gate_references));
     active_gate_mask = 0;
-    led_test_active = false;
+    valve_test_cancel(&valve_test);
     for (int gate = 0; gate < GATE_COUNT; ++gate) {
         gpio_set_level(gate_gpios[gate], 0);
     }
@@ -223,11 +234,11 @@ static gate_plan_t *free_plan(void)
     return NULL;
 }
 
-static bool reserve_led_test(void)
+static bool start_valve_test(bool autonomous)
 {
     bool idle = true;
     portENTER_CRITICAL(&schedule_mux);
-    if (active_gate_mask != 0 || led_test_active) {
+    if (active_gate_mask != 0 || valve_test.active) {
         idle = false;
     }
     for (int index = 0; index < MAX_PLANS; ++index) {
@@ -237,7 +248,7 @@ static bool reserve_led_test(void)
         }
     }
     if (idle) {
-        led_test_active = true;
+        valve_test_start(&valve_test, (uint64_t)esp_timer_get_time(), autonomous);
     }
     portEXIT_CRITICAL(&schedule_mux);
     return idle;
@@ -318,7 +329,13 @@ static void watchdog_task(void *argument)
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(25));
         uint64_t now_us = (uint64_t)esp_timer_get_time();
-        if (!watchdog_tripped && now_us - last_contact_us > WATCHDOG_US) {
+        // The bounded boot test must finish even without a USB host. Manual
+        // tests and ordinary schedules retain the communication watchdog.
+        portENTER_CRITICAL(&schedule_mux);
+        bool autonomous_test = valve_test.active && valve_test.autonomous;
+        portEXIT_CRITICAL(&schedule_mux);
+        if (!autonomous_test && !watchdog_tripped
+            && now_us - last_contact_us > WATCHDOG_US) {
             bool notify_host;
             uint32_t previous = force_all_off(&notify_host);
             watchdog_tripped = true;
@@ -330,21 +347,6 @@ static void watchdog_task(void *argument)
             }
         }
     }
-}
-
-static void led_test_task(void *argument)
-{
-    uint32_t interval_ms = (uint32_t)(uintptr_t)argument;
-    for (int gate = 0; gate < GATE_COUNT; ++gate) {
-        if (!led_test_active) {
-            break;
-        }
-        gpio_set_level(gate_gpios[gate], 1);
-        vTaskDelay(pdMS_TO_TICKS(interval_ms));
-        gpio_set_level(gate_gpios[gate], 0);
-    }
-    led_test_active = false;
-    vTaskDelete(NULL);
 }
 
 static void handle_command(char *body)
@@ -365,13 +367,19 @@ static void handle_command(char *body)
             send_message("ERR,%" PRIu32 ",BAD_PING,%" PRIu64, request, last_contact_us);
             return;
         }
+        portENTER_CRITICAL(&schedule_mux);
+        uint32_t mask = active_gate_mask;
+        bool testing = valve_test.active;
+        portEXIT_CRITICAL(&schedule_mux);
         send_message(
-            "PONG,%" PRIu32 ",%" PRIu64 ",%" PRIu64 ",%s,%08" PRIX32,
+            "PONG,%" PRIu32 ",%" PRIu64 ",%" PRIu64 ",%s,%08" PRIX32 ",%08" PRIX32 ",%u",
             request,
             host_us,
             last_contact_us,
             PROTOCOL_VERSION,
-            boot_id);
+            boot_id,
+            mask,
+            testing ? 1U : 0U);
         return;
     }
 
@@ -392,7 +400,7 @@ static void handle_command(char *body)
         }
         portENTER_CRITICAL(&schedule_mux);
         gate_plan_t *slot = NULL;
-        if (!led_test_active) {
+        if (!valve_test.active) {
             slot = find_plan(sequence);
             if (slot == NULL) {
                 slot = free_plan();
@@ -447,23 +455,9 @@ static void handle_command(char *body)
         return;
     }
 
-    if (strcmp(fields[0], "TEST") == 0 && count == 3) {
-        uint32_t interval_ms;
-        if (!parse_u32(fields[2], 10, &interval_ms)
-            || interval_ms < 20 || interval_ms > 500
-            || !reserve_led_test()) {
-            send_message("ERR,%" PRIu32 ",BAD_TEST,%" PRIu64, request, last_contact_us);
-            return;
-        }
-        if (xTaskCreate(
-                led_test_task,
-                "gate-led-test",
-                2048,
-                (void *)(uintptr_t)interval_ms,
-                5,
-                NULL) != pdPASS) {
-            led_test_active = false;
-            send_message("ERR,%" PRIu32 ",TEST_TASK,%" PRIu64, request, last_contact_us);
+    if (strcmp(fields[0], "TEST") == 0 && count == 2) {
+        if (!start_valve_test(false)) {
+            send_message("ERR,%" PRIu32 ",BUSY,%" PRIu64, request, last_contact_us);
             return;
         }
         send_message("ACK,%" PRIu32 ",TEST,0,%" PRIu64, request, last_contact_us);
@@ -550,9 +544,11 @@ void app_main(void)
         .flags.auto_reload_on_alarm = true,
     };
     ESP_ERROR_CHECK(gptimer_set_alarm_action(timer, &alarm));
+    last_contact_us = (uint64_t)esp_timer_get_time();
+    // Start once per boot, without waiting for USB or writing to its console.
+    start_valve_test(true);
     ESP_ERROR_CHECK(gptimer_start(timer));
 
-    last_contact_us = (uint64_t)esp_timer_get_time();
     boot_id = esp_random();
     xTaskCreate(event_task, "gate-events", 3072, NULL, 18, NULL);
     xTaskCreate(watchdog_task, "gate-watchdog", 3072, NULL, 19, NULL);

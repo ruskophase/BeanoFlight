@@ -8,8 +8,9 @@ stable bean IDs, and predicts where and when each bean will reach measured
 nozzle zones (or the original virtual sorting line).
 
 The current release is deliberately a human-verification and system-simulation
-tool. Its ESP32-S2 output is restricted to low-current gate-indicator LEDs; it
-does not drive physical valves.
+tool. Its ESP32-S2 actuator targets three populated breakout channels with LED
+indicators and FET valve switches: -V1, V0 and +V1 on GPIO1, GPIO2 and GPIO3.
+No valves are connected during this stage of bench testing.
 
 Version 0.2 adds independent PinkPlane nozzle-map loading for review, replay
 and live prediction. Use **Load nozzle map** in BeanoFlight, or pass
@@ -140,7 +141,7 @@ crossing probability qualifies.
 Crop previews, activity logs, monitor polling and diagnostic gate animation can be turned
 off independently without stopping their worker services.
 
-## ESP32-S2 indicator actuator
+## ESP32-S2 breakout actuator
 
 `beano-actuator` is the only host process that opens the ESP32 USB device. It
 clock-synchronizes with the board, converts approved host-monotonic plans to
@@ -148,7 +149,8 @@ absolute board timestamps, and records observed `OPEN`/`CLOSE` events back in
 BeanRegistry. The board uses a fixed schedule table and GPTimer tick, supports
 overlapping plans through per-gate reference counts, validates CRC32 on every
 line, rejects late or excessive pulses, and forces every output low after a
-500 ms communications watchdog timeout.
+500 ms communications watchdog timeout (except for the bounded autonomous
+boot test).
 
 In Performance mode the launcher reserves one CPU for BeanoActuator and one for
 BeanoSorter when at least four CPUs are available. Actuator plan admission and
@@ -156,19 +158,34 @@ native-USB I/O share one kernel-woken event loop; Registry audit workers run at
 lower scheduling priority and use compact acknowledgements so audit work cannot
 normally displace a gate deadline.
 
-The 21 active-high indicator outputs are:
+The three active-high channels, ordered left to right as viewed by CamL, are:
 
 ```text
-G-10..G+3  -> GPIO1..GPIO14
-G+4..G+6   -> GPIO16..GPIO18
-G+7        -> GPIO21
-G+8..G+10  -> GPIO33..GPIO35
+-V1 (left)   -> GPIO1, logical gate -1, USB mask bit 0
+ V0 (centre) -> GPIO2, logical gate  0, USB mask bit 1
++V1 (right)  -> GPIO3, logical gate +1, USB mask bit 2
 ```
 
 GPIO15 is reserved for the board status LED. GPIO19 and GPIO20 are reserved for
-native USB. Connect each selected GPIO to an LED through its own series resistor
-(1 kΩ is a conservative starting value), then connect the LED cathode to GND.
-These 3.3 V pins must never drive a solenoid or valve directly.
+native USB. Each populated channel drives the breakout's LED indicator and FET;
+**Test outputs (50 ms, 500 ms apart)** switches both. Valves are currently disconnected.
+Only the three populated channels are enabled. Wi-Fi, Bluetooth and radio PHY
+components are excluded from the firmware build; communication uses USB only.
+The ESP32-S2 itself has no Bluetooth radio.
+
+Every boot/reset runs -V1, V0, +V1 once: 50 ms on each, with starts 500 ms apart
+(1.05 seconds total). The same test is available in the machine-control WebGUI
+under **Valve channel test**, through the running BeanoActuator service. Its
+local control endpoint is `tcp://127.0.0.1:5592`; set
+`BEANO_VALVE_CONTROL_ENDPOINT` in both applications to override it. Use
+`beano-actuator --headless --serial <valve-board-port>` to run the service without
+a desktop window. Run only one BeanoActuator instance. Manual tests are rejected
+while sorting outputs are busy, and STOP ALL cancels remaining test pulses.
+
+Host and firmware must be upgraded together to `beano-actuator-v3-3valve`;
+the host rejects the old 21-channel firmware identity. Existing nozzle maps
+use `valve_channel` 9, 10 and 11 for logical gates -1, 0 and +1. These are
+translated to the new three-bit USB mask by BeanoActuator.
 
 The firmware and build instructions are in
 [`firmware/esp32_s2_actuator`](firmware/esp32_s2_actuator/README.md).
