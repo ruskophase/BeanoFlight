@@ -61,7 +61,9 @@ class EndToEndAnalysisTests(unittest.TestCase):
         results = []
         for index, y in enumerate((30, 103, 184)):
             frame = background.copy()
-            cv2.ellipse(frame, (205 + index * 2, y), (24, 17), 20, 0, 360, (190, 170, 140), -1)
+            cv2.ellipse(
+                frame, (205 + index * 2, y), (24, 17), 20, 0, 360, (190, 170, 140), -1
+            )
             results.append(engine.process(frame, index, index * 16_666_667))
 
         self.assertEqual([len(result.detections) for result in results], [1, 1, 1])
@@ -70,11 +72,16 @@ class EndToEndAnalysisTests(unittest.TestCase):
         self.assertEqual(ids[1], ids[2])
         self.assertEqual(results[-1].tracks[0].hits, 3)
         self.assertEqual(len(results[-1].predictions), 1)
-        self.assertGreater(results[-1].predictions[0].crossing_timestamp_ns, results[-1].timestamp_ns)
+        self.assertGreater(
+            results[-1].predictions[0].crossing_timestamp_ns, results[-1].timestamp_ns
+        )
         registry_record = registry.get(ids[-1])
         self.assertEqual(registry_record.revision, 3)
         self.assertEqual(registry_record.track.hits, 3)
         self.assertEqual(registry_record.prediction, results[-1].predictions[0])
+        self.assertIsNotNone(results[-1].timings)
+        self.assertGreater(results[-1].timings.detection_ms, 0.0)
+        self.assertGreaterEqual(results[-1].timings.registry_ms, 0.0)
 
 
 if __name__ == "__main__":

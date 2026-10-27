@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -19,15 +20,22 @@ from .models import (
 )
 from .registry_models import (
     BeanRecord,
+    InferenceJob,
+    InferenceStatus,
+    RunSession,
+    actuation_from_dict,
     decision_from_dict,
     enrichment_from_dict,
     enrichment_to_dict,
     event_from_dict,
     prediction_from_dict,
     prediction_to_dict,
+    run_session_from_dict,
+    run_session_to_dict,
 )
+from .telemetry import TimingAccumulator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 TRACK_EVENT_KINDS = {
     "bean.created",
     "bean.confirmed",
@@ -51,6 +59,16 @@ class SQLiteBeanRepository:
         )
         self._connection.row_factory = sqlite3.Row
         self._batch_depth = 0
+        self._save_timing = TimingAccumulator()
+        self._batch_timing = TimingAccumulator()
+        self._checkpoint_timing = TimingAccumulator()
+        self._checkpoint_stop = threading.Event()
+        self._checkpoint_stats_lock = threading.Lock()
+        self._checkpoint_count = 0
+        self._checkpoint_busy = 0
+        self._checkpoint_pages = 0
+        self._checkpoint_errors = 0
+        self._checkpoint_thread: threading.Thread | None = None
         with self._lock:
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
@@ -59,7 +77,14 @@ class SQLiteBeanRepository:
                 self._connection.close()
                 raise RuntimeError(f"could not enable SQLite WAL mode: {mode}")
             self._connection.execute("PRAGMA synchronous=NORMAL")
+            self._connection.execute("PRAGMA wal_autocheckpoint=0")
             self._create_schema()
+        self._checkpoint_thread = threading.Thread(
+            target=self._checkpoint_loop,
+            name="beano-registry-wal-checkpoint",
+            daemon=True,
+        )
+        self._checkpoint_thread.start()
 
     @property
     def journal_mode(self) -> str:
@@ -69,11 +94,15 @@ class SQLiteBeanRepository:
             ).lower()
 
     def save(self, record: BeanRecord, event: BeanEvent) -> int:
+        started = time.perf_counter_ns()
         with self._lock:
-            if self._batch_depth:
-                return self._save_locked(record, event)
-            with self._connection:
-                return self._save_locked(record, event)
+            try:
+                if self._batch_depth:
+                    return self._save_locked(record, event)
+                with self._connection:
+                    return self._save_locked(record, event)
+            finally:
+                self._save_timing.add((time.perf_counter_ns() - started) / 1_000_000.0)
 
     @contextmanager
     def batch(self) -> Iterator[None]:
@@ -81,6 +110,7 @@ class SQLiteBeanRepository:
 
         with self._lock:
             outermost = self._batch_depth == 0
+            started = time.perf_counter_ns()
             if outermost:
                 self._connection.execute("BEGIN")
             self._batch_depth += 1
@@ -95,6 +125,63 @@ class SQLiteBeanRepository:
                 self._batch_depth -= 1
                 if outermost:
                     self._connection.commit()
+                    self._batch_timing.add(
+                        (time.perf_counter_ns() - started) / 1_000_000.0
+                    )
+
+    def performance_metrics(self) -> dict[str, dict[str, float | int]]:
+        with self._checkpoint_stats_lock:
+            checkpoint = {
+                **self._checkpoint_timing.summary(),
+                "checkpoints": self._checkpoint_count,
+                "busy": self._checkpoint_busy,
+                "pages_checkpointed": self._checkpoint_pages,
+                "errors": self._checkpoint_errors,
+            }
+        return {
+            "event_save_ms": self._save_timing.summary(),
+            "frame_batch_ms": self._batch_timing.summary(),
+            "wal_checkpoint_ms": checkpoint,
+        }
+
+    def reset_performance_metrics(self) -> None:
+        self._save_timing.clear()
+        self._batch_timing.clear()
+        self._checkpoint_timing.clear()
+        with self._checkpoint_stats_lock:
+            self._checkpoint_count = 0
+            self._checkpoint_busy = 0
+            self._checkpoint_pages = 0
+            self._checkpoint_errors = 0
+
+    def _checkpoint_loop(self) -> None:
+        connection = sqlite3.connect(
+            self.path,
+            timeout=0.05,
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        try:
+            connection.execute("PRAGMA busy_timeout=50")
+            while not self._checkpoint_stop.wait(0.5):
+                started = time.perf_counter_ns()
+                try:
+                    busy, _log_pages, checkpointed = connection.execute(
+                        "PRAGMA wal_checkpoint(PASSIVE)"
+                    ).fetchone()
+                    elapsed_ms = (
+                        time.perf_counter_ns() - started
+                    ) / 1_000_000.0
+                    self._checkpoint_timing.add(elapsed_ms)
+                    with self._checkpoint_stats_lock:
+                        self._checkpoint_count += 1
+                        self._checkpoint_busy += int(busy)
+                        self._checkpoint_pages += int(checkpointed)
+                except sqlite3.Error:
+                    with self._checkpoint_stats_lock:
+                        self._checkpoint_errors += 1
+        finally:
+            connection.close()
 
     def _save_locked(self, record: BeanRecord, event: BeanEvent) -> int:
         if record.bean_ref != event.bean_ref or record.revision != event.revision:
@@ -104,8 +191,7 @@ class SQLiteBeanRepository:
             """
             INSERT INTO sessions(run_id, created_timestamp_ns)
             VALUES (?, ?)
-            ON CONFLICT(run_id) DO UPDATE SET
-                created_timestamp_ns = MIN(created_timestamp_ns, excluded.created_timestamp_ns)
+            ON CONFLICT(run_id) DO NOTHING
             """,
             (ref.run_id, record.created_timestamp_ns),
         )
@@ -130,9 +216,7 @@ class SQLiteBeanRepository:
             ),
         )
         if event.kind in TRACK_EVENT_KINDS:
-            self._save_track(
-                record, include_full_history=event.kind == "bean.created"
-            )
+            self._save_track(record, include_full_history=event.kind == "bean.created")
         for enrichment in record.enrichments:
             value = enrichment_to_dict(enrichment)
             self._connection.execute(
@@ -162,11 +246,14 @@ class SQLiteBeanRepository:
                 INSERT INTO sorting_decisions(
                     decision_id, run_id, sequence, registry_revision, source,
                     timestamp_ns, actuation_timestamp_ns, gate_indices_json,
-                    policy_version, reason, acknowledged_timestamp_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    policy_version, reason, acknowledged_timestamp_ns,
+                    close_timestamp_ns, crossing_timestamp_ns, based_on_revision,
+                    timing_marks_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(decision_id) DO UPDATE SET
                     registry_revision=excluded.registry_revision,
-                    acknowledged_timestamp_ns=excluded.acknowledged_timestamp_ns
+                    acknowledged_timestamp_ns=excluded.acknowledged_timestamp_ns,
+                    timing_marks_json=excluded.timing_marks_json
                 """,
                 (
                     decision.decision_id,
@@ -180,6 +267,80 @@ class SQLiteBeanRepository:
                     decision.policy_version,
                     decision.reason,
                     decision.acknowledged_timestamp_ns,
+                    decision.close_timestamp_ns,
+                    decision.crossing_timestamp_ns,
+                    decision.based_on_revision,
+                    _json(decision.timing_marks_ns),
+                ),
+            )
+        for job in record.inference_jobs:
+            self._connection.execute(
+                """
+                INSERT INTO inference_jobs(
+                    job_id, run_id, sequence, registry_revision, status, camera_id,
+                    frame_index, capture_timestamp_ns, source_registry_revision,
+                    crop_width_px, crop_height_px, padded, submitted_timestamp_ns,
+                    updated_timestamp_ns, detail, source_crop_width_px,
+                    source_crop_height_px, resized, timing_marks_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    registry_revision=excluded.registry_revision,
+                    status=excluded.status,
+                    updated_timestamp_ns=excluded.updated_timestamp_ns,
+                    detail=excluded.detail,
+                    source_crop_width_px=excluded.source_crop_width_px,
+                    source_crop_height_px=excluded.source_crop_height_px,
+                    resized=excluded.resized,
+                    timing_marks_json=excluded.timing_marks_json
+                """,
+                (
+                    job.job_id,
+                    ref.run_id,
+                    ref.sequence,
+                    record.revision,
+                    job.status.value,
+                    job.camera_id,
+                    job.frame_index,
+                    job.capture_timestamp_ns,
+                    job.source_registry_revision,
+                    job.crop_width_px,
+                    job.crop_height_px,
+                    int(job.padded),
+                    job.submitted_timestamp_ns,
+                    job.updated_timestamp_ns,
+                    job.detail,
+                    job.source_crop_width_px,
+                    job.source_crop_height_px,
+                    int(job.resized),
+                    _json(job.timing_marks_ns),
+                ),
+            )
+        if record.actuation is not None:
+            result = record.actuation
+            self._connection.execute(
+                """
+                INSERT INTO actuation_results(
+                    decision_id, run_id, sequence, registry_revision, source,
+                    actual_open_timestamp_ns, actual_close_timestamp_ns,
+                    success, detail
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(decision_id) DO UPDATE SET
+                    registry_revision=excluded.registry_revision,
+                    actual_open_timestamp_ns=excluded.actual_open_timestamp_ns,
+                    actual_close_timestamp_ns=excluded.actual_close_timestamp_ns,
+                    success=excluded.success,
+                    detail=excluded.detail
+                """,
+                (
+                    result.decision_id,
+                    ref.run_id,
+                    ref.sequence,
+                    record.revision,
+                    result.source,
+                    result.actual_open_timestamp_ns,
+                    result.actual_close_timestamp_ns,
+                    int(result.success),
+                    result.detail,
                 ),
             )
         cursor = self._connection.execute(
@@ -272,14 +433,76 @@ class SQLiteBeanRepository:
                         "actuation_timestamp_ns": decision_row[
                             "actuation_timestamp_ns"
                         ],
-                        "gate_indices": json.loads(
-                            decision_row["gate_indices_json"]
-                        ),
+                        "gate_indices": json.loads(decision_row["gate_indices_json"]),
                         "policy_version": decision_row["policy_version"],
                         "reason": decision_row["reason"],
                         "acknowledged_timestamp_ns": decision_row[
                             "acknowledged_timestamp_ns"
                         ],
+                        "close_timestamp_ns": decision_row["close_timestamp_ns"],
+                        "crossing_timestamp_ns": decision_row["crossing_timestamp_ns"],
+                        "based_on_revision": decision_row["based_on_revision"],
+                        "timing_marks_ns": json.loads(
+                            decision_row["timing_marks_json"]
+                        ),
+                    }
+                )
+            )
+            inference_jobs = tuple(
+                InferenceJob(
+                    job_id=str(row["job_id"]),
+                    bean_ref=bean_ref,
+                    status=InferenceStatus(str(row["status"])),
+                    camera_id=str(row["camera_id"]),
+                    frame_index=int(row["frame_index"]),
+                    capture_timestamp_ns=int(row["capture_timestamp_ns"]),
+                    source_registry_revision=int(row["source_registry_revision"]),
+                    crop_width_px=int(row["crop_width_px"]),
+                    crop_height_px=int(row["crop_height_px"]),
+                    padded=bool(row["padded"]),
+                    submitted_timestamp_ns=int(row["submitted_timestamp_ns"]),
+                    updated_timestamp_ns=int(row["updated_timestamp_ns"]),
+                    detail=str(row["detail"]),
+                    source_crop_width_px=int(row["source_crop_width_px"]),
+                    source_crop_height_px=int(row["source_crop_height_px"]),
+                    resized=bool(row["resized"]),
+                    timing_marks_ns={
+                        str(key): int(value)
+                        for key, value in json.loads(
+                            row["timing_marks_json"]
+                        ).items()
+                    },
+                )
+                for row in self._connection.execute(
+                    """
+                    SELECT * FROM inference_jobs WHERE run_id=? AND sequence=?
+                    ORDER BY submitted_timestamp_ns, job_id
+                    """,
+                    (bean_ref.run_id, bean_ref.sequence),
+                )
+            )
+            actuation_row = self._connection.execute(
+                """
+                SELECT * FROM actuation_results WHERE run_id=? AND sequence=?
+                ORDER BY registry_revision DESC LIMIT 1
+                """,
+                (bean_ref.run_id, bean_ref.sequence),
+            ).fetchone()
+            actuation = (
+                None
+                if actuation_row is None
+                else actuation_from_dict(
+                    {
+                        "decision_id": actuation_row["decision_id"],
+                        "source": actuation_row["source"],
+                        "actual_open_timestamp_ns": actuation_row[
+                            "actual_open_timestamp_ns"
+                        ],
+                        "actual_close_timestamp_ns": actuation_row[
+                            "actual_close_timestamp_ns"
+                        ],
+                        "success": bool(actuation_row["success"]),
+                        "detail": actuation_row["detail"],
                     }
                 )
             )
@@ -293,6 +516,8 @@ class SQLiteBeanRepository:
                 prediction=prediction,
                 enrichments=enrichments,
                 decision=decision,
+                inference_jobs=inference_jobs,
+                actuation=actuation,
             )
 
     def list_records(
@@ -328,6 +553,76 @@ class SQLiteBeanRepository:
                 for reference in references
                 if (record := self.load(reference)) is not None
             )
+
+    def list_records_page(
+        self,
+        *,
+        run_id: str,
+        after_sequence: int,
+        limit: int,
+        statuses: Sequence[TrackStatus] | None = None,
+    ) -> tuple[BeanRecord, ...]:
+        clauses = ["run_id=?", "sequence>?"]
+        parameters: list[object] = [run_id, after_sequence]
+        if statuses is not None:
+            values = tuple(status.value for status in statuses)
+            if not values:
+                return ()
+            clauses.append(f"status IN ({','.join('?' for _ in values)})")
+            parameters.extend(values)
+        parameters.append(limit)
+        with self._lock:
+            references = tuple(
+                BeanRef(row["run_id"], int(row["sequence"]))
+                for row in self._connection.execute(
+                    "SELECT run_id, sequence FROM beans WHERE "
+                    + " AND ".join(clauses)
+                    + " ORDER BY sequence LIMIT ?",
+                    parameters,
+                )
+            )
+            return tuple(
+                record
+                for reference in references
+                if (record := self.load(reference)) is not None
+            )
+
+    def run_outcome_counts(self, run_id: str) -> dict[str, int]:
+        """Return settlement counters without materializing bean histories."""
+
+        if not run_id:
+            raise ValueError("run_id is required for outcome counters")
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM beans WHERE run_id=?) AS beans,
+                    (SELECT COUNT(*) FROM inference_jobs WHERE run_id=?) AS jobs,
+                    (SELECT COUNT(DISTINCT sequence) FROM inference_jobs
+                        WHERE run_id=?) AS beans_with_jobs,
+                    (SELECT COUNT(*) FROM inference_jobs
+                        WHERE run_id=? AND status IN ('completed','dropped','failed'))
+                        AS terminal_jobs,
+                    (SELECT COUNT(*) FROM inference_jobs
+                        WHERE run_id=? AND status='completed') AS completed_jobs,
+                    (SELECT COUNT(*) FROM inference_jobs
+                        WHERE run_id=? AND status='dropped') AS dropped_jobs,
+                    (SELECT COUNT(*) FROM inference_jobs
+                        WHERE run_id=? AND status='failed') AS failed_jobs,
+                    (SELECT COUNT(*) FROM sorting_decisions WHERE run_id=?)
+                        AS decisions,
+                    (SELECT COUNT(*) FROM sorting_decisions AS decision
+                        WHERE decision.run_id=? AND (
+                            decision.acknowledged_timestamp_ns IS NOT NULL OR EXISTS(
+                                SELECT 1 FROM actuation_results AS actuation
+                                WHERE actuation.decision_id=decision.decision_id
+                            )
+                        )) AS finalized_decisions
+                """,
+                (run_id,) * 9,
+            ).fetchone()
+        assert row is not None
+        return {key: int(value) for key, value in dict(row).items()}
 
     def event_identity(self, event_id: str) -> tuple[BeanRef, str] | None:
         if not event_id:
@@ -406,8 +701,85 @@ class SQLiteBeanRepository:
                 )
             )
 
-    def close(self) -> None:
+    def event_cursor(self) -> int:
+        """Return the newest persistent registry event sequence."""
+
         with self._lock:
+            row = self._connection.execute(
+                "SELECT COALESCE(MAX(event_sequence), 0) FROM registry_events"
+            ).fetchone()
+            return int(row[0])
+
+    def save_session(self, session: RunSession) -> None:
+        value = run_session_to_dict(session)
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO sessions(
+                    run_id, created_timestamp_ns, revision, status, source_path,
+                    source_kind, frame_count, source_fps, target_fps,
+                    source_start_timestamp_ns, clock_source_timestamp_ns,
+                    clock_monotonic_ns, preview_enabled, updated_timestamp_ns,
+                    settings_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    revision=excluded.revision,
+                    status=excluded.status,
+                    source_path=excluded.source_path,
+                    source_kind=excluded.source_kind,
+                    frame_count=excluded.frame_count,
+                    source_fps=excluded.source_fps,
+                    target_fps=excluded.target_fps,
+                    source_start_timestamp_ns=excluded.source_start_timestamp_ns,
+                    clock_source_timestamp_ns=excluded.clock_source_timestamp_ns,
+                    clock_monotonic_ns=excluded.clock_monotonic_ns,
+                    preview_enabled=excluded.preview_enabled,
+                    updated_timestamp_ns=excluded.updated_timestamp_ns,
+                    settings_json=excluded.settings_json
+                """,
+                (
+                    session.run_id,
+                    session.created_timestamp_ns,
+                    session.revision,
+                    session.state.value,
+                    session.source_path,
+                    session.source_kind,
+                    session.frame_count,
+                    session.source_fps,
+                    session.target_fps,
+                    session.source_start_timestamp_ns,
+                    session.clock_source_timestamp_ns,
+                    session.clock_monotonic_ns,
+                    int(session.preview_enabled),
+                    session.updated_timestamp_ns,
+                    _json(value["settings"]),
+                ),
+            )
+
+    def load_session(self, run_id: str) -> RunSession | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM sessions WHERE run_id=?", (run_id,)
+            ).fetchone()
+            return None if row is None else _session_from_row(row)
+
+    def list_sessions(self) -> tuple[RunSession, ...]:
+        with self._lock:
+            return tuple(
+                _session_from_row(row)
+                for row in self._connection.execute(
+                    "SELECT * FROM sessions ORDER BY created_timestamp_ns, run_id"
+                )
+            )
+
+    def close(self) -> None:
+        self._checkpoint_stop.set()
+        thread = self._checkpoint_thread
+        if thread is not None:
+            thread.join(2.0)
+        self._checkpoint_thread = None
+        with self._lock:
+            self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             self._connection.close()
 
     def __enter__(self) -> SQLiteBeanRepository:  # noqa: PYI034 - Python 3.10
@@ -416,9 +788,7 @@ class SQLiteBeanRepository:
     def __exit__(self, _exc_type, _exc, _traceback) -> None:
         self.close()
 
-    def _save_track(
-        self, record: BeanRecord, *, include_full_history: bool
-    ) -> None:
+    def _save_track(self, record: BeanRecord, *, include_full_history: bool) -> None:
         ref = record.bean_ref
         track = record.track
         self._connection.execute(
@@ -544,7 +914,7 @@ class SQLiteBeanRepository:
 
     def _create_schema(self) -> None:
         current = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-        if current not in (0, SCHEMA_VERSION):
+        if current not in (0, 1, 2, SCHEMA_VERSION):
             raise RuntimeError(
                 f"unsupported BeanRegistry database schema {current}; "
                 f"expected {SCHEMA_VERSION}"
@@ -553,7 +923,20 @@ class SQLiteBeanRepository:
             """
             CREATE TABLE IF NOT EXISTS sessions(
                 run_id TEXT PRIMARY KEY,
-                created_timestamp_ns INTEGER NOT NULL
+                created_timestamp_ns INTEGER NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'created',
+                source_path TEXT NOT NULL DEFAULT '',
+                source_kind TEXT NOT NULL DEFAULT 'implicit',
+                frame_count INTEGER NOT NULL DEFAULT 0,
+                source_fps REAL NOT NULL DEFAULT 0,
+                target_fps REAL NOT NULL DEFAULT 0,
+                source_start_timestamp_ns INTEGER NOT NULL DEFAULT 0,
+                clock_source_timestamp_ns INTEGER NOT NULL DEFAULT 0,
+                clock_monotonic_ns INTEGER NOT NULL DEFAULT 0,
+                preview_enabled INTEGER NOT NULL DEFAULT 0,
+                updated_timestamp_ns INTEGER NOT NULL DEFAULT 0,
+                settings_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE IF NOT EXISTS beans(
                 run_id TEXT NOT NULL,
@@ -632,8 +1015,53 @@ class SQLiteBeanRepository:
                 policy_version TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 acknowledged_timestamp_ns INTEGER,
+                close_timestamp_ns INTEGER,
+                crossing_timestamp_ns INTEGER,
+                based_on_revision INTEGER NOT NULL DEFAULT 0,
+                timing_marks_json TEXT NOT NULL DEFAULT '{}',
                 FOREIGN KEY(run_id, sequence) REFERENCES beans(run_id, sequence)
             );
+            CREATE TABLE IF NOT EXISTS inference_jobs(
+                job_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                registry_revision INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                camera_id TEXT NOT NULL,
+                frame_index INTEGER NOT NULL,
+                capture_timestamp_ns INTEGER NOT NULL,
+                source_registry_revision INTEGER NOT NULL,
+                crop_width_px INTEGER NOT NULL,
+                crop_height_px INTEGER NOT NULL,
+                padded INTEGER NOT NULL,
+                submitted_timestamp_ns INTEGER NOT NULL,
+                updated_timestamp_ns INTEGER NOT NULL,
+                detail TEXT NOT NULL,
+                source_crop_width_px INTEGER NOT NULL DEFAULT 0,
+                source_crop_height_px INTEGER NOT NULL DEFAULT 0,
+                resized INTEGER NOT NULL DEFAULT 0,
+                timing_marks_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(run_id, sequence) REFERENCES beans(run_id, sequence)
+            );
+            CREATE INDEX IF NOT EXISTS inference_jobs_bean_index
+                ON inference_jobs(run_id, sequence, submitted_timestamp_ns);
+            CREATE TABLE IF NOT EXISTS actuation_results(
+                decision_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                registry_revision INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                actual_open_timestamp_ns INTEGER NOT NULL,
+                actual_close_timestamp_ns INTEGER NOT NULL,
+                success INTEGER NOT NULL,
+                detail TEXT NOT NULL,
+                FOREIGN KEY(decision_id) REFERENCES sorting_decisions(decision_id),
+                FOREIGN KEY(run_id, sequence) REFERENCES beans(run_id, sequence)
+            );
+            CREATE INDEX IF NOT EXISTS sorting_decisions_bean_revision_index
+                ON sorting_decisions(run_id, sequence, registry_revision DESC);
+            CREATE INDEX IF NOT EXISTS actuation_results_bean_revision_index
+                ON actuation_results(run_id, sequence, registry_revision DESC);
             CREATE TABLE IF NOT EXISTS registry_events(
                 event_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id TEXT NOT NULL UNIQUE,
@@ -651,11 +1079,74 @@ class SQLiteBeanRepository:
                 ON registry_events(run_id, sequence, event_sequence);
             """
         )
+        session_columns = {
+            "revision": "INTEGER NOT NULL DEFAULT 0",
+            "status": "TEXT NOT NULL DEFAULT 'created'",
+            "source_path": "TEXT NOT NULL DEFAULT ''",
+            "source_kind": "TEXT NOT NULL DEFAULT 'implicit'",
+            "frame_count": "INTEGER NOT NULL DEFAULT 0",
+            "source_fps": "REAL NOT NULL DEFAULT 0",
+            "target_fps": "REAL NOT NULL DEFAULT 0",
+            "source_start_timestamp_ns": "INTEGER NOT NULL DEFAULT 0",
+            "clock_source_timestamp_ns": "INTEGER NOT NULL DEFAULT 0",
+            "clock_monotonic_ns": "INTEGER NOT NULL DEFAULT 0",
+            "preview_enabled": "INTEGER NOT NULL DEFAULT 0",
+            "updated_timestamp_ns": "INTEGER NOT NULL DEFAULT 0",
+            "settings_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for name, declaration in session_columns.items():
+            self._ensure_column("sessions", name, declaration)
+        decision_columns = {
+            "close_timestamp_ns": "INTEGER",
+            "crossing_timestamp_ns": "INTEGER",
+            "based_on_revision": "INTEGER NOT NULL DEFAULT 0",
+            "timing_marks_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for name, declaration in decision_columns.items():
+            self._ensure_column("sorting_decisions", name, declaration)
+        inference_columns = {
+            "source_crop_width_px": "INTEGER NOT NULL DEFAULT 0",
+            "source_crop_height_px": "INTEGER NOT NULL DEFAULT 0",
+            "resized": "INTEGER NOT NULL DEFAULT 0",
+            "timing_marks_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for name, declaration in inference_columns.items():
+            self._ensure_column("inference_jobs", name, declaration)
         self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._connection.commit()
 
+    def _ensure_column(self, table: str, name: str, declaration: str) -> None:
+        names = {
+            str(row["name"])
+            for row in self._connection.execute(f"PRAGMA table_info({table})")
+        }
+        if name not in names:
+            self._connection.execute(
+                f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+            )
+
 
 def _json(value: object) -> str:
-    return json.dumps(
-        value, allow_nan=False, separators=(",", ":"), sort_keys=True
+    return json.dumps(value, allow_nan=False, separators=(",", ":"), sort_keys=True)
+
+
+def _session_from_row(row: sqlite3.Row) -> RunSession:
+    return run_session_from_dict(
+        {
+            "run_id": row["run_id"],
+            "revision": row["revision"],
+            "state": row["status"],
+            "source_path": row["source_path"],
+            "source_kind": row["source_kind"],
+            "frame_count": row["frame_count"],
+            "source_fps": row["source_fps"],
+            "target_fps": row["target_fps"],
+            "source_start_timestamp_ns": row["source_start_timestamp_ns"],
+            "clock_source_timestamp_ns": row["clock_source_timestamp_ns"],
+            "clock_monotonic_ns": row["clock_monotonic_ns"],
+            "preview_enabled": bool(row["preview_enabled"]),
+            "created_timestamp_ns": row["created_timestamp_ns"],
+            "updated_timestamp_ns": row["updated_timestamp_ns"],
+            "settings": json.loads(row["settings_json"]),
+        }
     )

@@ -53,6 +53,7 @@ class DetectionPipelineTests(unittest.TestCase):
 
     def test_default_component_minimums_match_review_tuning(self):
         settings = DetectorSettings()
+        self.assertEqual(settings.close_kernel, 3)
         self.assertEqual(settings.min_area_px, 2_000)
         self.assertEqual(settings.min_width_px, 50)
         self.assertEqual(settings.min_height_px, 50)

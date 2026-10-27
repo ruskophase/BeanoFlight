@@ -1,0 +1,12 @@
+[Unit]
+Description=Lock Jetson clocks for a Beano performance boot
+After=nvpmodel.service
+ConditionKernelCommandLine=beanoflight.performance=1
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/jetson_clocks
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

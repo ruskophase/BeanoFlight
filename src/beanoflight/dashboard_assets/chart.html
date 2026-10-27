@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Beano · Chart explorer</title>
+  <link rel="stylesheet" href="dashboard.css">
+</head>
+<body data-chart-page="true">
+  <header class="masthead">
+    <a class="brand" href="index.html#overview" aria-label="Return to Batch summary"><span class="mark">B</span><div><strong>Beano</strong><small>Batch statistics</small></div></a>
+    <div class="header-tools">
+      <div class="batch-meta"><span class="status-dot"></span><span id="batch-id">Loading batch…</span></div>
+      <button class="cart-button" id="open-cart"><span>Review collection</span><strong id="cart-count">0</strong></button>
+    </div>
+  </header>
+
+  <main class="standalone-main">
+    <a class="back-link" href="index.html#overview">← Back to dashboard</a>
+    <section class="standalone-chart-page">
+      <div class="page-heading">
+        <div><p class="eyebrow" id="standalone-eyebrow">Interactive chart</p><h1 id="standalone-title">Loading…</h1></div>
+        <button class="button secondary" data-open-cart>Open review collection</button>
+      </div>
+      <article class="panel standalone-chart-panel">
+        <div id="standalone-controls"></div>
+        <canvas id="standalone-chart" class="chart standalone-chart"></canvas>
+        <p class="explanation" id="standalone-explanation"></p>
+      </article>
+      <div class="standalone-note">
+        <strong>Selection:</strong> click a histogram bar or point; drag across a scatter plot to select a region. Selected beans can then be added to the named review collection.
+      </div>
+    </section>
+  </main>
+
+  <aside id="selection-drawer" class="selection-drawer" aria-live="polite">
+    <div class="selection-head">
+      <div><p class="eyebrow">Chart selection</p><h2><span id="selection-count">0</span> beans</h2><p id="selection-description">Click the chart to inspect its beans.</p></div>
+      <button id="close-selection" class="icon-button" aria-label="Close selection">×</button>
+    </div>
+    <label class="select-visible"><input id="select-visible" type="checkbox"><span>Select all <strong id="visible-tile-count">0</strong> visible tiles <small id="visible-selected-count">0 selected</small></span></label>
+    <div class="selection-actions">
+      <button class="button secondary" id="export-selection">Export chart result CSV</button>
+      <button class="button secondary" id="export-contact">Export swatch sheet</button>
+      <button class="text-button" id="clear-selection">Clear</button>
+    </div>
+    <div id="selection-summary" class="selection-summary"></div>
+    <div id="bean-gallery" class="bean-gallery"></div>
+    <div class="pagination"><button id="page-prev" class="icon-button">←</button><span id="page-status"></span><button id="page-next" class="icon-button">→</button></div>
+  </aside>
+
+  <aside id="collection-drawer" class="collection-drawer" aria-live="polite">
+    <div class="selection-head">
+      <div><p class="eyebrow">Threshold-building dataset</p><h2>Review collection</h2><p>Accumulate beans from several chart selections. Bean IDs are deduplicated automatically.</p></div>
+      <button id="close-cart" class="icon-button" aria-label="Close collection">×</button>
+    </div>
+    <label class="collection-name">Collection label<input id="collection-name" type="text" value="review-collection" maxlength="80" placeholder="e.g. orange-yellow"></label>
+    <div id="collection-summary" class="selection-summary"></div>
+    <div class="collection-actions">
+      <button class="button" id="export-cart-csv">Export named CSV</button>
+      <button class="button secondary" id="export-cart-json">Back up JSON</button>
+      <label class="button secondary file-button">Import JSON<input id="import-cart-json" type="file" accept="application/json,.json"></label>
+      <button class="text-button danger" id="clear-cart">Clear collection</button>
+    </div>
+    <div id="collection-list" class="collection-list"></div>
+  </aside>
+
+  <div id="tooltip" class="tooltip" role="tooltip"></div>
+  <script src="batch-data.js"></script>
+  <script src="dashboard.js"></script>
+</body>
+</html>
