@@ -65,20 +65,29 @@ class RunSession:
         return self.target_fps / self.source_fps
 
     def source_to_monotonic_ns(self, source_timestamp_ns: int) -> int | None:
-        scale = self.playback_scale
+        scale = self.clock_scale
         if self.state not in {RunState.RUNNING, RunState.COMPLETED} or scale <= 0:
             return None
         source_delta = source_timestamp_ns - self.clock_source_timestamp_ns
         return self.clock_monotonic_ns + round(source_delta / scale)
 
     def monotonic_to_source_ns(self, monotonic_ns: int) -> int:
-        scale = self.playback_scale
+        scale = self.clock_scale
         if self.state in {RunState.CREATED, RunState.PAUSED, RunState.FAILED}:
             return self.clock_source_timestamp_ns
         if scale <= 0:
             return self.clock_source_timestamp_ns
         monotonic_delta = monotonic_ns - self.clock_monotonic_ns
         return self.clock_source_timestamp_ns + round(monotonic_delta * scale)
+
+    @property
+    def clock_scale(self) -> float:
+        rate = self.settings.get('live_clock_source_rate_ppb')
+        if rate is None:
+            return self.playback_scale
+        if not isinstance(rate, int) or abs(rate - 1_000_000_000) > 2_000_000:
+            raise ValueError('invalid live hardware clock rate')
+        return rate / 1_000_000_000
 
 
 @dataclass(frozen=True, slots=True)

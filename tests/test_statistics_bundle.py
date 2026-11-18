@@ -25,6 +25,37 @@ from beanoflight.statistics_features import (
 
 
 class StatisticsFeatureTests(unittest.TestCase):
+    def test_focus_proxy_responds_to_blur_inside_silhouette(self):
+        y, x = np.indices((100, 100))
+        texture = np.asarray((x // 5 + y // 5) % 2 * 110 + 70, np.uint8)
+        sharp = cv2.cvtColor(texture, cv2.COLOR_GRAY2BGR)
+        blurred = cv2.GaussianBlur(sharp, (11, 11), 0)
+        mask = np.zeros((100, 100), np.uint8)
+        cv2.circle(mask, (50, 50), 34, 255, -1)
+        a = extract_view_features(sharp, mask).values["focus_gradient"]
+        b = extract_view_features(blurred, mask).values["focus_gradient"]
+        self.assertGreater(a, b * 1.5)
+
+    def test_all_sample_pairs_are_saved_and_middle_sample_is_representative(self):
+        import json
+
+        bean = {"bean_id": "photos/000007", "bean_sequence": 7}
+        image = np.zeros((32, 32, 3), np.uint8)
+        samples = [
+            {"CamL": _photo_jpeg(image), "CamR": _photo_jpeg(image),
+             "frame_index": 10 + index, "right_frame_index": 20 + index,
+             "timestamp_ns": 100 + index, "sample_index": index}
+            for index in (1, 2, 3)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_bean_photos(root, [bean], {BeanRef("photos", 7): samples})
+            self.assertEqual(len(list((root / "photos").glob("*.jpg"))), 6)
+            self.assertEqual(bean["photo_frame_index"], 12)
+            index = json.loads((root / "photos/index.json").read_text())
+            self.assertEqual(len(index["photos"][0]["samples"]), 3)
+            self.assertEqual(index["photos"][0]["CamL"], bean["photo_CamL"])
+
     def test_default_closing_kernel_matches_live_detector(self):
         self.assertEqual(BundleSettings().detector_close_kernel, 3)
         self.assertEqual(DetectorSettings().close_kernel, 3)

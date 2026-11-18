@@ -1,0 +1,16 @@
+{
+  "machine_id": "replace-with-a-stable-machine-uuid",
+  "host": "0.0.0.0",
+  "port": 8091,
+  "controller_url": "http://127.0.0.1:8000",
+  "data_root": "/srv/beano/machine-jobs",
+  "token_file": "/srv/beano/private/job-api-token",
+  "settings_file": "/path/to/ESP_Web_controller/app/static/candidate-settings.json",
+  "calibration_pack": "/path/to/final-product-calibration-pack",
+  "nozzle_map": "/path/to/active-wired-nozzle-map.json",
+  "maximum_pause_seconds": 600,
+  "recordings": {
+    "reference": {"name": "Reference recording", "path": "/path/to/reference-raw-recording"},
+    "white": {"name": "White-painted beans recording", "path": "/path/to/white-beans-raw-recording"}
+  }
+}

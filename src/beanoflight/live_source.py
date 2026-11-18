@@ -33,6 +33,7 @@ from .source import (
     _stored_value_lut,
 )
 from .stereo import StereoPointCalibration
+from .live_clock import LiveClockModel
 
 _PREVIEW_HEADER = struct.Struct("<8s6I4Q")
 _PREVIEW_MAGIC = b"BFCAP01"
@@ -156,10 +157,12 @@ class FastCapLiveProducer:
         preview_paths: dict[str, Path],
         *,
         duration_seconds: float,
+        frame_rate_hz: float | None = None,
         controller_url: str | None = None,
         witness_result: Path | None = None,
         test_override: bool = False,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
+        record_raw: bool = False,
     ) -> None:
         self.calibration_pack = calibration_pack.expanduser().resolve()
         self.state_root = state_root.expanduser().resolve()
@@ -167,13 +170,17 @@ class FastCapLiveProducer:
             name: path.expanduser().resolve() for name, path in preview_paths.items()
         }
         self.duration_seconds = duration_seconds
+        self.frame_rate_hz = frame_rate_hz
         self.controller_url = controller_url
         self.witness_result = witness_result
         self.test_override = bool(test_override)
         self.event_callback = event_callback or (lambda _event: None)
+        self.record_raw = record_raw
         self.process: subprocess.Popen[str] | None = None
         self.clock_source_timestamp_ns = 0
         self.clock_monotonic_ns = 0
+        self.clock_mapping: str | None = None
+        self.live_clock = LiveClockModel()
         self._events: queue.Queue[dict[str, Any]] = queue.Queue()
         self._stderr: list[str] = []
         self._reader: threading.Thread | None = None
@@ -182,6 +189,14 @@ class FastCapLiveProducer:
     def start(self, *, timeout_seconds: float = 15.0) -> None:
         if self.process is not None:
             raise SourceError("FastCap live producer has already been started")
+        # FastCap validates this root even when frames are kept only in memory.
+        # Prepare it for every capture mode before launching the child process.
+        try:
+            self.state_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise SourceError(
+                f"Cannot create FastCap output directory {self.state_root}: {exc}"
+            ) from exc
         fastcap_source = Path(__file__).resolve().parents[3] / "BeanoFastCap/src"
         environment = dict(os.environ)
         existing_path = environment.get("PYTHONPATH", "")
@@ -206,10 +221,14 @@ class FastCapLiveProducer:
         ]
         if self.controller_url:
             command.extend(("--controller-url", self.controller_url))
+        if self.frame_rate_hz is not None:
+            command.extend(("--fps", str(self.frame_rate_hz)))
         if self.witness_result is not None:
             command.extend(("--witness-result", str(self.witness_result)))
         if self.test_override:
             command.append("--test-override")
+        if self.record_raw:
+            command[2:4] = ["beanoflight.machine_jobs.capture"]
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
@@ -234,6 +253,7 @@ class FastCapLiveProducer:
             if event.get("event") == "synchronized":
                 self.clock_source_timestamp_ns = int(event["source_timestamp_ns"])
                 self.clock_monotonic_ns = int(event["anchor_monotonic_ns"])
+                self.clock_mapping = event.get("clock_mapping")
                 return
         self.close()
         raise SourceError("FastCap did not synchronize both live cameras within timeout")
@@ -258,6 +278,10 @@ class FastCapLiveProducer:
             except queue.Empty:
                 return
 
+    def clock_snapshot(self):
+        """Fail closed if the native counter sampler has stopped or jumped."""
+        return self.live_clock.snapshot(time.monotonic_ns())
+
     def close(self) -> None:
         process = self.process
         if process is None:
@@ -265,7 +289,7 @@ class FastCapLiveProducer:
         if process.poll() is None:
             process.send_signal(signal.SIGINT)
             try:
-                process.wait(timeout=5.0)
+                process.wait(timeout=30.0 if self.record_raw else 5.0)
             except subprocess.TimeoutExpired:
                 process.terminate()
                 try:
@@ -287,6 +311,12 @@ class FastCapLiveProducer:
             except json.JSONDecodeError:
                 value = {"event": "fastcap_output", "message": line.rstrip()}
             if isinstance(value, dict):
+                if value.get('event') in {'clock_sample', 'synchronized'} and 'counter_timestamp_ns' in value:
+                    try:
+                        self.live_clock.observe(int(value['counter_timestamp_ns']),
+                            int(value['counter_monotonic_ns']), int(value['clock_sample_bracket_ns']))
+                    except Exception as exc:
+                        self._events.put({'event': 'clock_error', 'message': str(exc)})
                 self._events.put(value)
 
     def _read_stderr(self) -> None:

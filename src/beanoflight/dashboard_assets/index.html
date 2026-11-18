@@ -66,6 +66,7 @@
 
       <section class="page" id="page-appearance">
         <div class="page-heading"><div><p class="eyebrow">Colour &amp; brightness</p><h1>Appearance</h1></div></div>
+        <div class="metric-grid compact" id="appearance-review-metrics"></div>
         <article class="panel threshold-panel">
           <div><p class="eyebrow">Interactive review screen</p><h2>Dark-bean threshold</h2><p>Beans at or below <span id="threshold-value">—</span> L* are selected. This is a review aid, not yet a production class boundary.</p></div>
           <label>Standard deviations below mean <output id="sigma-output">2.0</output><input id="sigma-slider" type="range" min="0" max="4" value="2" step="0.1"></label>
@@ -99,6 +100,12 @@
           <article class="panel chart-panel"><div class="panel-heading"><div><p class="eyebrow">Geometry agreement</p><h2><a class="chart-title-link" href="chart.html#area-ratio">CamR / CamL area ratio</a></h2></div><span class="hint">Click a bar</span></div><canvas id="ratio-chart" class="chart"></canvas><p class="explanation">A ratio near 1 means similar silhouette area. Larger departures can reflect pose, segmentation quality, or a bean falling away from the calibrated plane.</p></article>
           <article class="panel chart-panel"><div class="panel-heading"><div><p class="eyebrow">Colour agreement</p><h2><a class="chart-title-link" href="chart.html#lightness-delta">CamR − CamL lightness</a></h2></div><span class="hint">Click a bar</span></div><canvas id="delta-chart" class="chart"></canvas><p class="explanation">A value near 0 means both views reconstructed similar mean lightness. Systematic displacement suggests inter-camera photometric bias; isolated tails warrant bean-level review.</p></article>
         </div>
+        <div class="two-column focus-only">
+          <article class="panel chart-panel"><div class="panel-heading"><div><p class="eyebrow">Relative sharpness</p><h2>CamR / CamL focus proxy</h2></div><span class="hint">Click a bar</span></div><canvas id="focus-ratio-chart" class="chart"></canvas><p class="explanation">Masked interior gradient strength, measured before JPEG encoding. Different surface textures and camera responses mean this is a comparative tuning signal, not a direct distance measurement.</p></article>
+          <article class="panel chart-panel"><div class="panel-heading"><div><p class="eyebrow">Waterfall position</p><h2>Focus balance by height</h2></div></div><canvas id="focus-band-chart" class="chart"></canvas><p class="explanation">Median CamR/CamL focus ratio in ten horizontal frame bands. The dotted line is equal measured sharpness; compare repeated runs after moving the waterfall.</p></article>
+        </div>
+        <article class="panel chart-panel wide focus-only"><div class="panel-heading"><div><p class="eyebrow">Absolute sharpness profile</p><h2>CamL and CamR focus proxy by height</h2></div></div><canvas id="focus-level-chart" class="chart"></canvas><p class="explanation">Separate median interior-gradient values for each camera. CamL is green; CamR is blue. Camera and surface differences still affect the comparison.</p></article>
+        <article class="panel chart-panel wide focus-only"><div class="panel-heading"><div><p class="eyebrow">Plane crossing clue</p><h2>Area balance by height</h2></div></div><canvas id="area-band-chart" class="chart"></canvas><p class="explanation">Median CamR/CamL projected-area ratio in the same ten bands. Changes with height may suggest a shifting fall path, but bean pose and segmentation also affect silhouette area.</p><p class="explanation" id="stereo-band-counts"></p></article>
         <div class="metric-grid compact" id="stereo-metrics"></div>
       </section>
 

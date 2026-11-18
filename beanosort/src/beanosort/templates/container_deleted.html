@@ -1,0 +1,8 @@
+{% extends 'base.html' %}{% from 'macros.html' import portion_link, portion_note with context %}{% block content %}
+<p class="eyebrow">Deleted container</p><h1>{{ deletion.data.before.label }}</h1>
+<p class="notice">This empty container was deleted on {{ deletion.created_at|localtime }}. Its old label resolves to this deletion record.</p>
+<p class="identity">{{ deletion.data.container_id }}</p>
+<p>{{ deletion.data.reason }}</p>
+<details class="card"><summary>Deletion audit</summary><pre>{{ deletion.data|tojson(indent=2) }}</pre><p>Operator {{ deletion.operator_id }}</p></details>
+<section class="card"><h2>Material history</h2>{% for row in contents_history %}<p>{{ portion_link(row.portion_id) }}</p>{% else %}<p>No material was recorded in this container.</p>{% endfor %}</section><a class="button" href="/containers">Return to containers</a>
+{% endblock %}

@@ -1,0 +1,20 @@
+{% extends 'base.html' %}{% from 'macros.html' import tokens %}
+{% block content %}
+<p class="eyebrow">Location management</p><h1>Delete {{ location.name }}</h1>
+<p class="identity">{{ location.id }}</p>
+<section class="card">
+{% if containers %}
+<p class="notice">This location still contains {{ containers|length }} container{{ '' if containers|length == 1 else 's' }}. Move or remove all containers, including archived containers, before deleting it.</p>
+<ul>{% for container in containers %}<li><a href="/containers/{{ container.id }}">{{ container.label }}</a>{% if container.archived %} · Archived{% endif %}</li>{% endfor %}</ul>
+<p><a href="/handling/move">Move a container to another location</a></p>
+{% else %}
+<p>No containers are recorded here. Delete this location from the list of storage places. Its history will remain available.</p>
+<form action="/locations/{{ location.id }}/delete" method="post">{{ tokens(csrf) }}
+<input type="hidden" name="revision" value="{{ location.revision }}">
+<label class="check"><input name="confirmed" type="checkbox" required>I confirm this location has been cleared of containers and should be deleted.</label>
+<button class="danger">Delete location</button>
+</form>
+{% endif %}
+<p><a href="/locations/{{ location.id }}">Back to location</a> · <a href="/locations">All locations</a></p>
+</section>
+{% endblock %}

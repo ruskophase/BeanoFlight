@@ -1,0 +1,29 @@
+{% extends 'base.html' %}{% from 'macros.html' import tokens with context %}
+{% macro choices(source=false) %}<option value="">Choose a container</option>{% for row in rows %}<option value="{{ row.container.id }}"{% if (source and not row.source_eligible) or (not source and not row.eligible) or (kind == 'product_packaging' and not row.packaging_eligible) %} disabled{% endif %}{% if selected == row.container.id %} selected{% endif %} data-mass-mg="{{ row.state.mass_mg }}" data-tare-mg="{{ row.state.tare_mg if row.state.tare_mg is not none else '' }}" data-capacity-mg="{{ row.state.capacity_mg if row.state.capacity_mg is not none else '' }}" data-portion="{{ row.state.portion_id or '' }}">{{ container_description(row.container) }}{% if row.state.locked %} · Active job{% elif row.state.packed %} · Packaged material{% elif row.state.quality == 'held' or row.state.hold_reason %} · Quality held{% endif %}</option>{% endfor %}{% endmacro %}
+{% block content %}
+<p class="eyebrow">Material handling</p><h1>{{ 'Move contents' if kind == 'contents_move' else 'Reconciliation' }}</h1>
+{% if environment == 'simulation' %}<p class="notice">Isolated simulation: enter the scale readings represented by this training operation.</p>{% endif %}
+<form class="card" method="post" action="{{ '/handling/contents' if kind == 'contents_move' else '/handling/reconcile' }}" data-material-form="{{ kind }}">{{ tokens(csrf) }}
+{% for row in rows %}<input type="hidden" name="state_{{ row.container.id }}" value="{{ row.token }}">{% endfor %}
+{% if kind == 'contents_move' %}
+<p>For a partial move, enter the measured net mass. To move everything, select Empty the source container: its entire recorded balance is transferred without a new weighing.</p>
+<div class="grid two"><label>Source container<select name="source_id" required>{{ choices(true) }}</select></label><label>Destination container<select name="destination_id" required>{{ choices() }}</select></label></div>
+<label><span data-moved-mass-label>Measured net mass moved (kg)</span><input name="moved_mass" type="number" inputmode="decimal" min="0.000001" step="0.000001" required placeholder="Enter the scale reading"></label>
+<label class="check"><input name="empty_source" type="checkbox">Empty the source container — all its contents have been moved.</label>
+<p class="muted" data-whole-move-note hidden>No weighing is needed. The recorded source balance is carried over in full. Use Reconciliation separately if its recorded weight needs correcting.</p>
+<p class="muted">A complete move into an empty destination retains the portion ID. Splits and combinations create new portions with recorded ancestry.</p>
+{% else %}
+<p>Enter the current scale reading. This updates the recorded mass immediately and keeps the previous weighing in the history. A zero net weight empties the recorded container.</p>
+<label>Container<select name="container_id" required>{{ choices() }}</select></label>
+<div class="grid two"><label>Scale reading is<select name="weighing_basis"><option value="gross">Container + contents (gross)</option><option value="net">Contents only (net, scale already tared)</option></select></label>
+<label>Scale reading (kg)<input name="weight" type="number" inputmode="decimal" min="0" step="0.000001" required placeholder="Enter the current scale reading"></label></div>
+{% endif %}
+<section class="prediction" data-material-preview role="status" aria-live="polite"><p>Choose containers and enter the weighing to review the resulting balances.</p></section>
+<label>{{ 'Movement notes (optional)' if kind == 'contents_move' else 'Reason for this adjustment' }}<textarea name="reason" rows="2" maxlength="2000"{% if kind == 'weight_adjustment' %} required{% endif %} placeholder="{{ 'Any observations about this movement' if kind == 'contents_move' else 'e.g. sample removed, spill, or corrected scale reading' }}"></textarea></label>
+<details data-population-assumption><summary>Population estimates</summary><label class="check"><input name="representative" type="checkbox" checked>Assume the transferred or remaining material is representative of its source.</label><p>Existing population estimates are inherited under this assumption. Clear it for selective removals or movements; subsequent composition will be recorded as unknown. Weighing does not identify individual beans.</p></details>
+{% if kind == 'contents_move' %}<p class="muted">Known population evidence is retained when all contributing contents have it. Combining known and unknown populations, or two unknown populations, leaves the resulting population unknown.</p>{% endif %}
+<p class="muted">{{ 'Record movement confirms the material was moved. Partial moves use the entered scale reading; complete moves use the recorded source balance.' if kind == 'contents_move' else 'Record weighing confirms this is the current contents measurement.' }} Existing quality holds are preserved. Containers committed to active jobs are unavailable.</p>
+<button>{{ 'Record movement' if kind == 'contents_move' else 'Record weighing' }}</button>
+</form><p><a href="/handling">Back to material handling</a></p>
+<script src="/static/material.js" defer></script>
+{% endblock %}

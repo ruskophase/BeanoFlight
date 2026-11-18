@@ -16,6 +16,10 @@
     return bean;
   });
   const beansById = new Map(beans.map(bean => [bean.bean_id, bean]));
+  const samplePairs = payload.sample_pairs || {};
+  const stereoSamples = payload.stereo_samples || [];
+  const trajectoryData = payload.trajectories || {};
+  if (!stereoSamples.length) document.querySelectorAll(".focus-only").forEach(element => { element.style.display = "none"; });
   const summary = payload.summary || {};
   const counts = summary.counts || {};
   const distributions = summary.distributions || {};
@@ -31,6 +35,10 @@
   let selectionContext = { metric: "appearance", paired: false, chart: "unknown" };
   let galleryPage = 0;
   let modalBeanIndex = -1;
+  let modalSampleIndex = 0;
+  let fullFrameOpen = false;
+  let showCurrentPaths = false;
+  let showFinalPaths = false;
   const pageSize = 60;
   const collectionStorageKey = `beano-review-collection:${summary.source_run_id || "unknown"}`;
   let collection = { label: "review-collection", entries: {} };
@@ -76,6 +84,15 @@
     return usable[lower] + (usable[upper] - usable[lower]) * (index - lower);
   }
 
+  const focusByBean = new Map();
+  for (const sample of stereoSamples) {
+    if (sample[3] > 0 && sample[4] > 0) {
+      if (!focusByBean.has(sample[0])) focusByBean.set(sample[0], []);
+      focusByBean.get(sample[0]).push(sample[4] / sample[3]);
+    }
+  }
+  for (const bean of beans) bean.focus_ratio = quantile(focusByBean.get(bean.bean_id) || [], .5);
+
   document.getElementById("batch-id").textContent = summary.source_run_id || "Completed batch";
   installSelectionControls();
   installCollectionControls();
@@ -90,17 +107,77 @@
     installThreshold();
     const availablePages = new Set(["overview", "appearance", "size", "stereo", "timeline", "health"]);
     showPage(availablePages.has(location.hash.slice(1)) ? location.hash.slice(1) : "overview", false);
+    for (const [id, kind] of [["area-scatter", "area-scatter"], ["ratio-chart", "area-ratio"],
+      ["delta-chart", "lightness-delta"], ["focus-ratio-chart", "focus-ratio"]]) {
+      chartInterpretation(id, cameraComparison(kind));
+    }
+  }
+
+  function chartInterpretation(canvasId, text) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas || !text) return;
+    let paragraph = document.getElementById(`${canvasId}-interpretation`);
+    if (!paragraph) {
+      paragraph = document.createElement("p");
+      paragraph.id = `${canvasId}-interpretation`;
+      paragraph.className = "explanation chart-interpretation";
+      canvas.parentElement.append(paragraph);
+    }
+    paragraph.textContent = `This bundle: ${text}`;
+  }
+
+  function comparisonCaution(kind) {
+    if (kind === "focus") return "Higher focus proxy means stronger measured image gradients, not necessarily better optical focus. Texture, illumination, camera response and crop size also matter; this chart is not the separate full-size-only focus comparison.";
+    if (kind === "lightness") return "This compares the two visible bean surfaces; lighting, surface colour and camera response can differ. It does not establish which camera is closer.";
+    return "Larger projected area can be consistent with being closer to that camera, but pose, silhouette segmentation and calibration also affect it. This alone does not locate the waterfall or prescribe a movement.";
+  }
+
+  function cameraComparison(kind) {
+    if (!["area-scatter", "area-ratio", "lightness-delta", "focus-ratio"].includes(kind)) return "";
+    const metricKind = kind === "lightness-delta" ? "lightness" : kind === "focus-ratio" ? "focus" : "area";
+    const neutral = metricKind === "lightness" ? 0 : 1;
+    const values = kind === "area-scatter"
+      ? beans.filter(b => finite(b.caml_area) && finite(b.camr_area) && b.caml_area > 0 && b.camr_area > 0).map(b => b.camr_area / b.caml_area)
+      : beans.map(b => b[{"area-ratio": "area_ratio", "lightness-delta": "lightness_delta", "focus-ratio": "focus_ratio"}[kind]])
+          .filter(v => finite(v) && (metricKind === "lightness" || v > 0));
+    if (!values.length) return `No valid paired ${metricKind} measurements are available, so no camera comparison can be made.`;
+    const left = values.filter(v => v < neutral).length;
+    const right = values.filter(v => v > neutral).length;
+    const equal = values.length - left - right;
+    const description = {area: "larger in projected area", lightness: "brighter", focus: "higher in measured focus proxy"}[metricKind];
+    const countsText = `${number.format(values.length)} beans with valid paired values: ${pct(left, values.length)} ${description} in CamL, ${pct(right, values.length)} in CamR, and ${pct(equal, values.length)} exactly equal.`;
+    const direction = left === right
+      ? (equal === values.length ? "All measured values are equal between cameras." : "Neither camera has more beans on its side of equality.")
+      : `More beans are ${description} in ${left > right ? "CamL" : "CamR"} than in ${left > right ? "CamR" : "CamL"}.`;
+    const median = quantile(values, .5);
+    const medianText = metricKind === "lightness"
+      ? `Median CamR − CamL lightness: ${fmt(median, 3)} L*.`
+      : `Median CamR/CamL ${metricKind === "focus" ? "focus proxy" : "area"} ratio: ${fmt(median, 3)}.`;
+    const axes = kind === "area-scatter" ? "Above the diagonal means larger in CamR; below means larger in CamL." :
+      metricKind === "lightness" ? "Positive values mean brighter in CamR; negative values mean brighter in CamL." :
+      `Ratios above 1 mean ${description} in CamR; below 1 mean ${description} in CamL.`;
+    return `${direction} ${countsText} ${medianText} ${axes} ${values.length < 20 ? "Fewer than 20 beans: treat this as a small sample. " : ""}${comparisonCaution(metricKind)}`;
+  }
+
+  function bandInterpretation(values, kind) {
+    const valid = values.map((value, index) => ({value, band: index + 1})).filter(p => finite(p.value));
+    if (!valid.length) return "Not enough valid measurements in bands with at least 20 tracked beans to interpret height dependence.";
+    const list = predicate => valid.filter(p => predicate(p.value)).map(p => p.band).join(", ") || "none";
+    const description = kind === "focus" ? "higher measured focus proxy" : "larger projected area";
+    const first = valid[0], last = valid[valid.length - 1];
+    const endpoints = valid.length < 2 ? "Only one band is plotted, so no height change can be inferred." :
+      `Uppermost plotted band ${first.band}: ${fmt(first.value, 3)}; lowermost plotted band ${last.band}: ${fmt(last.value, 3)}. ${last.value === first.value ? "The end-point ratios are equal." : `The lower end-point is relatively more weighted towards ${last.value > first.value ? "CamR" : "CamL"}; intermediate bands need not follow a steady trend.`}`;
+    return `Bands run from 1 (top of image) to 10 (bottom). CamR has ${description} in bands ${list(v => v > 1)}; CamL in bands ${list(v => v < 1)}; equal medians in bands ${list(v => v === 1)}. ${endpoints} These are medians of sampled CamR/CamL ratios, not necessarily the same beans tracked through every band. ${comparisonCaution(kind)}`;
   }
 
   function renderSummary() {
     const total = counts.confirmed_beans || beans.length;
-    const candidates = dark.candidate_count || beans.filter(bean => bean.dark_2sd).length;
     const colourCount = counts.beans_with_colour == null ? beans.filter(bean => finite(bean.lightness)).length : counts.beans_with_colour;
     document.getElementById("summary-metrics").innerHTML = [
       metric("Confirmed beans", number.format(total), "One row per completed bean track"),
       metric("Two-sample coverage", pct(counts.beans_with_two_samples || 0, total), `${number.format(counts.beans_with_two_samples || 0)} beans`, counts.beans_with_two_samples === total ? "good" : "warn"),
       metric("Colour coverage", pct(colourCount, total), `${number.format(colourCount)} with approximate Lab`, colourCount === total ? "good" : "warn"),
-      metric("Dark review set", number.format(candidates), `${pct(candidates, total)} at mean − 2 SD`),
+      hasPhotos ? metric("Saved bean photographs", number.format(counts.saved_bean_crop_images ?? total * 2), "Individual CamL and CamR crop images") : metric("Measured observations", number.format(counts.derived_observations || 0), "Numerical measurements, not photographs"),
     ].join("");
     const complete = (counts.beans_without_samples || 0) === 0;
     document.getElementById("quality-banner").innerHTML = `${payload.classification === "test" ? '<div class="notice warn"><span class="notice-mark">!</span><div><strong>Test recording only</strong><span>Calibration witness did not pass for this run. Review these measurements and photographs as exploratory evidence, not production validation.</span></div></div>' : ""}<div class="notice ${complete ? "good" : "warn"}"><span class="notice-mark">${complete ? "✓" : "!"}</span><div><strong>${complete ? "Every confirmed bean has statistics" : "Some confirmed beans have no statistics"}</strong><span>${number.format(counts.beans_with_two_samples || 0)} have two samples; ${number.format(counts.beans_with_one_sample || 0)} use the explicit one-sample fallback; ${number.format(counts.beans_without_samples || 0)} have none.</span></div></div>`;
@@ -130,10 +207,18 @@
   function renderStereoMetrics() {
     const ratio = distributions.projected_area_ratio_camr_to_caml_median || {};
     const delta = distributions.approx_lab_l_view_delta_median || {};
+    const focus = beans.map(bean => bean.focus_ratio).filter(finite);
+    const focusLeft = stereoSamples.map(sample => sample[3]).filter(finite);
+    const focusRight = stereoSamples.map(sample => sample[4]).filter(finite);
     document.getElementById("stereo-metrics").innerHTML = [
       metric("Median area ratio", fmt(ratio.p50), "CamR / CamL; ideal agreement is 1.00"),
       metric("Area ratio p10–p90", `${fmt(ratio.p10)}–${fmt(ratio.p90)}`, "Central 80% of measured beans"),
       metric("Median L* difference", fmt(delta.p50), "CamR minus CamL"),
+      ...(focus.length ? [
+        metric("Median focus ratio", fmt(quantile(focus, .5)), "CamR / CamL interior gradient proxy"),
+        metric("Focus ratio p10–p90", `${fmt(quantile(focus, .1))}–${fmt(quantile(focus, .9))}`, `${number.format(focus.length)} beans with valid focus`),
+        metric("Median focus per view", `${fmt(quantile(focusLeft, .5))} / ${fmt(quantile(focusRight, .5))}`, "CamL / CamR; relative proxy units"),
+      ] : []),
       metric("Edge-affected beans", number.format(counts.beans_with_sensor_edge_observation || 0), "At least one observation touched a sensor boundary", counts.beans_with_sensor_edge_observation ? "warn" : "good"),
     ].join("");
   }
@@ -234,6 +319,7 @@
 
   function renderStandaloneChart() {
     const id = "standalone-chart";
+    chartInterpretation(id, cameraComparison(standaloneChart));
     if (standaloneChart === "lightness") {
       const sigma = Number(document.getElementById("standalone-sigma")?.value || 2);
       const centre = finite(dark.lightness_mean) ? dark.lightness_mean : mean(beans.map(bean => bean.lightness));
@@ -291,6 +377,10 @@
       } else if (name === "stereo") {
         histogram("ratio-chart", "area_ratio", { xLabel: "CamR area / CamL area", colour: "#44835b", marker: { value: 1, label: "equal area" }, paired: true, chartId: "area-ratio" });
         histogram("delta-chart", "lightness_delta", { xLabel: "CamR L* − CamL L*", colour: "#a15d83", marker: { value: 0, label: "equal lightness" }, paired: true, chartId: "lightness-delta" });
+        if (stereoSamples.length) {
+          histogram("focus-ratio-chart", "focus_ratio", { xLabel: "CamR / CamL focus proxy", colour: "#397c61", marker: { value: 1, label: "equal focus" }, paired: true, bins: 60, chartId: "focus-ratio" });
+          renderStereoBands();
+        }
       } else if (name === "timeline") {
         timelineHistogram("throughput-chart");
         scatter("timeline-lightness", "time", "lightness", { xLabel: "Elapsed batch time (seconds)", yLabel: "Approximate Lab L*", colourByBean: true, radius: 1.6, xMinimum: 0, chartId: "timeline-lightness" });
@@ -303,6 +393,8 @@
     const centre = finite(dark.lightness_mean) ? dark.lightness_mean : mean(beans.map(bean => bean.lightness));
     const deviation = finite(dark.lightness_sample_standard_deviation) ? dark.lightness_sample_standard_deviation : standardDeviation(beans.map(bean => bean.lightness));
     const threshold = centre - sigma * deviation;
+    const candidates = dark.candidate_count || beans.filter(bean => bean.dark_2sd).length;
+    document.getElementById("appearance-review-metrics").innerHTML = metric("Dark review set", number.format(candidates), `${pct(candidates, beans.length)} at mean − 2 SD`);
     document.getElementById("threshold-value").textContent = fmt(threshold);
     histogram("lightness-chart", "lightness", { xLabel: "Approximate Lab L*", colour: "#b97937", marker: { value: threshold, label: `mean − ${sigma.toFixed(1)} SD` }, highlightBelow: threshold, chartId: "lightness" });
     scatter("lab-chart", "lab_a", "lab_b", { xLabel: "Lab a* (green → red)", yLabel: "Lab b* (blue → yellow)", colourByBean: true, radius: 1.8, chartId: "lab" });
@@ -381,6 +473,80 @@
     context.fillText(xLabel, (area.left + area.right) / 2, area.bottom + 43);
     context.save(); context.translate(12, (area.top + area.bottom) / 2); context.rotate(-Math.PI / 2); context.fillText(yLabel, 0, 0); context.restore();
     context.restore();
+  }
+  function renderStereoBands() {
+    const height = trajectoryData.image_size_px?.[1] || 1088;
+    const bands = Array.from({ length: 10 }, () => ({ focus: [], area: [], left: [], right: [], beans: new Set() }));
+    for (const sample of stereoSamples) {
+      if (!finite(sample[2])) continue;
+      const band = bands[Math.max(0, Math.min(9, Math.floor(sample[2] / height * 10)))];
+      if (sample[3] > 0 && sample[4] > 0) {
+        band.focus.push(sample[4] / sample[3]);
+        band.left.push(sample[3]); band.right.push(sample[4]);
+      }
+      if (finite(sample[5]) && sample[5] > 0) band.area.push(sample[5]);
+      band.beans.add(sample[0]);
+    }
+    for (const [id, key, colour] of [["focus-band-chart", "focus", "#397c61"], ["area-band-chart", "area", "#4483a3"]]) {
+      const canvas = document.getElementById(id);
+      if (!canvas) continue;
+      const values = bands.map(band => band.beans.size >= 20 ? quantile(band[key], .5) : null);
+      chartInterpretation(id, bandInterpretation(values, key));
+      const { context, width, height: canvasHeight } = canvasContext(canvas);
+      const area = plotArea(width, canvasHeight);
+      const domain = extent([1, ...values.filter(finite)], .1);
+      axes(context, area, [1, 10], domain, "Horizontal band (top to bottom)", `Median CamR / CamL ${key}`);
+      const unity = scale(1, domain[0], domain[1], area.bottom, area.top);
+      context.strokeStyle = "#7d8580"; context.setLineDash([4, 4]); context.beginPath(); context.moveTo(area.left, unity); context.lineTo(area.right, unity); context.stroke(); context.setLineDash([]);
+      context.strokeStyle = colour; context.fillStyle = colour; context.lineWidth = 2;
+      values.forEach((value, index) => {
+        if (!finite(value)) return;
+        const x = scale(index + 1, 1, 10, area.left, area.right);
+        const y = scale(value, domain[0], domain[1], area.bottom, area.top);
+        context.beginPath(); context.arc(x, y, 4, 0, Math.PI * 2); context.fill();
+        if (index && finite(values[index - 1])) {
+          const previousX = scale(index, 1, 10, area.left, area.right);
+          const previousY = scale(values[index - 1], domain[0], domain[1], area.bottom, area.top);
+          context.beginPath(); context.moveTo(previousX, previousY); context.lineTo(x, y); context.stroke();
+        }
+      });
+    }
+    const levelCanvas = document.getElementById("focus-level-chart");
+    if (levelCanvas) {
+      const { context, width, height: canvasHeight } = canvasContext(levelCanvas);
+      const area = plotArea(width, canvasHeight);
+      const left = bands.map(band => band.beans.size >= 20 ? quantile(band.left, .5) : null);
+      const right = bands.map(band => band.beans.size >= 20 ? quantile(band.right, .5) : null);
+      const valid = left.map((value, index) => ({left: value, right: right[index], band: index + 1}))
+        .filter(p => finite(p.left) && finite(p.right));
+      const list = predicate => valid.filter(predicate).map(p => p.band).join(", ") || "none";
+      const endpoints = valid.length >= 2 ? `From uppermost plotted band ${valid[0].band} to lowermost plotted band ${valid[valid.length - 1].band}, CamL changes from ${fmt(valid[0].left, 3)} to ${fmt(valid[valid.length - 1].left, 3)} and CamR from ${fmt(valid[0].right, 3)} to ${fmt(valid[valid.length - 1].right, 3)}. This end-point comparison need not describe a steady trend.` : "Too few populated bands to infer a height change.";
+      chartInterpretation("focus-level-chart", valid.length ? `CamL (green) has the higher median focus proxy in bands ${list(p => p.left > p.right)}; CamR (blue) in bands ${list(p => p.right > p.left)}; equal values in bands ${list(p => p.left === p.right)}. Bands run from top (1) to bottom (10) of the image. ${endpoints} These are separate per-camera sample medians, not a median of paired ratios. ${comparisonCaution("focus")}` : "Not enough paired focus measurements in bands with at least 20 tracked beans to interpret height dependence.");
+      const domain = extent([...left, ...right].filter(finite), .1);
+      axes(context, area, [1, 10], domain, "Horizontal band (top to bottom)", "Median focus proxy");
+      for (const [values, colour] of [[left, "#397c61"], [right, "#4483a3"]]) {
+        context.strokeStyle = colour; context.fillStyle = colour; context.lineWidth = 2;
+        values.forEach((value, index) => {
+          if (!finite(value)) return;
+          const x = scale(index + 1, 1, 10, area.left, area.right);
+          const y = scale(value, domain[0], domain[1], area.bottom, area.top);
+          context.beginPath(); context.arc(x, y, 4, 0, Math.PI * 2); context.fill();
+          if (index && finite(values[index - 1])) {
+            context.beginPath();
+            context.moveTo(scale(index, 1, 10, area.left, area.right), scale(values[index - 1], domain[0], domain[1], area.bottom, area.top));
+            context.lineTo(x, y); context.stroke();
+          }
+        });
+      }
+    }
+    const areaMedians = bands.map(band => band.beans.size >= 20 ? quantile(band.area, .5) : null);
+    const crossings = [];
+    for (let index = 1; index < areaMedians.length; index++) {
+      const before = areaMedians[index - 1], after = areaMedians[index];
+      if (finite(before) && finite(after) && (before - 1) * (after - 1) <= 0)
+        crossings.push(`${index}–${index + 1}`);
+    }
+    document.getElementById("stereo-band-counts").textContent = `Unique beans per band, top to bottom: ${bands.map(band => number.format(band.beans.size)).join(" · ")}. Bands with fewer than 20 beans are not plotted. ${crossings.length ? `Area-ratio unity is crossed between bands ${crossings.join(", ")}; this is a balance clue, not a measured plane intersection.` : "No robust area-ratio unity crossing was observed."}`;
   }
   function axisNumber(value) {
     if (Math.abs(value) >= 1e6) return `${(value / 1e6).toFixed(1)}m`;
@@ -676,6 +842,7 @@
   function openBeanModal(bean) {
     modalBeanIndex = selected.findIndex(candidate => candidate.bean_id === bean.bean_id);
     if (modalBeanIndex < 0) return;
+    modalSampleIndex = 0;
     renderBeanModal();
     document.getElementById("bean-modal").classList.add("open");
   }
@@ -687,19 +854,107 @@
   function moveBeanModal(direction) {
     if (!selected.length) return;
     modalBeanIndex = Math.min(selected.length - 1, Math.max(0, modalBeanIndex + direction));
+    modalSampleIndex = 0;
+    // Frame visibility and trajectory overlays are viewing preferences, not bean state.
+    // Keep all three when navigating; only the selected capture starts over.
     renderBeanModal();
   }
 
   function renderBeanModal() {
     const bean = selected[modalBeanIndex];
     if (!bean) return;
-    const colourView = hasPhotos ? `<div class="modal-photo-pair"><figure><img src="${escapeHtml(bean.photo_CamL)}" alt="CamL calibrated crop of bean ${escapeHtml(bean.sequence)}"><figcaption>CamL <i style="background:${beanColour(bean, "caml")}"></i></figcaption></figure><figure><img src="${escapeHtml(bean.photo_CamR)}" alt="CamR calibrated crop of bean ${escapeHtml(bean.sequence)}"><figcaption>CamR <i style="background:${beanColour(bean, "camr")}"></i></figcaption></figure></div>` : selectionContext.paired
+    const samples = samplePairs[bean.bean_id] || [{ CamL: bean.photo_CamL, CamR: bean.photo_CamR, frame_index: bean.first_frame }];
+    modalSampleIndex = Math.min(modalSampleIndex, samples.length - 1);
+    const sample = samples[modalSampleIndex];
+    const colourView = hasPhotos ? `<div class="sample-nav"><button class="button secondary" id="sample-prev" aria-label="Previous capture">←</button><span>Capture ${modalSampleIndex + 1} of ${samples.length} · frames CamL ${sample.frame_index ?? "—"} / CamR ${sample.right_frame_index ?? "—"}</span><button class="button secondary" id="sample-next" aria-label="Next capture">→</button></div><div class="modal-photo-pair"><figure><img src="${escapeHtml(sample.CamL)}" alt="CamL calibrated crop of bean ${escapeHtml(bean.sequence)}"><figcaption>CamL <i style="background:${beanColour(bean, "caml")}"></i></figcaption></figure><figure><img src="${escapeHtml(sample.CamR)}" alt="CamR calibrated crop of bean ${escapeHtml(bean.sequence)}"><figcaption>CamR <i style="background:${beanColour(bean, "camr")}"></i></figcaption></figure></div><div class="frame-controls"><button class="button secondary" id="toggle-frame">${fullFrameOpen ? "Hide entire frame" : "View entire frame"}</button>${fullFrameOpen ? '<label><input id="show-current-paths" type="checkbox"> Show all trajectories as known at this frame</label><label><input id="show-final-paths" type="checkbox"> Show all final trajectories + extrapolated tails</label>' : ""}</div>${fullFrameOpen ? '<p class="frame-status" id="frame-status">Full frame not available — showing recorded bean positions on black. CamR non-sample paths are projected; dotted tails are visual extrapolations only.</p><div class="frame-pair"><div class="frame-panel"><strong>CamL</strong><img id="full-CamL" alt="Full CamL frame"><canvas id="overlay-CamL"></canvas></div><div class="frame-panel"><strong>CamR</strong><img id="full-CamR" alt="Full CamR frame"><canvas id="overlay-CamR"></canvas></div></div>' : ""}` : selectionContext.paired
       ? `<div class="modal-view paired"><div class="modal-view-half" style="background:${beanColour(bean, "caml")}"><strong>CamL view</strong></div><div class="modal-view-half" style="background:${beanColour(bean, "camr")}"><strong>CamR view</strong></div></div>`
       : `<div class="modal-view" style="background:${beanColour(bean)}"></div>`;
-    document.getElementById("modal-content").innerHTML = `<div class="modal-heading"><p class="eyebrow">${hasPhotos ? "Calibrated paired photographs" : "Numerical live evidence"} · ${escapeHtml(selectionContext.chart)}</p><h2 id="modal-bean-title">Bean #${escapeHtml(bean.sequence)}</h2><p>${escapeHtml(bean.bean_id)}</p></div>${colourView}<div class="modal-data"><div><strong>Combined Lab</strong><span>L* ${fmt(bean.lightness)} · a* ${fmt(bean.lab_a)} · b* ${fmt(bean.lab_b)} · C* ${fmt(bean.chroma)}</span></div><div><strong>CamL Lab</strong><span>L* ${fmt(bean.caml_lightness)} · a* ${fmt(bean.caml_lab_a)} · b* ${fmt(bean.caml_lab_b)} · C* ${fmt(bean.caml_chroma)}</span></div><div><strong>CamR Lab</strong><span>L* ${fmt(bean.camr_lightness)} · a* ${fmt(bean.camr_lab_a)} · b* ${fmt(bean.camr_lab_b)} · C* ${fmt(bean.camr_chroma)}</span></div><div><strong>Projected geometry</strong><span>Area ${fmt(bean.projected_area)} ${areaUnit} · volume ${compact(bean.volume_proxy)} ${volumeUnit}</span></div><div><strong>Stereo agreement</strong><span>Area ratio ${fmt(bean.area_ratio)} · L* Δ ${fmt(bean.lightness_delta)}</span></div><div><strong>Capture quality</strong><span>${bean.sample_count || 0} sample(s) · ${bean.measurement_views || 0} view(s)${bean.sensor_edge ? " · sensor edge" : ""}${bean.enrichment_fallback ? " · fallback" : ""}</span></div></div>`;
+    const captureMetrics = hasPhotos && (finite(sample.focus_ratio) || finite(sample.area_ratio))
+      ? `<p class="frame-status">This capture: focus R/L ${fmt(sample.focus_ratio)} · projected area R/L ${fmt(sample.area_ratio)}</p>` : "";
+    document.getElementById("modal-content").innerHTML = `<div class="modal-heading"><p class="eyebrow">${hasPhotos ? "Calibrated paired photographs" : "Numerical live evidence"} · ${escapeHtml(selectionContext.chart)}</p><h2 id="modal-bean-title">Bean #${escapeHtml(bean.sequence)}${hasPhotos ? ` (${modalSampleIndex + 1}/${samples.length})` : ""}</h2><p>${escapeHtml(bean.bean_id)}</p></div>${colourView}${captureMetrics}<div class="modal-data"><div><strong>Combined Lab</strong><span>L* ${fmt(bean.lightness)} · a* ${fmt(bean.lab_a)} · b* ${fmt(bean.lab_b)} · C* ${fmt(bean.chroma)}</span></div><div><strong>CamL Lab</strong><span>L* ${fmt(bean.caml_lightness)} · a* ${fmt(bean.caml_lab_a)} · b* ${fmt(bean.caml_lab_b)} · C* ${fmt(bean.caml_chroma)}</span></div><div><strong>CamR Lab</strong><span>L* ${fmt(bean.camr_lightness)} · a* ${fmt(bean.camr_lab_a)} · b* ${fmt(bean.camr_lab_b)} · C* ${fmt(bean.camr_chroma)}</span></div><div><strong>Projected geometry</strong><span>Area ${fmt(bean.projected_area)} ${areaUnit} · volume ${compact(bean.volume_proxy)} ${volumeUnit}</span></div><div><strong>Stereo agreement</strong><span>Area ratio ${fmt(bean.area_ratio)} · focus ratio ${fmt(bean.focus_ratio)} · L* Δ ${fmt(bean.lightness_delta)}</span></div><div><strong>Capture quality</strong><span>${bean.sample_count || 0} sample(s) · ${bean.measurement_views || 0} view(s)${bean.sensor_edge ? " · sensor edge" : ""}${bean.enrichment_fallback ? " · fallback" : ""}</span></div></div>`;
+    if (hasPhotos) {
+      document.getElementById("sample-prev").disabled = modalSampleIndex === 0;
+      document.getElementById("sample-next").disabled = modalSampleIndex === samples.length - 1;
+      document.getElementById("sample-prev").onclick = () => { modalSampleIndex--; renderBeanModal(); };
+      document.getElementById("sample-next").onclick = () => { modalSampleIndex++; renderBeanModal(); };
+      document.getElementById("toggle-frame").onclick = () => { fullFrameOpen = !fullFrameOpen; renderBeanModal(); };
+      if (fullFrameOpen) {
+        document.getElementById("show-current-paths").checked = showCurrentPaths;
+        document.getElementById("show-final-paths").checked = showFinalPaths;
+        document.getElementById("show-current-paths").onchange = event => { showCurrentPaths = event.target.checked; drawFrameOverlay(sample); };
+        document.getElementById("show-final-paths").onchange = event => { showFinalPaths = event.target.checked; drawFrameOverlay(sample); };
+        loadFullFrames(sample);
+        drawFrameOverlay(sample);
+      }
+    }
     document.getElementById("modal-prev").disabled = modalBeanIndex === 0;
     document.getElementById("modal-next").disabled = modalBeanIndex === selected.length - 1;
     updateModalReviewCheckbox(bean);
+  }
+
+  function loadFullFrames(sample) {
+    if (!Number.isInteger(sample.frame_index)) return;
+    for (const camera of ["CamL", "CamR"]) {
+      const image = document.getElementById(`full-${camera}`);
+      const portable = sample[`full_${camera}`];
+      if (!portable && !/^https?:$/.test(location.protocol)) continue;
+      image.onload = () => {
+        const status = document.getElementById("frame-status");
+        if (status) status.textContent = `${portable ? "Portable full frame loaded from this bundle" : "Source frame loaded from recording"}. Green dots are observed now; amber dots are last known positions. CamR non-sample paths are central-plane projections; dotted tails are visual, not nozzle-crossing predictions.`;
+      };
+      image.onerror = () => { image.removeAttribute("src"); };
+      image.src = portable || `/api/frame?frame=${encodeURIComponent(sample.frame_index)}&camera=${camera}`;
+    }
+  }
+
+  function drawFrameOverlay(sample) {
+    const positions = trajectoryData.frame_positions?.[String(sample.frame_index)] || [];
+    const finalPaths = trajectoryData.final_paths || {};
+    const width = trajectoryData.image_size_px?.[0] || 1456;
+    const height = trajectoryData.image_size_px?.[1] || 1088;
+    const frame = Number(sample.frame_index);
+    for (const camera of ["CamL", "CamR"]) {
+      const canvas = document.getElementById(`overlay-${camera}`);
+      if (!canvas) continue;
+      canvas.width = width; canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      const xIndex = camera === "CamL" ? 1 : 4;
+      const yIndex = camera === "CamL" ? 2 : 5;
+      for (const point of positions) {
+        const identity = `/${String(point[0]).padStart(6, "0")}`;
+        const path = Object.entries(finalPaths).find(([key]) => key.endsWith(identity))?.[1] || [];
+        const pathX = camera === "CamL" ? 1 : 3;
+        const pathY = camera === "CamL" ? 2 : 4;
+        for (const [enabled, subset, colour] of [
+          [showCurrentPaths, path.filter(entry => entry[0] <= frame), "#62d6ff"],
+          [showFinalPaths, path, "#ffe78c"],
+        ]) {
+          if (!enabled || subset.length < 2) continue;
+          ctx.strokeStyle = colour; ctx.lineWidth = 2;
+          if (camera === "CamR") ctx.setLineDash([6, 4]);
+          ctx.beginPath(); ctx.moveTo(subset[0][pathX], subset[0][pathY]);
+          for (const entry of subset.slice(1)) ctx.lineTo(entry[pathX], entry[pathY]);
+          ctx.stroke(); ctx.setLineDash([]);
+          if (enabled === showFinalPaths && colour === "#ffe78c" && subset.length > 1) {
+            const last = subset.at(-1), previous = subset.at(-2);
+            const dy = last[pathY] - previous[pathY];
+            if (dy > 0) {
+              const extension = Math.min(120, Math.max(0, height - last[pathY]));
+              ctx.strokeStyle = colour; ctx.setLineDash([3, 5]); ctx.beginPath();
+              ctx.moveTo(last[pathX], last[pathY]);
+              ctx.lineTo(last[pathX] + (last[pathX] - previous[pathX]) / dy * extension, last[pathY] + extension);
+              ctx.stroke(); ctx.setLineDash([]);
+            }
+          }
+        }
+        if (!finite(point[xIndex]) || !finite(point[yIndex])) continue;
+        ctx.fillStyle = point[3] ? "#69f6a7" : "#ffd568";
+        ctx.beginPath(); ctx.arc(point[xIndex], point[yIndex], 8, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = "#10271c"; ctx.lineWidth = 2; ctx.stroke();
+        ctx.font = "bold 21px system-ui"; ctx.fillStyle = "white";
+        ctx.fillText(`#${point[0]}${camera === "CamR" && !point[6] ? " ~" : ""}`, point[xIndex] + 12, point[yIndex] - 10);
+      }
+    }
   }
 
   function updateModalReviewCheckbox(bean) {
@@ -718,6 +973,7 @@
     if (metricName === "volume_proxy") return [`Volume ${compact(bean.volume_proxy)} ${volumeUnit}`, `Projected area ${fmt(bean.projected_area)} ${areaUnit}`];
     if (metricName === "projected_area") return [`Projected area ${fmt(bean.projected_area)} ${areaUnit}`, `Volume ${compact(bean.volume_proxy)} ${volumeUnit}`];
     if (metricName === "area_ratio") return [`CamL ${fmt(bean.caml_area)} · CamR ${fmt(bean.camr_area)} ${areaUnit}`, `Area ratio ${fmt(bean.area_ratio)}`];
+    if (metricName === "focus_ratio") return [`CamR/CamL focus proxy ${fmt(bean.focus_ratio)}`, `Area ratio ${fmt(bean.area_ratio)}`];
     if (metricName === "lightness_delta") return [`CamL L* ${fmt(bean.caml_lightness)} · CamR L* ${fmt(bean.camr_lightness)}`, `Lightness Δ ${fmt(bean.lightness_delta)}`];
     if (metricName === "caml_area,camr_area") return [`CamL ${fmt(bean.caml_area)} · CamR ${fmt(bean.camr_area)} ${areaUnit}`, `Ratio ${fmt(bean.area_ratio)} · volume ${compact(bean.volume_proxy)}`];
     if (metricName === "time") return [`Elapsed ${fmt(bean.time)} s · frame ${bean.first_frame ?? "—"}`, `L* ${fmt(bean.lightness)} · volume ${compact(bean.volume_proxy)}`];

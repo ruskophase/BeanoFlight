@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beanosort"
+version = "0.1.0"
+description = "Population-aware material workflow with separate manual sorter controls"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "sqlalchemy>=2.0,<2.1",
+  "alembic>=1.14,<2", "psycopg[binary]>=3.2,<4", "jinja2>=3.1,<4",
+  "python-multipart>=0.0.20,<1", "itsdangerous>=2.2,<3", "qrcode>=8,<9",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9", "httpx>=0.28,<1"]
+
+[project.scripts]
+beanosort = "beanosort.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+beanosort = ["templates/*.html", "static/*.css", "static/*.js", "static/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

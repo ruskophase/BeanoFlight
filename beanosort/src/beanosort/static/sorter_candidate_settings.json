@@ -1,0 +1,108 @@
+{
+  "schema": "beano-sorting-settings/v1",
+  "name": "Candidate 3",
+  "saved_date": "2026-11-16",
+  "air_pressure": {
+    "value": 30,
+    "unit": "PSI",
+    "source": "Operator specified; manually regulated"
+  },
+  "duration_seconds": 600,
+  "conveyor": {
+    "speed_steps_per_second": 20,
+    "direction": "reverse",
+    "acceleration_steps_per_second_squared": 10
+  },
+  "vibration_motor": {
+    "frequency_hz": 4000,
+    "duty_percent": 38.0,
+    "direction": "clockwise"
+  },
+  "cameras": {
+    "frame_rate_hz": 59.5,
+    "trigger_low_us": 50,
+    "strobe_lead_us": 250,
+    "strobe_lag_us": 10
+  },
+  "valves": {
+    "lead_ms": 4,
+    "lag_ms": 0,
+    "pulse_duration_ms": 4,
+    "gpio_by_output": {
+      "-V1": 1,
+      "V0": 2,
+      "+V1": 3
+    },
+    "nozzle_map": "pinkplane-align/nozzle-map_20261106T122534.718267Z_down-30mm_depth-15mm_wired.json",
+    "previous_nozzle_map": "pinkplane-align/nozzle-map_20261027T123840.839979Z_down-30mm_depth-15mm_wired.json",
+    "nozzle_map_sha256": "7a2e303579700670c0f5a195ffbcb8ea40c188f12573558272235f80c16da391",
+    "nozzle_map_updated_utc": "2026-11-06T12:30:36.209236+00:00"
+  },
+  "selection_policy": {
+    "version": "exploratory-white-L19-C5p5-S020-colour-only-first-stereo-v4",
+    "colour_per_camera": {
+      "lab_l_mean_min_inclusive": 19,
+      "lab_chroma_mean_max_inclusive": 5.5,
+      "hsv_saturation_mean_max_inclusive": 0.2
+    },
+    "live_evidence": "First valid complete calibrated stereo frame must pass all three colour thresholds in both cameras. No physical size or volume calculation/filter. A confirmed track and timely nozzle prediction are separately required. A failing first valid sample excludes the track.",
+    "required_stereo_observations": 1,
+    "size_filter_enabled": false,
+    "volume_calculation_enabled": false,
+    "neighbour_rule": "Withhold if another predicted track has >=0.05 probability at a selected nozzle and crosses within its firing window plus 10ms either side",
+    "nozzle_channels": [
+      -1,
+      0,
+      1
+    ],
+    "maximum_frame_age_before_measurement_ms": 35,
+    "minimum_actuator_notice_ms": 4,
+    "requested_crop_size_px": 192,
+    "measurement_scheduling": "One in-flight background stereo measurement; no queue; immutable RAW frame retained until completion; tracking and ready actuation commands take priority.",
+    "maximum_measurements_in_flight": 1,
+    "clock_mapping": "Tegra hardware counter to host monotonic; refreshed once per second with measured source/host rate; immutable mapping per submitted plan",
+    "clock_sample_maximum_age_ms": 3000,
+    "clock_mapping_maximum_jump_ms": 1,
+    "calibration_pack": "Camera_Tuner/beano-deed5ac0914f/final-product-2026-10-18_12-41-56-r4",
+    "script_sha256": {
+      "white_rule.py": "5046fd23cca4c37ab7ea641f189a94e813ad4ebcfaf12630177585505290dd6b",
+      "run_sorting_trial.py": "9d5241b80da9845eb1812301b44f6eef939aed1034545db7ed0fd15ffef546f0"
+    },
+    "purity_target": 0.995,
+    "purity_verified": false
+  },
+  "reference_run": "diagnostics/white-beans-20261031/sorting-selection/runs/white-sort-gui-conv20-vib38-f4000-lead4-lag0-10min-20261116T0744",
+  "derived_from": "Candidate 2",
+  "reference_run_note": "Completed ten-minute test: 470 transmitted firing decisions with hardware results; 467 passed the crossing-window audit, and three closed 0.307–0.709 microseconds before the predicted crossing with zero lag. Two additional plans were withheld for lateness. Physical ejection accuracy and purity remain unverified.",
+  "status": "Working candidate; exploratory, purity unverified",
+  "reference_validation": {
+    "report": "diagnostics/white-beans-20261031/sorting-selection/runs/white-sort-gui-conv20-vib38-f4000-lead4-lag0-10min-20261116T0744/run-verification.json",
+    "tracked_beans": 2981,
+    "accepted_firing_decisions": 470,
+    "hardware_confirmed_successful_decisions": 467,
+    "nozzle_pulses": 532,
+    "hardware_crossing_window_flags": [
+      {
+        "bean": "9ae1cf34/000116",
+        "close_minus_predicted_crossing_ns": -307,
+        "pulse_duration_ns": 3999919
+      },
+      {
+        "bean": "9ae1cf34/001421",
+        "close_minus_predicted_crossing_ns": -709,
+        "pulse_duration_ns": 3999921
+      },
+      {
+        "bean": "9ae1cf34/002586",
+        "close_minus_predicted_crossing_ns": -567,
+        "pulse_duration_ns": 3999890
+      }
+    ],
+    "plans_withheld_before_transmission_due_to_lateness": 2,
+    "rejected_transmitted_commands": 0,
+    "frames": 35667,
+    "late_frames": 8,
+    "late_frame_percent": 0.022429696918720387,
+    "all_outputs_off": true
+  }
+}

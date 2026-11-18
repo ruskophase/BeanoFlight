@@ -1,0 +1,14 @@
+{% extends 'base.html' %}{% from 'macros.html' import tokens %}
+{% block content %}
+<p class="eyebrow">Container storage</p><h1>Locations</h1>
+<p>Find containers by where they are stored. Locations can be floors, loading bays, shelves or any other named place.</p>
+<div class="grid two">
+<section class="card"><h2>Add a location</h2><form action="/locations" method="post">{{ tokens(csrf) }}
+<label>Location name<input name="name" required maxlength="200" placeholder="e.g. Shelf --- NewBeans"></label>
+<button>Add location</button></form></section>
+<section class="card"><h2>Storage places</h2>
+{% for location, count in location_rows %}<a class="job-row" href="/locations/{{ location.id }}"><strong>{{ location.name }}</strong><span class="badge">{{ count }} container{{ '' if count == 1 else 's' }}</span></a>
+{% else %}<p>Add your first storage location.</p>{% endfor %}
+<p class="muted">Counts include any archived containers still recorded here.</p>
+</section></div>
+{% endblock %}

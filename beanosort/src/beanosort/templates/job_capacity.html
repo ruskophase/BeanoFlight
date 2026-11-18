@@ -1,0 +1,8 @@
+<section class="capacity-warning" data-capacity-monitor data-status="{{ op.status }}" data-url="/jobs/{{ op.id }}/capacity-status" data-transition="/jobs/{{ op.id }}/transition" data-csrf="{{ csrf }}"{% if not capacity_rows|rejectattr('level','equalto','normal')|list %} hidden{% endif %} role="region" aria-label="Receiving container capacity">
+<div data-capacity-messages aria-live="polite">
+{% for row in capacity_rows if row.level != 'normal' %}<div class="capacity-message {{ row.level }}"><strong>{{ row.stream }} · {{ row.label }}: {{ '≈ ' if row.mass_known else 'at least ' }}{{ row.fill_percent }}% of nominal capacity</strong><p>{{ row.mass_mg|kg }} kg / {{ row.capacity_mg|kg }} kg nominal. {{ row.basis }}. {% if op.status == 'paused' and row.percent_exact|float >= 100 %}Resuming overrides the current level; next automatic pause: {{ row.resume_pause_percent }}%{% else %}Next automatic pause: {{ row.next_pause_percent }}%{% endif %}.</p></div>{% endfor %}
+</div>
+<p class="capacity-explanation">Warnings begin at 90%. The workflow pauses at 100%, then every further 5% after an operator resumes. Estimated fills are not live scale readings. These pauses send no physical stop command.</p>
+<div class="actions" data-capacity-actions>{% if op.status == 'paused' %}<form method="post" action="/jobs/{{ op.id }}/transition"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="target" value="running"><input type="hidden" name="reason" value="Operator reviewed receiving capacity and explicitly resumed"><button>Override capacity warning & resume</button></form><a class="button secondary" href="/jobs/{{ op.id }}/change-containers">Change containers</a>{% endif %}</div>
+</section>
+<script src="/static/sort_capacity.js" defer></script>

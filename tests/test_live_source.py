@@ -5,13 +5,16 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 import numpy as np
 
 from beanoflight.live_source import (
+    FastCapLiveProducer,
     SharedMemoryRawStereoSource,
     SharedRawRegion,
+    SourceError,
 )
 
 HEADER = struct.Struct("<8s6I4Q")
@@ -59,6 +62,83 @@ class PreviewWriter:
 
 
 class LiveSourceTests(unittest.TestCase):
+    def test_producer_passes_requested_rate_and_preserves_hardware_anchor(self):
+        for rate in (None, 60.0):
+            with self.subTest(rate=rate), tempfile.TemporaryDirectory() as directory:
+                producer = FastCapLiveProducer(
+                    Path('/pack'), Path(directory),
+                    {'CamL': Path('/left'), 'CamR': Path('/right')},
+                    duration_seconds=30, frame_rate_hz=rate,
+                )
+                producer._events.put({
+                    'event': 'synchronized', 'source_timestamp_ns': 121000000000,
+                    'anchor_monotonic_ns': 100000000000,
+                    'clock_mapping': 'tegra-cntvct-to-monotonic',
+                })
+                process = Mock()
+                process.poll.return_value = None
+                with patch('beanoflight.live_source.subprocess.Popen', return_value=process) as popen, \
+                        patch('beanoflight.live_source.threading.Thread'):
+                    producer.start()
+                command = popen.call_args.args[0]
+                if rate is None:
+                    self.assertNotIn('--fps', command)
+                else:
+                    self.assertEqual(command[command.index('--fps') + 1], '60.0')
+                self.assertEqual(producer.clock_monotonic_ns, 100000000000)
+                self.assertEqual(producer.clock_source_timestamp_ns, 121000000000)
+                self.assertEqual(producer.clock_mapping, 'tegra-cntvct-to-monotonic')
+
+    def test_producer_prepares_output_directory_before_launch_in_both_capture_modes(self):
+        # Stereo crops and numerical-only jobs share the non-RAW capture path.
+        for record_raw in (False, True):
+            for existing in (False, True):
+                with self.subTest(record_raw=record_raw, existing=existing), \
+                        tempfile.TemporaryDirectory() as directory:
+                    output = Path(directory) / 'new-job' / 'raw'
+                    if existing:
+                        output.mkdir(parents=True)
+                        (output / 'keep.txt').write_text('existing capture data')
+                    producer = FastCapLiveProducer(
+                        Path('/pack'), output,
+                        {'CamL': Path('/left'), 'CamR': Path('/right')},
+                        duration_seconds=30, record_raw=record_raw,
+                    )
+                    producer._events.put({
+                        'event': 'synchronized', 'source_timestamp_ns': 121000000000,
+                        'anchor_monotonic_ns': 100000000000,
+                    })
+                    process = Mock()
+                    process.poll.return_value = None
+
+                    def launch(command, **kwargs):
+                        child_output = Path(command[command.index('--output') + 1])
+                        self.assertEqual(child_output, output)
+                        self.assertTrue(child_output.is_dir(),
+                                        'FastCap requires an existing output root at startup')
+                        return process
+
+                    with patch('beanoflight.live_source.subprocess.Popen', side_effect=launch), \
+                            patch('beanoflight.live_source.threading.Thread'):
+                        producer.start()
+                    if existing:
+                        self.assertEqual((output / 'keep.txt').read_text(), 'existing capture data')
+
+    def test_producer_rejects_output_file_without_launching_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'raw'
+            output.write_text('keep this file')
+            producer = FastCapLiveProducer(
+                Path('/pack'), output,
+                {'CamL': Path('/left'), 'CamR': Path('/right')},
+                duration_seconds=30,
+            )
+            with patch('beanoflight.live_source.subprocess.Popen') as popen:
+                with self.assertRaisesRegex(SourceError, 'FastCap output directory'):
+                    producer.start(timeout_seconds=0)
+                popen.assert_not_called()
+            self.assertEqual(output.read_text(), 'keep this file')
+
     def test_shared_region_reads_only_new_complete_generations(self):
         with tempfile.TemporaryDirectory() as directory:
             writer = PreviewWriter(Path(directory) / "CamL.shm")

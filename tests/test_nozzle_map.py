@@ -274,12 +274,12 @@ class MeasuredNozzleTests(unittest.TestCase):
                     )
                     self.assertEqual(w.crossing_timestamp_ns, p.crossing_timestamp_ns)
 
-    def timed_pending(self):
+    def timed_pending(self, valve_channels=(0, 20)):
         _registry, session, record, anchor = self.make_record(mapped=True)
         base = self.track.timestamp_ns
         windows = (
-            GateWindow(1, base + 20_000_000, base + 15_000_000, base + 25_000_000, 0),
-            GateWindow(3, base + 40_000_000, base + 35_000_000, base + 45_000_000, 20),
+            GateWindow(1, base + 20_000_000, base + 15_000_000, base + 25_000_000, valve_channels[0]),
+            GateWindow(3, base + 40_000_000, base + 35_000_000, base + 45_000_000, valve_channels[1]),
         )
         decision = SortingDecision(
             "measured-1",
@@ -366,7 +366,8 @@ class MeasuredNozzleTests(unittest.TestCase):
                 )
 
     def test_actuator_emits_separate_firmware_commands_and_one_parent_result(self):
-        pending, anchor = self.timed_pending()
+        # Map to the populated -V1/+V1 channels on the three-valve board.
+        pending, anchor = self.timed_pending(valve_channels=(9, 11))
         plan = _external_actuation_plan(pending)
         service = ESP32ActuatorService()
         service.connected = service.synchronized = True
@@ -383,7 +384,7 @@ class MeasuredNozzleTests(unittest.TestCase):
         with patch("beanoflight.esp32_actuator.time.monotonic_ns", return_value=anchor):
             self.assertTrue(service._accept_plan(plan)[0])
             self.assertEqual(service._send_queued_plans(serial), 2)
-        self.assertEqual([line[3] for line in serial.lines], ["00000001", "00100000"])
+        self.assertEqual([line[3] for line in serial.lines], ["00000001", "00000004"])
         for sequence, p in list(service._pending.items()):
             service._pending[sequence] = replace(p, opened_board_us=p.open_board_us)
             service._complete_plan(sequence, p.close_board_us)
@@ -411,7 +412,7 @@ class MeasuredNozzleTests(unittest.TestCase):
             receiver.close()
 
     def test_failed_multi_pulse_link_produces_one_failed_parent_audit(self):
-        pending, anchor = self.timed_pending()
+        pending, anchor = self.timed_pending(valve_channels=(9, 11))
         plan = _external_actuation_plan(pending)
         service = ESP32ActuatorService()
         service.connected = service.synchronized = True

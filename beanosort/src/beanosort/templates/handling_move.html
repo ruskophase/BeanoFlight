@@ -1,0 +1,27 @@
+{% extends 'base.html' %}{% from 'macros.html' import tokens, portion_note with context %}
+{% block content %}
+<p class="eyebrow">Material handling / Container location</p><h1>Move container</h1>
+{% if move_recorded %}<p class="notice" role="status">Container move recorded. Choose the next container to move.</p>{% endif %}
+<p>Record a filled or empty container's move to a storage location. Its contents and quantity stay with the container.</p>
+<section class="card"><h2>1. Select the container</h2>
+<form action="/handling/move" method="get">
+<label>Container<select name="container_id" required data-move-container-picker><option value="">Choose a container</option>
+{% for row in containers %}<option value="{{ row.container.id }}"{% if selected and selected.id == row.container.id %} selected{% endif %}{% if not row.usage.can_move %} disabled{% endif %}>{{ container_description(row.container) }}{% if not row.usage.can_move %} · Active job{% endif %}</option>{% endfor %}
+</select></label><button>Choose container</button>
+</form></section>
+{% if selected %}
+<section class="card"><h2>2. Record its new location</h2>
+<dl><dt>Container</dt><dd><a href="/containers/{{ selected.id }}">{{ selected.label }}</a></dd><dt>Currently recorded at</dt><dd>{{ selected.location }}</dd><dt>Contents</dt><dd>{% if current %}{{ (current.mass|kg) if current.mass % 1000 else (current.mass|kg3) }} kg · {{ current.portion.quality }}<small><a href="/portions/{{ current.portion.id }}">View material details</a>{{ portion_note(current.portion.id) }}</small>{% else %}No recorded material assignment{% endif %}</dd></dl>
+{% if not usage.can_move %}<p class="notice">This container is part of an active job. Finish the job or cancel its unstarted preparation before moving it.</p>
+{% elif locations|length < 2 %}<p>Add another storage location before recording a move.</p>
+{% else %}<form action="/handling/move" method="post" data-move-container-record>{{ tokens(csrf) }}
+<input name="container_id" type="hidden" value="{{ selected.id }}"><input name="revision" type="hidden" value="{{ selected.revision }}">
+<label>Destination location<select name="location_id" required><option value="">Choose where the container is now stored</option>{% for place in locations if place.id != selected.location_id %}<option value="{{ place.id }}">{{ place.name }}</option>{% endfor %}</select></label>
+<label class="check"><input name="physical_confirmation" type="checkbox" required>I have moved this container to the selected location.</label>
+<button>Record container move</button>
+</form>{% endif %}
+<p><a href="/locations">Manage storage locations</a></p>
+</section>{% endif %}
+<p><a href="/handling">Back to Material handling</a></p>
+<script src="/static/container_move.js" defer></script>
+{% endblock %}

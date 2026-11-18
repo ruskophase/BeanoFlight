@@ -1,0 +1,27 @@
+{% extends 'base.html' %}{% from 'macros.html' import portion_link with context %}
+{% block content %}
+<p class="eyebrow">Material handling · Completed</p><h1>Final product recorded</h1>
+<p>{{ op.created_at|localtime }} · <span class="identity">{{ op.id }}</span></p>
+<section class="card">
+<h2>{{ record.packaged_mg|kg }} kg packaged as Final product</h2>
+<p>This material has left inventory. Individual packets and product stock are not tracked.</p>
+<p><strong>Station:</strong> {{ record.station_name }}</p>
+<p>Source container: <a href="/containers/{{ record.container.container_id }}">{{ record.container.label }}</a></p>
+<div class="table-wrap"><table><thead><tr><th>Recorded before packaging</th><th>{{ 'Calculated contents remaining' if record.weighing_basis == 'removed' else 'Measured contents remaining' }}</th><th>Final product removed</th></tr></thead>
+<tbody><tr><td>{{ record.before_mg|kg }} kg</td><td>{{ record.after_mg|kg }} kg</td><td>{{ record.packaged_mg|kg }} kg</td></tr></tbody></table></div>
+{% if record.weighing_basis == 'removed' %}
+<p>Scale reading: {{ record.reading_mg|kg }} kg — Mass of contents removed.</p>
+<p class="muted">Final-product mass was weighed directly. Remaining contents are calculated from the recorded source balance; the source container was not reweighed.</p>
+{% else %}
+<p>Remaining scale reading: {{ record.reading_mg|kg }} kg {{ record.weighing_basis }}{% if record.weighing_basis == 'gross' %}; tare {{ record.container.tare_mg|kg }} kg deducted{% endif %}.</p>
+<p class="muted">Final-product mass is calculated from recorded contents less the measured remainder.</p>
+{% endif %}
+{% if record.reason %}<p>Notes: {{ record.reason }}</p>{% endif %}
+</section>
+<section class="card"><h2>Remaining contents</h2>
+{% for output in record.outputs %}{% if output.portion_id %}<p>{{ portion_link(output.portion_id) }} · {{ output.mass_mg|kg }} kg</p>
+<p class="muted">{{ 'Any existing population evidence is retained under the representative-material assumption.' if record.representative else 'Selective packaging: composition of the remaining contents is recorded as unknown.' }}</p>
+{% else %}<p>Container recorded empty and available for reuse. The source portion is closed; its history and earlier population evidence remain available.</p>{% endif %}{% endfor %}
+</section>
+<div class="actions"><a class="button" href="/handling/package">Package more product</a><a class="button secondary" href="/handling">Material handling</a></div>
+{% endblock %}

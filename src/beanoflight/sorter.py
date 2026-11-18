@@ -2408,7 +2408,7 @@ def _run_clock_timing_marks(session: RunSession | None) -> dict[str, int]:
         "run_clock_source_ns": session.clock_source_timestamp_ns,
         "run_clock_monotonic_ns": session.clock_monotonic_ns,
         "run_clock_epoch": session.revision,
-        "run_clock_scale_ppb": round(session.playback_scale * 1_000_000_000),
+        "run_clock_scale_ppb": round(session.clock_scale * 1_000_000_000),
     }
 
 
@@ -2600,7 +2600,7 @@ def _external_actuation_plan(pending: _PendingActuation) -> ActuationPlan:
         crossing_source_ns=decision.crossing_timestamp_ns,
         run_clock_source_ns=pending.session.clock_source_timestamp_ns,
         run_clock_monotonic_ns=pending.session.clock_monotonic_ns,
-        run_clock_scale_ppb=round(pending.session.playback_scale * 1_000_000_000),
+        run_clock_scale_ppb=round(pending.session.clock_scale * 1_000_000_000),
     )
     plan.validate()
     return plan

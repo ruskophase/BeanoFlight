@@ -1,0 +1,5 @@
+{% extends 'base.html' %}{% block content %}
+<p class="eyebrow">Deleted location</p><h1>{{ deletion.data.before.name }}</h1>
+<p class="notice">This empty location was deleted on {{ deletion.created_at|localtime }}. Its history remains available here.</p>
+<p class="identity">{{ deletion.data.location_id }}</p><details class="card"><summary>Deletion audit</summary><pre>{{ deletion.data|tojson(indent=2) }}</pre></details>
+<a class="button" href="/locations">All locations</a>{% endblock %}

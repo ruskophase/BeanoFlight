@@ -13,3 +13,8 @@ artifacts/
 *.db-wal
 *.registry.lock
 firmware/*/sdkconfig
+
+/var/machine-jobs/
+/var/machine-jobs-validation/
+/var/*.log
+/var/qa/

@@ -1,0 +1,14 @@
+{% extends 'base.html' %}{% from 'macros.html' import history as show_history %}
+{% block content %}
+<p class="eyebrow">Storage location</p><h1>{{ location.name }}</h1>
+<p>{{ containers|length }} container{{ '' if containers|length == 1 else 's' }} recorded here.</p>
+<div class="actions"><a class="button secondary" href="/locations">All locations</a><a class="button" href="/containers">Register a container</a>{% if location.revision is defined %}<a class="button" href="/locations/{{ location.id }}/edit">Edit location</a>{% if location_delete_enabled and user.role in ['admin','supervisor'] %}<a class="button danger" href="/locations/{{ location.id }}/delete">Delete location</a>{% endif %}{% endif %}</div>
+{% if containers %}<p class="muted">Move or remove all containers, including archived containers, before deleting this location.</p>{% endif %}
+<section class="card"><h2>Containers stored here</h2>
+{# Keep old workers readable during the template/backend restart boundary. #}
+{% if containers and containers[0].mass is not defined %}
+<div class="table-wrap"><table><thead><tr><th>Container</th><th>Contents / status</th></tr></thead><tbody>{% for row in containers %}<tr><td><a href="/containers/{{ row.container.id }}">{{ row.container.label }}</a></td><td>{{ 'Archived' if row.container.archived else ('Contains material' if row.assignment else 'Unassigned') }}</td></tr>{% endfor %}</tbody></table></div>
+{% else %}{% with populations=containers, empty_message='No containers are currently recorded at this location. Open a container to record its move here.' %}{% include 'population_table.html' %}{% endwith %}{% endif %}
+{% if containers %}<p class="muted">Unassigned does not confirm a container is physically empty or clean. Collections awaiting reconciliation are unavailable stock.</p>{% endif %}</section>
+
+{% if changes %}{{ show_history(changes) }}{% endif %}{% endblock %}

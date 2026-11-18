@@ -1,0 +1,20 @@
+# Optional local database only. No hardware devices, application services or
+# live controller networks are mounted. Supply the password in a private .env.
+services:
+  database:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: beanosort
+      POSTGRES_PASSWORD: ${BEANOSORT_DB_PASSWORD:?Set BEANOSORT_DB_PASSWORD locally}
+      POSTGRES_DB: beanosort_training
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - beanosort_training:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U beanosort -d beanosort_training"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  beanosort_training:

@@ -1,0 +1,23 @@
+{% set fill_scale = namespace(peak=100) %}
+{% for row in capacity_rows if row.percent_exact is not none %}{% if row.percent_exact|float > fill_scale.peak %}{% set fill_scale.peak = row.percent_exact|float %}{% endif %}{% endfor %}
+{% set scale = ((fill_scale.peak / 25)|round(0, 'ceil')|int) * 25 %}
+<section class="card receiver-fill" data-receiver-fill data-scale="{{ scale }}"{% if not capacity_rows %} hidden{% endif %} aria-label="Receiving container fill">
+<h2>{{ fill_heading|default('Receiving container fill') }}</h2>
+<p class="muted">Estimated net contents relative to nominal capacity. <span class="fill-legend green">0–90%</span> <span class="fill-legend orange">90–100%</span> <span class="fill-legend red">Over 100%</span></p>
+<div class="grid two" data-fill-grid>
+{% for row in capacity_rows %}
+<article class="receiver-fill-card" data-fill-receiver="{{ row.destination_id }}">
+<h3 data-fill-title>{{ row.stream }}</h3>
+<a data-fill-container href="/containers/{{ row.container_id }}">{{ row.label }}</a>
+<p class="receiver-fill-value" data-fill-value>{{ '≈ ' if row.mass_known else 'At least ' }}{{ row.mass_mg|kg }} kg / {{ (row.capacity_mg|kg) ~ ' kg nominal' if row.capacity_mg is not none else 'nominal capacity not recorded' }}{% if row.fill_percent is not none %} · <strong>{{ row.fill_percent }}%</strong>{% endif %}</p>
+{% set percent = row.percent_exact|float if row.percent_exact is not none else 0 %}
+<div class="receiver-fill-track" data-fill-track{% if row.percent_exact is not none %} role="progressbar" aria-label="{{ row.stream }} · {{ row.label }} fill" aria-valuemin="0" aria-valuemax="{{ scale }}" aria-valuenow="{{ row.percent_exact }}" aria-valuetext="{{ 'Estimated' if row.mass_known else 'At least' }} {{ row.fill_percent }}% of nominal capacity"{% else %} role="img" aria-label="Nominal capacity not recorded; fill percentage unavailable"{% endif %}>
+<span class="receiver-fill-amount {{ 'green' if row.level == 'normal' else row.level }}" data-fill-amount style="width:{{ percent * 100 / scale }}%" aria-hidden="true"></span>
+<span class="receiver-fill-nominal" data-fill-marker style="left:{{ 10000 / scale }}%"{% if row.percent_exact is none %} hidden{% endif %} aria-hidden="true"></span>
+</div>
+<div class="receiver-fill-axis" data-fill-axis{% if row.percent_exact is none %} hidden{% endif %} aria-hidden="true"><span>0%</span><span class="receiver-fill-nominal-label" data-fill-nominal style="left:{{ 10000 / scale }}%">100%</span><span class="receiver-fill-max" data-fill-max{% if scale == 100 %} hidden{% endif %}>{{ scale }}%</span></div>
+<p class="muted receiver-fill-note" data-fill-note>{{ row.basis }}{% if row.percent_exact is none %}. Fill percentage is unavailable without a nominal capacity.{% endif %}</p>
+</article>
+{% endfor %}
+</div>
+</section>

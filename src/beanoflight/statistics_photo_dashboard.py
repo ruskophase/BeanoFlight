@@ -52,6 +52,7 @@ def install_photo_dashboard(
         by_id[item["bean_id"]] = item
 
     rows: list[dict[str, Any]] = []
+    sample_pairs: dict[str, list[dict[str, Any]]] = {}
     for bean in beans:
         bean_id = str(bean.get("bean_id", ""))
         if not bean_id:
@@ -71,6 +72,17 @@ def install_photo_dashboard(
                     f"photo link disagrees with bean row: {bean_id} {camera}"
                 )
             photos[camera] = _validated_photo_path(root, relative)
+        samples = pair.get("samples") or [pair]
+        sample_pairs[bean_id] = [
+            {
+                "sample_index": item.get("sample_index", index + 1),
+                "frame_index": item.get("frame_index"),
+                "right_frame_index": item.get("right_frame_index"),
+                "CamL": _validated_photo_path(root, item["CamL"]),
+                "CamR": _validated_photo_path(root, item["CamR"]),
+            }
+            for index, item in enumerate(samples)
+        ]
         rows.append({**bean, "photo_CamL": photos["CamL"], "photo_CamR": photos["CamR"]})
     if by_id:
         raise SourceError(
@@ -81,6 +93,25 @@ def install_photo_dashboard(
     if len({row["bean_id"] for row in rows}) != len(rows):
         raise SourceError("statistics rows contain duplicate bean IDs")
     rows.sort(key=lambda row: row["bean_sequence"])
+
+    frame_index_path = root / "frames/index.json"
+    frames_by_left = {}
+    if frame_index_path.is_file():
+        frame_index = _read_json(frame_index_path)
+        if frame_index.get("schema") != "beanoflight-statistics-full-frames/v1":
+            raise SourceError("unsupported portable full-frame index schema")
+        for item in frame_index.get("frame_pairs", []):
+            left = int(item["frame_index"])
+            if left in frames_by_left:
+                raise SourceError(f"duplicate full-frame pair: {left}")
+            frames_by_left[left] = item
+        for samples in sample_pairs.values():
+            for sample in samples:
+                packed = frames_by_left.get(sample["frame_index"])
+                if packed is None or packed["right_frame_index"] != sample["right_frame_index"]:
+                    continue
+                for camera in ("CamL", "CamR"):
+                    sample[f"full_{camera}"] = _validated_frame_path(root, packed[camera])
 
     if source_fps is None:
         source_fps = _recording_fps(root, recording_path)
@@ -95,6 +126,30 @@ def install_photo_dashboard(
             row[37] = bool(row[35] is not None and row[35] <= -2)
         summary["dark_bean_screen"] = {"candidate_count": sum(row[37] for row in dashboard_rows)}
     first_frames = [row[2] for row in dashboard_rows if row[2] is not None]
+    summary["counts"]["saved_bean_crop_images"] = 2 * sum(len(value) for value in sample_pairs.values())
+    trajectory_path = root / "trajectories.json"
+    trajectories = _read_json(trajectory_path) if trajectory_path.is_file() else None
+    stereo_samples = []
+    observations_path = root / "observations.jsonl"
+    if observations_path.is_file():
+        sample_by_key = {
+            (bean_id, sample["sample_index"]): sample
+            for bean_id, samples in sample_pairs.items() for sample in samples
+        }
+        for observation in _read_jsonl(observations_path):
+            left = _number(observation.get("caml_focus_gradient"))
+            right = _number(observation.get("camr_focus_gradient"))
+            sample = sample_by_key.get((str(observation.get("bean_id")), observation.get("sample_index")))
+            if sample is not None:
+                sample["focus_ratio"] = right / left if left is not None and right is not None and left > 0 else None
+                sample["area_ratio"] = _number(observation.get("projected_area_ratio_camr_to_caml"))
+            if left is not None and right is not None and left > 0 and right > 0:
+                stereo_samples.append([
+                    str(observation["bean_id"]), observation.get("frame_index"),
+                    _number(observation.get("caml_centroid_y_px")),
+                    left, right,
+                    _number(observation.get("projected_area_ratio_camr_to_caml")),
+                ])
     payload = {
         "schema": DASHBOARD_SCHEMA,
         "fields": [*_FIELDS, "photo_CamL", "photo_CamR"],
@@ -103,7 +158,10 @@ def install_photo_dashboard(
         "summary": summary,
         "classification": _recording_metadata(root, recording_path).get("classification"),
         "beans": dashboard_rows,
-        "image_policy": {"images_available": True, "kind": "calibrated_paired_crops", "geometry_units": "mm"},
+        "sample_pairs": sample_pairs,
+        "stereo_samples": stereo_samples,
+        "trajectories": trajectories,
+        "image_policy": {"images_available": True, "kind": "calibrated_paired_crops", "geometry_units": "mm", "portable_full_frames": bool(frames_by_left)},
     }
     staging = Path(tempfile.mkdtemp(prefix=".photo-dashboard-", dir=root))
     try:
@@ -134,7 +192,7 @@ def install_photo_dashboard(
         "path": "dashboard/index.html",
         "paired_beans": len(rows),
         "offline_file_safe": True,
-        "features": ["appearance", "size_volume", "stereo", "timeline", "review_collection", "paired_photos"],
+        "features": ["appearance", "size_volume", "stereo", "timeline", "review_collection", "paired_photos", "focus_by_height", "sample_navigation", "frame_trajectories", "portable_full_frames" if frames_by_left else "recording_backed_full_frames"],
     }
 
 
@@ -296,6 +354,22 @@ def _validated_photo_path(root: Path, value: Any) -> str:
         or not (root / relative).is_file()
     ):
         raise SourceError(f"invalid or missing paired photo: {value}")
+    return "../" + relative.as_posix()
+
+
+def _validated_frame_path(root: Path, value: Any) -> str:
+    if not isinstance(value, str):
+        raise SourceError("missing portable full-frame path")
+    relative = Path(value)
+    if (
+        relative.is_absolute()
+        or len(relative.parts) != 2
+        or relative.parts[0] != "frames"
+        or relative.suffix.lower() not in {".jpg", ".jpeg"}
+        or not (root / relative).resolve().is_relative_to((root / "frames").resolve())
+        or not (root / relative).is_file()
+    ):
+        raise SourceError(f"invalid or missing portable full frame: {value}")
     return "../" + relative.as_posix()
 
 

@@ -1,0 +1,288 @@
+<!-- Control surface copied from ESP_Web_controller on 2026-11-16. -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Manual sorter controls</title>
+    <meta name="sorter-csrf" content="{{ csrf }}">
+    <meta name="sorter-connection" content="{{ connection.id }}">
+    <link rel="stylesheet" href="/static/sorter_controls.css?v=20261116">
+    <script src="/static/sorter_controls.js?v=20261116" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </div>
+        <div>
+          <p class="eyebrow">ESP32-S2 CONTROL SURFACE</p>
+          <h1>Manual machine controls</h1><p class="eyebrow">{{ connection.url }}</p>
+        </div>
+      </div>
+      <div class="topbar-status">
+        <div class="status-chip" id="connection-chip">
+          <span class="status-dot"></span>
+          <span id="connection-label">Connecting…</span>
+        </div>
+        <div class="status-chip muted" id="mode-chip">MODE UNKNOWN</div>
+        <button class="danger-button" id="stop-all" type="button">STOP ALL OUTPUTS</button>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="control-strip" id="control-strip">
+        <div>
+          <p class="eyebrow">OPERATOR CONTROL</p>
+          <p class="control-message" id="control-message">The dashboard is starting.</p>
+        </div>
+        <div class="control-actions">
+          <label class="compact-field" for="operator-name">
+            <span>Operator</span>
+            <input id="operator-name" maxlength="64" value="{{ user.username }}" readonly autocomplete="name">
+          </label>
+          <button class="primary-button" id="take-control" type="button">Take control</button>
+          <button class="secondary-button hidden" id="release-control" type="button">Release safely</button>
+        </div>
+      </section>
+
+      <section class="control-strip" aria-label="Candidate settings">
+        <div>
+          <p class="eyebrow">CANDIDATE 3 — WORKING SETTINGS</p>
+          <p class="control-message">Vibration 4,000 Hz / 38% · conveyor 20 steps/s reverse · triggers 59.5 Hz</p>
+          <p class="control-message">Sorting trial: 4 ms valve lead / 0 ms lag · 10 minutes</p>
+          <p class="control-message" id="candidate-settings-status">Load into the controls, then use Apply settings. Air pressure: 30 PSI, set manually.</p>
+        </div>
+        <button class="secondary-button" id="load-candidate-settings" type="button">Load Candidate 3</button>
+      </section>
+
+      <div class="dashboard-grid">
+        <section class="panel timing-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">SYNCHRONIZED TIMING</p>
+              <h2>Cameras &amp; illumination</h2>
+            </div>
+            <div class="period-readout">
+              <span id="period-value">16,667 µs</span>
+              <small id="actual-frequency">≈ 59.99880 Hz</small>
+            </div>
+          </div>
+
+          <div class="waveform" aria-label="Waveform timing preview">
+            <svg id="waveform-svg" viewBox="0 0 1000 172" role="img">
+              <line class="grid-line" x1="90" y1="55" x2="970" y2="55"></line>
+              <line class="grid-line" x1="90" y1="125" x2="970" y2="125"></line>
+              <text class="wave-label" x="12" y="59">LED</text>
+              <text class="wave-label" x="12" y="129">CAM</text>
+              <path id="led-wave" class="wave led-wave" d=""></path>
+              <path id="camera-wave" class="wave camera-wave" d=""></path>
+              <g id="wave-markers"></g>
+            </svg>
+            <div class="wave-legend">
+              <span><i class="legend-line led"></i>LED active HIGH</span>
+              <span><i class="legend-line camera"></i>Camera active LOW</span>
+              <span id="wave-window-label">Showing active timing window</span>
+            </div>
+          </div>
+
+          <div class="info-callout">
+            <span class="callout-icon">i</span>
+            <p>Camera triggering and LED illumination are independently switchable. With cameras stopped, GPIO34/GPIO36 remain HIGH while GPIO14/GPIO15 can continue the configured illumination waveform.</p>
+          </div>
+
+          <div class="timing-controls">
+            <article class="subcard">
+              <div class="subcard-title">
+                <div>
+                  <h3>Camera triggers</h3>
+                  <p>GPIO34 + GPIO36 · active LOW</p>
+                </div>
+                <span class="output-state" id="trigger-state">OFF</span>
+              </div>
+              <div class="field-row">
+                <label>Frequency <span class="unit-input"><input id="trigger-frequency" type="number" min="0.001" max="1000000" step="0.001" value="60"><b>Hz</b></span></label>
+                <label>LOW time / exposure <span class="unit-input"><input id="trigger-low" type="number" min="1" step="1" value="50"><b>µs</b></span></label>
+              </div>
+              <div class="button-row">
+                <button class="secondary-button requires-control" id="apply-trigger" type="button">Apply timing</button>
+                <button class="state-button requires-control" id="toggle-trigger" type="button">Start triggers</button>
+              </div>
+              <div class="pulse-row">
+                <span class="unit-input small"><input id="trigger-count" type="number" min="1" max="1000000" value="1"><b>cycles</b></span>
+                <button class="ghost-button requires-control" id="pulse-trigger" type="button">Run finite pulse train</button>
+              </div>
+            </article>
+
+            <article class="subcard">
+              <div class="subcard-title">
+                <div>
+                  <h3>LED illumination</h3><p id="strobe-effective-rate">Output rate: —</p>
+                  <p>GPIO14 + GPIO15 · active HIGH</p>
+                </div>
+                <span class="output-state" id="strobe-state">OFF</span>
+              </div>
+              <div class="field-row">
+                <label>Lead before trigger <span class="unit-input"><input id="strobe-lead" type="number" min="0" step="1" value="250"><b>µs</b></span></label>
+                <label>Lag after trigger <span class="unit-input"><input id="strobe-lag" type="number" min="0" step="1" value="10"><b>µs</b></span></label>
+              </div>
+              <div class="button-row">
+                <button class="secondary-button requires-control" id="apply-strobe" type="button">Apply timing</button>
+                <button class="state-button requires-control" id="toggle-strobe" type="button">Start illumination</button>
+              </div>
+              <button class="ghost-button requires-control full-width" id="pulse-strobe" type="button">Single illuminated cycle</button>
+            </article>
+            <article class="subcard high-speed-card">
+              <div class="subcard-title">
+                <div><h3>High-speed camera triggers</h3><p>GPIO33 · rising edge · KYT-U200-2034T pin 13 / ground pin 15</p></div>
+                <span class="output-state" id="high-speed-state">OFF</span>
+              </div>
+              <div class="field-row">
+                <label>Trigger rate
+                  <select id="high-speed-mode"><option value="multiple">Multiple of paired-camera rate</option><option value="fixed">Fixed frequency</option></select>
+                </label>
+                <label>Paired-camera multiplier <span class="unit-input"><input id="high-speed-multiplier" type="number" min="1" max="16" step="1" value="3"><b>×</b></span></label>
+                <label>Fixed frequency <span class="unit-input"><input id="high-speed-frequency" type="number" min="1" max="199.9" step="0.1" value="180"><b>Hz</b></span></label>
+                <label>Trigger pulse width <span class="unit-input"><input id="high-speed-pulse" type="number" min="1" max="1000000" step="1" value="50"><b>µs</b></span></label>
+              </div>
+              <label class="high-speed-lighting"><input id="high-speed-illumination" type="checkbox" checked> Increase illumination rate while high-speed triggering is on</label>
+              <p class="control-message">Faster shared illumination requires multiple mode and uses the existing lead/lag window. Turning high-speed triggers off restores the paired-camera illumination rate. The camera's exposure is configured separately.</p>
+              <p class="control-message" id="high-speed-live">Waiting for firmware status…</p>
+              <p class="control-message" id="high-speed-preview"></p>
+              <p class="inline-validation" id="high-speed-validation"></p>
+              <div class="button-row">
+                <button class="secondary-button requires-control" id="apply-high-speed" type="button">Apply high-speed settings</button>
+                <button class="state-button requires-control" id="toggle-high-speed" type="button">Start high-speed triggers</button>
+              </div>
+              <p class="control-message">Set timing while camera and illumination outputs are stopped. Start/Stop preserves paired-camera timing. During automated sorting, the trial controls this output and the WebGUI is read-only.</p>
+            </article>
+          </div>
+          <p class="inline-validation" id="timing-validation"></p>
+        </section>
+
+        <section class="panel pwm-test-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">MOTION CONTROL</p>
+              <h2>Vibration motor control</h2>
+            </div>
+            <span class="output-state" id="vibration-state">OFF</span>
+          </div>
+          <div class="info-callout pwm-info">
+            <span class="callout-icon">i</span>
+            <p>One motor is driven through its H-bridge inputs on GPIO4 and GPIO5. Clockwise drives GPIO5 with PWM while GPIO4 stays LOW; anti-clockwise drives GPIO4 with PWM while GPIO5 stays LOW. Both inputs remain LOW at boot, while stopped, and after STOPALL or failsafe.</p>
+          </div>
+          <div class="vibration-controls">
+            <label>Frequency <span class="unit-input"><input id="vibration-frequency" type="number" min="1" max="19531" step="1" value="1000"><b>Hz</b></span></label>
+            <label>Direction
+              <select id="vibration-direction">
+                <option value="clockwise" selected>Clockwise</option>
+                <option value="anticlockwise">Anti-clockwise</option>
+              </select>
+            </label>
+            <div class="vibration-readout">
+              <span>Active input path</span>
+              <strong id="vibration-path">GPIO4 LOW · GPIO5 PWM</strong>
+              <small id="vibration-summary">1.000 ms period · 370.0 µs HIGH</small>
+            </div>
+          </div>
+          <div class="duty-heading aux-duty-heading"><h3>Duty cycle</h3><strong id="vibration-duty-value">20.0%</strong></div>
+          <input class="duty-slider" id="vibration-duty-slider" type="range" min="0" max="100" step="0.1" value="20">
+          <div class="aux-duty-input vibration-duty-input">
+            <span class="unit-input spinner-unit-input">
+              <input id="vibration-duty" type="number" min="0" max="100" step="1" value="20">
+              <b>%</b>
+              <span class="number-spinner" aria-label="Vibration duty controls">
+                <button id="vibration-duty-up" type="button" aria-label="Increase vibration duty by 1%" aria-controls="vibration-duty">▲</button>
+                <button id="vibration-duty-down" type="button" aria-label="Decrease vibration duty by 1%" aria-controls="vibration-duty">▼</button>
+              </span>
+            </span>
+            <p class="inline-validation" id="vibration-validation"></p>
+          </div>
+          <div class="button-row vibration-actions">
+            <button class="secondary-button requires-control" id="apply-vibration" type="button">Apply settings</button>
+            <button class="state-button requires-control" id="toggle-vibration" type="button">Start motor</button>
+          </div>
+        </section>
+
+        <section class="panel conveyor-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">MOTION CONTROL</p>
+              <h2>Conveyor belt controls</h2>
+            </div>
+            <span class="output-state" id="conveyor-state">OFF</span>
+          </div>
+          <div class="info-callout conveyor-info">
+            <span class="callout-icon">i</span>
+            <p>Stepper driver: STEP GPIO35, DIR GPIO37, ENABLE GPIO13 (active LOW). Starts, stops, speed changes, and direction changes use the configured acceleration. STOPALL and failsafe disable the driver immediately.</p>
+          </div>
+          <div class="conveyor-controls">
+            <label>Target speed <span class="unit-input"><input id="conveyor-speed" type="number" min="10" max="5000" step="1" value="100"><b>steps/s</b></span></label>
+            <label>Acceleration <span class="unit-input"><input id="conveyor-acceleration" type="number" min="1" max="100000" step="1" value="10"><b>steps/s²</b></span></label>
+            <label>Direction
+              <select id="conveyor-direction">
+                <option value="forward" selected>Forwards</option>
+                <option value="reverse">Reverse</option>
+              </select>
+            </label>
+            <div class="conveyor-readout">
+              <span>Current speed</span>
+              <strong id="conveyor-current-speed">0 steps/s</strong>
+              <small id="conveyor-ramp-summary">Stopped · driver disabled</small>
+            </div>
+          </div>
+          <p class="inline-validation" id="conveyor-validation"></p>
+          <div class="button-row conveyor-actions">
+            <button class="secondary-button requires-control" id="apply-conveyor" type="button">Apply settings</button>
+            <button class="state-button requires-control" id="toggle-conveyor" type="button">Start conveyor</button>
+          </div>
+        </section>
+
+        <section class="panel valve-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">VALVE BREAKOUT</p>
+              <h2>Valve channel test</h2>
+            </div>
+            <span class="output-state" id="valve-state">OFFLINE</span>
+          </div>
+          <div class="info-callout">
+            <strong>−V1 → V0 → +V1</strong>
+            <p>Left to right as viewed by CamL · GPIO1, GPIO2, GPIO3.</p>
+            <p>Each output switches on for 50 ms, with pulse starts 500 ms apart.
+              This also runs once at boot and switches both LEDs and FETs.</p>
+          </div>
+          <p id="valve-status" aria-live="polite">Connecting to BeanoActuator…</p>
+          <div class="button-row">
+            <button class="state-button requires-control" id="test-valves" type="button" disabled>Test valve channels</button>
+            <button class="secondary-button" id="stop-valves" type="button" disabled>Stop valve outputs</button>
+          </div>
+        </section>
+
+        <section class="panel diagnostics-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">DIAGNOSTICS</p>
+              <h2>Device status</h2>
+            </div>
+          </div>
+          <div class="device-facts">
+            <div><span>Port</span><strong id="device-port">—</strong></div>
+            <div><span>Firmware</span><strong id="device-firmware">—</strong></div>
+            <div><span>Uptime</span><strong id="device-uptime">—</strong></div>
+            <div><span>Last error</span><strong id="device-error">—</strong></div>
+          </div>
+          <details class="event-log" open>
+            <summary>Controller event log</summary>
+            <div id="log-lines" class="log-lines"><p class="empty-log">Waiting for controller events…</p></div>
+          </details>
+        </section>
+      </div>
+    </main>
+
+    <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+  </body>
+</html>

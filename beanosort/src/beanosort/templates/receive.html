@@ -1,0 +1,57 @@
+{% extends 'base.html' %}{% from 'macros.html' import tokens %}
+{% macro containers_step(key) %}
+<div class="receiving-row" data-load="{{ key }}">
+<input type="hidden" name="receiving_load_id" value="{{ key }}"><input type="hidden" name="receiving_container_revision" value="">
+<label>Receiving container <span data-load-number></span><select name="receiving_container_id" required><option value="">Choose an empty labelled container</option>
+{% for c in containers %}<option value="{{ c.id }}" data-label="{{ c.label }}" data-tare="{{ c.tare_mg|kg if c.tare_mg is not none else '' }}" data-capacity="{{ c.capacity_mg|kg if c.capacity_mg is not none else '' }}" data-receiving-limit="{{ ((c.capacity_mg * 6) // 5)|kg if c.capacity_mg is not none else '' }}" data-revision="{{ c.revision }}">{{ container_description(c) }} · {{ ('tare ' ~ (c.tare_mg|kg3) ~ ' kg') if c.tare_mg is not none else 'enter tare below' }}{% if c.capacity_mg is none %} · enter capacity below{% endif %}</option>{% endfor %}</select></label>
+<p class="muted" data-container-weights>Choose a container to see its registered tare and capacity.</p>
+<div class="grid two"><label data-tare-entry>Empty-container tare (kg)<input name="receiving_tare_mass" type="number" min="0.000001" step="0.000001" inputmode="decimal" placeholder="e.g. 0.500"><small>Enter only if tare is not yet recorded.</small></label>
+<label data-capacity-entry>Nominal container capacity (kg)<input name="receiving_capacity" type="number" min="0.000001" step="0.000001" inputmode="decimal" placeholder="e.g. 20"><small>Enter only if capacity is not yet recorded.</small></label></div>
+<p class="muted" data-missing-weights-note>Missing container weights will be saved with this receipt. Use Edit container to change weights already recorded.</p>
+<button type="button" class="secondary" data-remove-load hidden>Remove this container</button>
+</div>
+{% endmacro %}
+{% macro weights_step(key) %}
+<div class="receiving-row" data-load="{{ key }}"><h3 data-container-title>Container <span data-load-number></span></h3>
+<label>Net bean mass (kg)<input name="receiving_net_mass" type="number" inputmode="decimal" min="0.001" step="0.001" placeholder="0.000" required></label>
+<p class="muted" data-receiving-limit>Receiving allows up to 120% of nominal container capacity.</p>
+<label class="check"><input type="checkbox" name="tared" value="{{ key }}" required>I zeroed the empty container on the scale before adding these beans.</label></div>
+{% endmacro %}
+{% macro storage_step(key) %}
+<div class="receiving-row" data-load="{{ key }}"><h3 data-container-title>Container <span data-load-number></span></h3>
+<label>Storage location after loading<select name="receiving_location_id" required><option value="">Choose a storage location</option>{% for place in locations %}<option value="{{ place.id }}">{{ place.name }}</option>{% endfor %}</select></label></div>
+{% endmacro %}
+{% block content %}
+<p class="eyebrow">Receiving green beans</p><h1>Receive beans into containers</h1>
+<p>Record the source, decant into empty labelled containers, weigh the beans and record where the containers are stored. Supplier bags are not stock items; enter only the bean mass actually received.</p>
+<ol class="receiving-progress" aria-label="Receiving steps"><li>Source details</li><li>Receiving containers</li><li>Weigh beans</li><li>Storage location</li></ol>
+<form action="/receive" method="post" class="card" data-receiving-form>{{ tokens(csrf) }}
+<fieldset data-receiving-step="0"><legend>1. Source details</legend>
+<div class="grid three">{% for field, title in [('supplier','Supplier'),('supplier_lot','Supplier lot / bag reference'),('origin','Origin'),('bean_type','Bean or material type')] %}<label>{{ title }}<input name="{{ field }}" maxlength="200" placeholder="Unknown if blank"{% if field == 'bean_type' %} value="Green coffee"{% endif %}></label>{% endfor %}
+<label>Purchase date<input type="date" name="purchase_date"></label><label>Received date<input type="date" name="received_date" value="{{ today }}" required></label></div>
+<label>Notes, variety, declarations<textarea name="notes" maxlength="4000" rows="2"></textarea></label>
+<p class="muted">Use one set of source details for all containers loaded here. Unknown source details may stay blank. A typical 60 kg supplier bag may fill several containers; the recorded weights determine the received quantity.</p>
+<button type="button" data-receiving-next hidden>Next: receiving containers</button></fieldset>
+<fieldset data-receiving-step="1"><legend>2. Receiving container details</legend>
+<p>Select empty containers. If a container has no recorded tare or capacity, enter the missing value below. Zero each empty container on the scale before adding beans, then record its net reading in the next step. Each container can be selected only once.</p>
+<div data-container-rows>{{ containers_step('0') }}</div><button type="button" class="secondary" data-add-load hidden>Add another container</button>
+<p><a href="/containers">Create or update a labelled container</a></p>
+<label>Receiving / weighing station<select name="station_id" required>{% for station in stations %}<option value="{{ station.id }}">{{ station.name }}</option>{% endfor %}</select></label>
+<label class="check"><input type="checkbox" name="ready" required>Every selected container was physically empty, clean and ready before loading.</label>
+{% if not containers %}<p class="notice">No eligible empty containers are available. Create a container or complete the operations using existing containers.</p>{% endif %}
+{% if unavailable %}<details><summary>Containers unavailable for receiving · {{ unavailable|length }}</summary><ul>{% for row in unavailable %}<li><a href="/containers/{{ row.container.id }}">{{ row.container.label }}</a> · {{ row.reason }}</li>{% endfor %}</ul></details>{% endif %}
+<div class="actions"><button type="button" class="secondary" data-receiving-back hidden>Back</button><button type="button" data-receiving-next hidden>Next: weigh beans</button></div></fieldset>
+<fieldset data-receiving-step="2"><legend>3. Weigh the beans — mass evidence</legend>
+<p>With the empty container zeroed on the scale, enter the net bean reading in kg to three decimal places. Container tare is recorded separately and is not deducted again.</p>
+<p>Receiving allows up to 20% above nominal container capacity. For example, a 25 kg container can receive up to 30.000 kg of beans.</p>
+<div data-weight-rows>{{ weights_step('0') }}</div>
+<p class="muted">All bean properties apart from the entered mass and source declarations remain unknown.</p>
+<div class="actions"><button type="button" class="secondary" data-receiving-back hidden>Back</button><button type="button" data-receiving-next hidden>Next: storage location</button></div></fieldset>
+<fieldset data-receiving-step="3"><legend>4. Storage location after loading</legend>
+<div data-storage-rows>{{ storage_step('0') }}</div><p><a href="/locations">Manage storage locations</a></p>
+<label class="check"><input name="placed" type="checkbox" required>The loaded containers are at their selected storage locations.</label>
+<div class="actions"><button type="button" class="secondary" data-receiving-back hidden>Back</button><button {% if not containers %}disabled{% endif %}>Receive into stock</button></div>
+</fieldset></form>
+<template data-container-template>{{ containers_step('__LOAD__') }}</template><template data-weight-template>{{ weights_step('__LOAD__') }}</template><template data-storage-template>{{ storage_step('__LOAD__') }}</template>
+<script src="/static/receiving.js" defer></script>
+{% endblock %}

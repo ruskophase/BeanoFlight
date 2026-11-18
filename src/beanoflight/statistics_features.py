@@ -258,6 +258,19 @@ def extract_view_features(
     ):
         raise ValueError("feature mask touches the crop edge")
 
+    # Interior gradients avoid measuring the segmentation boundary as focus.
+    # Normalising by the local grey level reduces, but does not eliminate,
+    # illumination and camera-response differences. This is a relative proxy.
+    focus_interior = cv2.erode(binary, np.ones((5, 5), np.uint8)) > 0
+    grey = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    gx = cv2.Sobel(grey, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(grey, cv2.CV_32F, 0, 1, ksize=3)
+    focus_gradient = (
+        float(np.sqrt(np.mean((gx[focus_interior] ** 2 + gy[focus_interior] ** 2))))
+        / max(float(np.mean(grey[focus_interior])), 16.0)
+        if np.count_nonzero(focus_interior) >= 25 else 0.0
+    )
+
     contours, _hierarchy = cv2.findContours(
         binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
@@ -318,6 +331,7 @@ def extract_view_features(
     )
 
     values: dict[str, float] = {
+        "focus_gradient": focus_gradient,
         "area_px": area_px,
         "contour_area_px": contour_area,
         "perimeter_px": perimeter_px,

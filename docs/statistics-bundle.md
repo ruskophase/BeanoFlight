@@ -13,18 +13,20 @@ another recording.
 ```bash
 beano-statistics /path/to/recording \
   --background-frames 2,8,14 \
-  --output-root /path/to/statistics-bundles
+  --save-bean-photos
 ```
 
-Multiple recording paths may be supplied. The command writes one atomic,
-self-contained directory per recording. Existing bundles are protected unless
-`--overwrite` is explicit.
+Multiple recording paths may be supplied. By default, each bundle is written
+inside its recording as `postprocess/statistics-bundle`, so the two travel
+together. A separate `--output-root` is available for comparisons. Existing
+bundles are protected unless `--overwrite` is explicit.
 
-Add `--save-bean-photos` to retain a calibrated CamL/CamR JPEG pair for each
-successfully sampled, confirmed bean. The representative sample prefers the
-middle field-of-view band. `beans.csv` and `beans.jsonl` link to the photographs;
-`photos/index.json` records their bean IDs, sample indices and exact source
-frame indices/timestamps. The bundle manifest hashes the photographs too.
+Add `--save-bean-photos` to retain **every** valid calibrated CamL/CamR sample
+pair for each confirmed bean (up to three). The representative thumbnail still
+prefers the middle sample. `beans.csv` and `beans.jsonl` link to that thumbnail;
+`photos/index.json` lists all samples with exact source frame indices and
+timestamps. The manifest hashes the photographs. The Summary page counts
+individual saved crop images, not full recording frames.
 Open `dashboard/index.html` for the full interactive statistics dashboard:
 appearance, size/volume, stereo agreement, batch timeline and capture health.
 Every chart selection opens bean tiles with both calibrated photographs and
@@ -33,6 +35,39 @@ allow selected pairs to be inspected and exported with their measurements and
 photo paths. It works directly from disk without a web server or network
 connection, and uses the offline bundle's own bean IDs rather than attempting
 to match a separate replay run.
+The enlarged bean view navigates samples for the same bean. Stereo agreement
+adds a masked interior-gradient focus proxy and focus/area balance across ten
+horizontal bands. These are comparative alignment aids, not direct depth
+measurements: texture, pose, optics and camera responses also matter.
+The enlarged view remembers “View entire frame” and both trajectory checkbox
+settings while navigating beans (Previous/Next or arrow keys), changing samples,
+or closing and reopening the viewer. These preferences last until the dashboard
+page is reloaded; they are not written into the bundle.
+Camera-comparison and height charts include data-derived interpretations beneath
+the plots, including camera direction, valid sample counts or populated bands,
+and the limits of what area, brightness and focus proxies imply. These describe
+the whole plotted dataset, not just a selected group. Ratio values above one
+favour CamR; values below one favour CamL. They are not automatic instructions
+to move the waterfall.
+
+By default, photo bundles also contain deduplicated full-frame CamL/CamR JPEGs
+for every sampled frame. Open `dashboard/index.html` directly from the bundle;
+no server, terminal or source recording is needed. Keeping the entire bundle
+together preserves these relative links. `--no-full-frames` makes a smaller
+photo bundle; `beano-statistics-embed-frames /path/to/bundle` can enrich it later
+while the matching recording is still present. The legacy read-only local
+`beano-statistics-viewer /path/to/bundle` can still supply recording frames on
+demand for bundles without an embedded frame pack.
+
+If the portable frame images are missing, the viewer shows a black canvas
+with recorded bean-position dots and a "Full frame not available" message.
+Compact trajectories are stored independently inside the bundle;
+CamR non-sample positions and paths are labelled as central-plane projections.
+The dotted tail extends the final observed image path only for visual context;
+it is not a nozzle-arrival prediction.
+The full-frame images are compressed demosaiced review previews, while
+statistics use the calibrated crops. Embedding a full 120-second recording's
+sampled frames can add roughly a gigabyte to the bundle.
 This is offline export from RAW, not extra disk I/O on the live sorting path.
 Beans with no valid sample have no fabricated photo. JPEGs are review images;
 numerical statistics are computed from the calibrated arrays before encoding.

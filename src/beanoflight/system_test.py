@@ -340,6 +340,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 state_root,
                 preview_paths,
                 duration_seconds=capture_seconds,
+                frame_rate_hz=arguments.target_fps,
                 controller_url=arguments.controller_url,
                 witness_result=arguments.witness_result,
                 test_override=arguments.live_test_override,

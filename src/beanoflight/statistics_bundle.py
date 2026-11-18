@@ -38,6 +38,7 @@ from .statistics_features import (
     paired_features,
     robust_median,
 )
+from .statistics_full_frames import write_frame_pack
 from .statistics_photo_dashboard import install_photo_dashboard
 from .tracking import TrackerSettings
 
@@ -46,6 +47,7 @@ OBSERVATION_SCHEMA = "beanoflight-statistics-observation/v1"
 BEAN_SCHEMA = "beanoflight-statistics-bean/v1"
 DEFAULT_BACKGROUND_INDICES = (2, 8, 14)
 VIEW_FEATURE_KEYS = (
+    "focus_gradient",
     "area_px",
     "contour_area_px",
     "perimeter_px",
@@ -108,6 +110,7 @@ class BundleSettings:
     maximum_frames: int | None = None
     progress_every: int = 600
     save_bean_photos: bool = False
+    embed_full_frames: bool = True
     detector_close_kernel: int = 3
 
     def validate(self) -> None:
@@ -164,6 +167,10 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Export calibrated CamL/CamR JPEG crops for every sampled confirmed bean",
     )
+    result.add_argument(
+        "--no-full-frames", action="store_true",
+        help="Keep a compact photo bundle without portable full-frame images",
+    )
     return result
 
 
@@ -176,6 +183,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         maximum_frames=arguments.maximum_frames,
         progress_every=arguments.progress_every,
         save_bean_photos=arguments.save_bean_photos,
+        embed_full_frames=not arguments.no_full_frames,
         detector_close_kernel=arguments.detector_close_kernel,
     )
     try:
@@ -242,7 +250,9 @@ def build_statistics_bundle(
     samples_by_ref: dict[BeanRef, list[dict[str, Any]]] = defaultdict(list)
     bands_by_ref: dict[BeanRef, set[int]] = defaultdict(set)
     representatives: dict[BeanRef, bytes] = {}
-    photo_samples: dict[BeanRef, dict[str, Any]] = {}
+    photo_samples: dict[BeanRef, list[dict[str, Any]]] = defaultdict(list)
+    frame_positions: dict[int, list[list[float | int]]] = {}
+    final_paths: dict[str, list[list[float | int]]] = {}
     feature_times: list[float] = []
     feature_cpu_times: list[float] = []
     materialization_times: list[float] = []
@@ -320,6 +330,23 @@ def build_statistics_bundle(
                 timestamp_ns = source.timestamp_ns(frame_index)
                 analysis = engine.process(frame, frame_index, timestamp_ns)
                 frames_processed += 1
+                current_positions = []
+                if options.save_bean_photos:
+                    for snapshot in analysis.tracks:
+                        if snapshot.bean_ref.sequence <= 0 or not snapshot.history:
+                            continue
+                        history = snapshot.history
+                        if history[-1].frame_index == frame_index:
+                            final_paths.setdefault(str(snapshot.bean_ref), []).append([
+                                frame_index, round(history[-1].detection.centroid_px[0], 2),
+                                round(history[-1].detection.centroid_px[1], 2),
+                            ])
+                        current_positions.append([
+                            snapshot.bean_ref.sequence,
+                            round(history[-1].detection.centroid_px[0], 2),
+                            round(history[-1].detection.centroid_px[1], 2),
+                            1 if history[-1].frame_index == frame_index else 0,
+                        ])
                 candidates = []
                 for track in analysis.tracks:
                     info = track_info.setdefault(
@@ -363,6 +390,8 @@ def build_statistics_bundle(
                 left_foreground = None
                 right_foreground = None
                 right_fallback_foreground = None
+                sampled_on_frame = False
+                observed_right: dict[int, tuple[float, float]] = {}
                 for track, observation, band in candidates:
                     prepared = source.prepare_stereo_crop(
                         frame,
@@ -505,6 +534,8 @@ def build_statistics_bundle(
                         )
                     )
                     observations.append(row)
+                    sampled_on_frame = True
+                    observed_right[track.bean_ref.sequence] = prepared.pair.camr_centroid_px
                     samples_by_ref[track.bean_ref].append(row)
                     bands_by_ref[track.bean_ref].add(band)
                     feature_times.append(kernel_ms)
@@ -514,15 +545,23 @@ def build_statistics_bundle(
                         representatives[track.bean_ref] = _representative_jpeg(
                             left_image, right_image, left_mask, right_mask
                         )
-                        if options.save_bean_photos:
-                            photo_samples[track.bean_ref] = {
-                                "CamL": _photo_jpeg(left_image),
-                                "CamR": _photo_jpeg(right_image),
-                                "frame_index": frame_index,
-                                "right_frame_index": prepared.pair.right_frame_index,
-                                "timestamp_ns": timestamp_ns,
-                                "sample_index": row["sample_index"],
-                            }
+                    if options.save_bean_photos:
+                        photo_samples[track.bean_ref].append({
+                            "CamL": _photo_jpeg(left_image),
+                            "CamR": _photo_jpeg(right_image),
+                            "frame_index": frame_index,
+                            "right_frame_index": prepared.pair.right_frame_index,
+                            "timestamp_ns": timestamp_ns,
+                            "sample_index": row["sample_index"],
+                        })
+                if options.save_bean_photos and sampled_on_frame:
+                    for point in current_positions:
+                        measured = observed_right.get(int(point[0]))
+                        projected = measured or source.stereo_calibration.project_distorted_caml_to_distorted_camr(
+                            (float(point[1]), float(point[2]))
+                        )
+                        point.extend([round(projected[0], 2), round(projected[1], 2), 1 if measured else 0])
+                    frame_positions[frame_index] = current_positions
             finally:
                 source.release_frame(frame)
             if progress is not None and (
@@ -553,7 +592,26 @@ def build_statistics_bundle(
         beans = _aggregate_beans(confirmed_samples, track_info)
         _score_appearance_outliers(beans)
         if options.save_bean_photos:
+            for ref, path in final_paths.items():
+                if ref not in confirmed_ids:
+                    continue
+                for point in path:
+                    projected = source.stereo_calibration.project_distorted_caml_to_distorted_camr(
+                        (float(point[1]), float(point[2]))
+                    )
+                    point.extend([round(projected[0], 2), round(projected[1], 2)])
             _write_bean_photos(temporary, beans, photo_samples)
+            full_frame_pack = (
+                write_frame_pack(temporary, source, progress=lambda done, total: print(
+                    f"Portable full frames: {done}/{total}", flush=True
+                )) if options.embed_full_frames else None
+            )
+            _write_json(temporary / "trajectories.json", {
+                "schema": "beanoflight-statistics-trajectories/v1",
+                "image_size_px": [source.metadata.width, source.metadata.height],
+                "frame_positions": {str(key): value for key, value in frame_positions.items()},
+                "final_paths": {str(ref): path for ref, path in final_paths.items() if ref in confirmed_ids},
+            })
 
         charts = temporary / "charts"
         outliers = temporary / "outliers"
@@ -584,8 +642,10 @@ def build_statistics_bundle(
         summary["bean_photos"] = {
             "enabled": options.save_bean_photos,
             "beans_with_photos": sum(bool(bean.get("photo_CamL")) for bean in beans),
-            "processing": "calibrated sRGB; representative sample, middle band preferred",
+            "image_count": 2 * sum(len(photo_samples[ref]) for ref in confirmed if ref in photo_samples),
+            "processing": "calibrated sRGB; every valid stereo sample",
         }
+        summary["full_frames"] = full_frame_pack if options.save_bean_photos else None
         if options.save_bean_photos:
             summary["photo_dashboard"] = install_photo_dashboard(
                 temporary, beans=beans, source_fps=source.metadata.fps,
@@ -919,6 +979,7 @@ def _provenance(
             "crop_size_px": settings.crop_size_px,
             "maximum_samples_per_bean": settings.samples_per_bean,
             "save_bean_photos": settings.save_bean_photos,
+            "embed_full_frames": settings.embed_full_frames,
             "detector_close_kernel": settings.detector_close_kernel,
             "sampling_bands": ["top", "middle", "bottom"],
             "feature_kernel_pre_warmed": True,
@@ -973,7 +1034,11 @@ def _definitions() -> dict[str, str]:
 def _bundle_readme(recording_name: str, *, has_photo_dashboard: bool = False) -> str:
     dashboard = (
         "Open `dashboard/index.html` for interactive appearance, size/volume, "
-        "stereo, timeline and review-collection charts with paired bean photos.\n\n"
+        "stereo, focus-by-height, timeline and review-collection charts with all "
+        "valid paired bean photos. When `frames/index.json` is present, complete "
+        "sampled CamL/CamR frames also open directly from disk without a server. "
+        "If frame files are unavailable, the dashboard shows trajectory dots "
+        "on black.\n\n"
         if has_photo_dashboard
         else ""
     )
@@ -986,6 +1051,11 @@ Source recording: `{recording_name}`
 
 - `beans.csv` / `beans.jsonl`: robust per-track medians and outlier scores.
 - `observations.csv` / `observations.jsonl`: calibrated stereo sample evidence.
+- `photos/index.json` / `trajectories.json`: all sampled pairs and compact
+  per-frame/final paths when photo export is enabled.
+- `frames/index.json`: deduplicated sampled full-frame CamL/CamR JPEG previews
+  when portable full-frame export is enabled.
+- `frames/index.json`: deduplicated portable full-frame images when enabled.
 - `summary.json`: batch distributions, coverage, failures and timing.
 - `manifest.json`: schemas, exact calibration/provenance, definitions and hashes.
 
@@ -1519,31 +1589,29 @@ def _write_bean_photos(root: Path, beans, samples) -> None:
     """Link only confirmed bean rows; never publish orphan tentative-track photos."""
     photos = root / "photos"
     photos.mkdir()
-    by_id = {str(ref): (ref, sample) for ref, sample in samples.items()}
+    by_id = {str(ref): value for ref, value in samples.items()}
     index = []
     for bean in beans:
-        item = by_id.get(str(bean["bean_id"]))
-        if item is None:
+        saved = by_id.get(str(bean["bean_id"]))
+        if saved is None:
             continue
-        ref, sample = item
-        metadata = {
-            "bean_id": str(ref),
-            **{
-                key: sample[key]
-                for key in (
-                    "frame_index",
-                    "right_frame_index",
-                    "timestamp_ns",
-                    "sample_index",
-                )
-            },
-        }
+        sequence = int(bean.get("bean_sequence") or str(bean["bean_id"]).rsplit("/", 1)[-1])
+        saved_samples = saved if isinstance(saved, list) else [saved]
+        sample_rows = []
+        for sample in sorted(saved_samples, key=lambda row: row["sample_index"]):
+            metadata = {key: sample[key] for key in (
+                "frame_index", "right_frame_index", "timestamp_ns", "sample_index",
+            )}
+            for camera in ("CamL", "CamR"):
+                relative = f"photos/bean-{sequence:06d}-s{sample['sample_index']}-{camera}.jpg"
+                (root / relative).write_bytes(sample[camera])
+                metadata[camera] = relative
+            sample_rows.append(metadata)
+        representative = next((row for row in sample_rows if row["sample_index"] == 2), sample_rows[0])
+        metadata = {"bean_id": str(bean["bean_id"]), **representative, "samples": sample_rows}
         for camera in ("CamL", "CamR"):
-            relative = f"photos/bean-{ref.sequence:06d}-{camera}.jpg"
-            (root / relative).write_bytes(sample[camera])
-            bean[f"photo_{camera}"] = relative
-            metadata[camera] = relative
-        bean["photo_frame_index"] = sample["frame_index"]
+            bean[f"photo_{camera}"] = representative[camera]
+        bean["photo_frame_index"] = representative["frame_index"]
         index.append(metadata)
     _write_json(
         photos / "index.json", {"schema": "beanoflight-bean-photos/v1", "photos": index}
