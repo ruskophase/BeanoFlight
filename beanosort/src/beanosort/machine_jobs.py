@@ -39,7 +39,7 @@ class Transport:
         request=Request(endpoint+path,None if body is None else json.dumps(body).encode(),
                         {'Authorization':'Bearer '+token,'Content-Type':'application/json'})
         try:
-            with build_opener(ProxyHandler({}),NoRedirect()).open(request,timeout=3) as r:
+            with build_opener(ProxyHandler({}),NoRedirect()).open(request,timeout=8 if path.endswith('/fastcam/status') else 3) as r:
                 payload=r.read(4*1024*1024+1)
                 if len(payload)>4*1024*1024:raise DomainError('Machine response exceeded the numerical page limit')
                 return json.loads(payload)
@@ -63,6 +63,17 @@ class Transport:
                     raise DomainError('The machine did not return a supported saved photograph')
                 return body
         except OSError:raise DomainError('Saved photograph unavailable from the machine') from None
+
+    def preview(self,endpoint,run_id):
+        try:
+            if not self.token_file:raise DomainError('Machine camera access is not configured')
+            token=Path(self.token_file).read_text().strip()
+            request=Request(f'{endpoint}/v1/jobs/{run_id}/fastcam/frame',headers={'Authorization':'Bearer '+token,'Accept':'image/jpeg'})
+            with build_opener(ProxyHandler({}),NoRedirect()).open(request,timeout=5) as response:
+                body=response.read(4*1024*1024+1)
+                if len(body)>4*1024*1024 or not body.startswith(b'\xff\xd8'):raise DomainError('Camera preview was not a supported JPEG')
+                return body
+        except OSError:raise DomainError('Camera preview is unavailable') from None
 
 
 class Integration:
@@ -88,10 +99,13 @@ class Integration:
         try:duration=int(data.get('duration_seconds',''))
         except ValueError:raise DomainError('Enter a whole number of active run seconds') from None
         if not 1<=duration<=catalog['maximum_duration_seconds']:raise DomainError('Duration must be 1–1800 seconds')
+        from .fastcam import plan
+        fastcam=plan(data,source,duration,selected['values'].get('cameras'))
+        if fastcam and not catalog.get('fastcam_capture_supported'):raise DomainError('Update the machine job service before scheduling FastCamUSB')
         return {'endpoint':endpoint,'remote_id':str(uuid.uuid5(uuid.NAMESPACE_URL,'beanosort:'+data['key'])),
             'request':{'machine_id':catalog['machine_id'],'recipe':'all_pass_through','source':source,'paced':True,
             'duration_seconds':duration,'image_mode':mode,'settings':selected['values'],'settings_sha256':selected['id'],
-            'configuration':catalog.get('configuration')}}
+            'configuration':catalog.get('configuration'),**({'fastcam':fastcam} if fastcam else {})}}
     def enqueue(self,user_id,operation_id,key,action):
         if action not in {'start','pause','resume','end','stop'}:raise DomainError('Unknown machine command')
         with self.db.write() as s:

@@ -91,7 +91,7 @@ class Store:
             if row is None:raise KeyError('Unknown journal event')
             return {'sequence':row['sequence'],'kind':row['kind'],'data':json.loads(row['data'])}
 
-    def command(self, key, command_id, action, execute):
+    def command(self, key, command_id, action, execute, *, validate=None):
         # Manager serializes commands. Persist an intent before execution; uncertain
         # commands are never re-executed after a process restart.
         with self.connect() as c:
@@ -99,6 +99,7 @@ class Store:
             if row:
                 if row['action']!=action: raise ValueError('Command identity reused with a different action')
                 return json.loads(row['result'])
+            if validate:validate()
             c.execute('INSERT INTO commands VALUES(?,?,?,?)',(key,command_id,action,encode({'accepted':True,'action':action})))
         return execute()
 

@@ -623,7 +623,7 @@ databases, including reconciliation into empty/occupied containers, missing
 measurements, historical cutoffs, replay labels and unchanged profiles/stock:
 
 ```bash
-python -m pytest -q tests/test_measurement_charts.py tests/test_machine_jobs.py
+python -m pytest -q tests/test_measurement_charts.py tests/test_machine_jobs.py tests/test_fastcam.py
 ```
 
 Optional browser acceptance uses a disposable simulation database, starts/stops

@@ -1,5 +1,67 @@
 # Actual sorter integration map
 
+## Enlarged population charts
+
+The same `/jobs/{id}/measurements`, `/jobs/{id}/populations` and
+`/portions/{id}/populations` views accept a validated `chart` presentation parameter.
+Title/back links preserve profile, run/collection, combined-contents and population
+scope. Existing inspection endpoints and source-specific photo GETs are reused;
+no machine interface or data-ingestion change is required. A focused chart is the
+same report and evidence, not a new measurement/profile or simulated population.
+
+## Manual FastCamUSB tab during a live job
+
+`beanosort/manual_fastcam.py` exposes `/jobs/{operation_id}/fastcam` plus authenticated
+status, command and preview routes. They resolve `MachineJob.endpoint`/`remote_id`,
+then use `/v1/jobs/{run_id}/fastcam/{status,commands,frame}` on the existing machine
+API. Machine API bearer tokens and ESP32 lease IDs remain server-side.
+`machine_jobs/manual_fastcam.py` serializes explicit actions with the existing
+live runner's `CameraHTTP` client ID. The current ESP Web Controller lease checks
+therefore remain intact; its existing `/api/fastcam/*` and
+`/api/high-speed/enabled` interfaces require no changes. GPIO33 configuration is
+read-only during the job. Neither the ESP controller service nor Pi listener needs
+a code change/restart for this feature.
+
+The runner creates the adapter after source priming, even without an automatic
+USB-camera plan, and closes it before releasing its lease. Manual takeover finishes
+the scheduled worker first. Requested/result/closed events are appended to the
+existing compact journal and ingested as normal `MachineEvent` evidence; they add
+no particle observations or inventory movements. All hardware tests use fakes,
+including an HTTP ESP32 lease gate. Physical activation is left to the operator.
+
+## Optional FastCamUSB live-job recording
+
+The existing Waveform Generator/controller now exposes `/api/fastcam/status`,
+`/api/fastcam/settings` and `/api/fastcam/command` through
+`ESP_Web_controller/app/fastcam.py`. It bridges to the Pi listener configured by
+`BEANO_FASTCAM_URL` (currently `http://10.203.77.197:8765`). Read-only defaults use
+its current settings plus the controller's current `high_speed` setup; external
+triggering alone is preselected. BeanoSort reaches these through the authenticated
+machine job API, so it also works when the workflow server is on another device.
+
+The optional manifest and `machine_jobs/fastcam.py` schedule only explicitly opted-in
+live jobs, using the existing job lease. GPIO33 config is applied before capture
+startup and its enable state brackets the recording window. All camera network IO
+runs outside tracking/measurement and heartbeat threads. Job journal/status retains
+requested/reported settings, acknowledgements, timing offsets, failures and Pi file
+paths. There is no USB-frame-to-particle association or video download interface.
+Real recording/timing has not been exercised during implementation; tests use fakes
+and only GET status/defaults reads were made against the operational system.
+
+November 19 recorder hardening: the standalone Pi app's `capture_core.py` re-exports
+the maintained `tools/fastcamusb/recorder.py`; guarded `controller.py` integration
+adds `recorder`, `recorder_policy` and scoped previous-session diagnostics to the
+existing listener status. The Waveform Generator bridge passes these fields
+through unchanged. A separate `ScheduledCapture` GET monitor persists compact
+diagnostics without delaying its timer or the tracking/heartbeat paths. The job
+page displays queue peaks/stalls, first-failure and observation times and stale
+telemetry. The recorder writes AVI/CSV plus a diagnostics JSON sidecar on the Pi.
+No new physical detector, image-to-particle association, database migration or
+hardware-startup path is introduced. A saved-frame replay on the actual Lexar
+filesystem recovered a >2-second write stall with all 5,400 frames intact; live
+simultaneous camera/sorter load was not exercised for this update. See
+[`../../tools/fastcamusb/README.md`](../../tools/fastcamusb/README.md).
+
 ## November 18: numerical machine evidence charts
 
 The All Pass-through job integration is documented in
@@ -13,10 +75,18 @@ sequence boundaries, without adding requests or work to the machine pipeline.
 
 This enables numerical charts from completed jobs that never saved photos. Links
 are derived on job/container/portion pages, preserving existing profile versions.
-No machine API, Registry schema, export format or hardware service changed for
-this display feature. The job API has no image-download interface: saved images
-remain machine-local. Intended Pass-through membership and known tracked coverage
-remain distinct from physical arrival verification and a full bean census.
+The subsequent crop-viewing addition uses retained `images` events to choose the
+earliest saved frame per track. `machine_photos.py` proxies authenticated,
+bounded PNG GETs from the machine API's terminal-job crop endpoint. Source files
+remain on the machine, with no RAW download or image upload in processing.
+Combined portion views follow pinned previous-contents profiles and resolve each
+record's crop against its original job, so a later no-image addition cannot mask
+earlier saved crops. This adds no machine API/control change. Pooled records are
+labelled historical observations; missing portion coverage and calibration/source
+incompatibilities remain explicit rather than a claimed complete bin census.
+Registry/feature schemas and hardware control paths are unchanged. Intended
+Pass-through membership and known tracked coverage remain distinct from physical
+arrival verification and a full bean census.
 
 ## November 16: explicit manual controls
 

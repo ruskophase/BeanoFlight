@@ -36,9 +36,9 @@ def started(x, *, source='live', destination=None, image_mode='none'):
     return op,adapter
 
 
-def finished(x, *, source='live', destination=None, destination_gross='1.100'):
-    op,adapter=started(x,source=source,destination=destination)
-    adapter.transport.events=events();adapter.transport.state='completed';adapter.tick()
+def finished(x, *, source='live', destination=None, destination_gross='1.100', image_mode='none', extra_events=()):
+    op,adapter=started(x,source=source,destination=destination,image_mode=image_mode)
+    adapter.transport.events=events()+list(extra_events);adapter.transport.state='completed';adapter.tick()
     client=client_for(x);page=client.get('/jobs/'+op+'/weigh');form={}
     with x.db.read() as s:ctx=weighing_context(s,s.get(Operation,op),x.db.environment)
     for row in ctx['rows']:
@@ -118,6 +118,8 @@ def test_existing_destination_shows_only_run_contribution_and_replay_is_labelled
     assert page.status_code==200 and 'Recorded replay measurements' in page.text
     assert "Charts describe this run's contribution" in page.text and 'do not observe the present contents' in page.text
     assert report(page)['populations']['input']['count']==3
+    assert report(page)['populations']['observed_previous']['count']==0
+    assert 'Earlier contents have no' in page.text
     client.close()
 
 
@@ -182,3 +184,68 @@ def test_saved_crops_follow_bean_identity_and_leave_colour_and_history_intact(sy
         assert before==[(p.id,p.payload) for p in s.scalars(select(Particle))]
         assert original_events==[(e.sequence,e.data) for e in s.scalars(select(MachineEvent))]
     client.close()
+
+
+def test_combined_history_keeps_earlier_photos_when_latest_addition_saves_none(system):
+    x=system
+    first,c1,p1,cid,url1=finished(x)
+    crop={'sequence':4,'kind':'images','created_at':'2026-11-18T08:00:01+00:00',
+          'data':{'bean_sequence':100,'frame_index':20,'paths':['stereo/100/00000020-CamL.png','stereo/100/00000020-CamR.png']}}
+    middle,c2,p2,_,url2=finished(x,destination=cid,destination_gross='1.700',image_mode='stereo',extra_events=[crop])
+    latest,client,p3,_,url=finished(x,destination=cid,destination_gross='2.300')
+    with x.db.read() as s:
+        profiles=[(p.id,deepcopy(p.data)) for p in s.scalars(select(Profile))]
+        ledger=[(l.id,l.delta_mg) for l in s.scalars(select(Ledger))]
+        particles=[(p.id,deepcopy(p.payload)) for p in s.scalars(select(Particle))]
+        middle_job=s.get(MachineJob,middle)
+    page=client.get(url);assert page.status_code==200,page.text
+    data=report(page)
+    assert data['record_count']==9 and data['combined_contribution_evidence']
+    assert [source['operation_id'] for source in data['contributions']]==[first,middle,latest]
+    assert data['populations']['input']['count']==3
+    assert data['populations']['observed_previous']['count']==6
+    assert data['populations']['observed_pass_through']['count']==9
+    for key,hist in data['populations']['observed_pass_through']['histograms'].items():
+        assert sum(hist)+data['populations']['observed_pass_through']['unknown'][key]==9
+    assert 'does not remove earlier saved photographs' in page.text
+    args=dict(parse_qsl(urlsplit(url).query));args.update(feature='lab_l',bucket=0,basis='observed',population='pass_through')
+    inspected=client.get('/jobs/'+latest+'/measurements/inspect',params=args).json()
+    assert inspected['matching_count']==3 and inspected['photographed_count']==1
+    assert inspected['missing_photo_reference_count']==2 and inspected['photo_ordering']=='saved-photo records first'
+    beans=inspected['items'];assert len(beans)==3
+    assert beans[0]['origin_operation_id']==middle and beans[0]['photos']['CamL'].startswith('/jobs/'+middle+'/')
+    assert beans[0]['photo_frame_index']==20 and beans[0]['colours']['CamL']==[100,80,40]
+    assert all(not b['photos']['CamL'] and not b['photos']['CamR'] for b in beans[1:])
+    assert {b['origin_operation_id'] for b in beans}=={first,middle,latest}  # same bean_sequence, different runs
+    calls=[]
+    class Images:
+        def crop(self,*args):calls.append(args);return b'\x89PNG\r\n\x1a\nfixture'
+    client.app.state.machine_jobs.transport=Images()
+    assert client.get(beans[0]['photos']['CamL']).status_code==200
+    assert calls==[(middle_job.endpoint,middle_job.remote_id,4,'CamL')]
+    # Single-run views and older immutable profiles keep their own cutoff and scope.
+    single=report(client.get(url+'&scope=run'))
+    assert single['record_count']==3 and not single['combined_contribution_evidence']
+    assert report(client.get(url2))['record_count']==6
+    assert report(client.get(url1))['record_count']==3
+    previous=client.get('/jobs/'+latest+'/measurements/inspect',params={**args,'population':'previous'}).json()
+    assert previous['matching_count']==2 and previous['photographed_count']==1
+    latest_only=client.get('/jobs/'+latest+'/measurements/inspect',params={**args,'population':'input'}).json()
+    assert latest_only['matching_count']==1 and latest_only['photographed_count']==0
+    assert latest_only['items'][0]['origin_operation_id']==latest and latest_only['items'][0]['photos']['CamL'] is None
+    with x.db.read() as s:
+        assert profiles==[(p.id,p.data) for p in s.scalars(select(Profile))]
+        assert ledger==[(l.id,l.delta_mg) for l in s.scalars(select(Ledger))]
+        assert particles==[(p.id,p.payload) for p in s.scalars(select(Particle))]
+    for c in (c1,c2,client):c.close()
+
+
+def test_cyclic_pinned_contribution_history_is_rejected(system):
+    x=system;op,adapter=started(x)
+    adapter.transport.events=events();adapter.tick()
+    key=identity('profile')
+    with x.db.write() as s:
+        s.add(Profile(id=key,operation_id=op,stream='pass_through',version=1,
+            data={'destination_combination':{'previous_profile_id':key,'previous_portion_id':None}}))
+    with x.db.read() as s:
+        with pytest.raises(DomainError,match='Cyclic'):context(s,op,key)

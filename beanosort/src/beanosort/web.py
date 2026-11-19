@@ -75,6 +75,9 @@ def create_app(settings=None):
 
     def render(request, name, *, user=None, status=200, db_session=None, **context):
         request.session.setdefault("csrf", secrets.token_urlsafe(32))
+        if name in {"measurement_charts.html","populations.html","portion_populations.html"}:
+            from .chart_view import options
+            context.update(options(request,context['report']))
         descriptions = {}
         operation_descriptions = {}
         container_labeler = None
@@ -1306,4 +1309,8 @@ def create_app(settings=None):
     measurement_routes(app, db, user_for, render)
     from .machine_photos import register_routes as photo_routes
     photo_routes(app, db, machine, user_for)
+    from .fastcam import register_routes as fastcam_routes
+    fastcam_routes(app, machine, user_for)
+    from .manual_fastcam import register_routes as manual_fastcam_routes
+    manual_fastcam_routes(app,db,machine,user_for,render,form)
     return app

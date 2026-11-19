@@ -14,6 +14,8 @@ from .store import Store,encode,fingerprint
 from .runner import Runner
 from .provenance import configuration
 from .crops import read_crop
+from .fastcam import defaults as fastcam_defaults,validate as validate_fastcam
+from .manual_fastcam import validate_request as validate_manual_fastcam
 
 
 class Manager:
@@ -35,6 +37,8 @@ class Manager:
             'maximum_pause_seconds':self.config.get('maximum_pause_seconds',600),
             'maximum_duration_seconds':1800,'images_over_network':True,
             'crop_delivery':'committed stereo PNGs on demand, terminal jobs only; no RAW download',
+            'fastcam_capture_supported':True,
+            'manual_fastcam_supported':True,
             'configuration':configuration(self.config)}
     def start(self,key,request):
         try:uuid.UUID(key)
@@ -57,6 +61,7 @@ class Manager:
             if request.get('configuration')!=catalog['configuration']:raise ValueError('Calibration or nozzle map changed since preparation')
             if request.get('settings_sha256')!=allowed['id'] or fingerprint(request.get('settings'))!=allowed['id']:
                 raise ValueError('Settings changed since preparation; prepare a new job')
+            validate_fastcam(request.get('fastcam'),duration,request['source'],request['settings'].get('cameras'))
             if self.store.create(key,request):
                 runner=Runner(self.store,key,request,self.config);self.runners[key]=runner;runner.thread.start()
             return self.store.job(key)
@@ -73,6 +78,30 @@ class Manager:
         for runner in self.runners.values():
             if runner.thread.is_alive():runner.command('end')
         for runner in self.runners.values():runner.thread.join(45)
+    def manual_camera(self,key):
+        job=self.store.job(key)
+        if job['request'].get('source')!='live':raise ValueError('Manual camera controls require a live source')
+        runner=self.runners.get(key)
+        return job,getattr(runner,'manual_fastcam',None)
+    def camera_status(self,key):
+        job,camera=self.manual_camera(key)
+        if camera:return camera.read_status()
+        return {**(job.get('manual_fastcam') or {}),'controls_available':False,'connected':False,
+            'reason':'Camera controls are available while this live job is running or paused'}
+    def camera_command(self,key,command_id,data):
+        validate_manual_fastcam(data)
+        if not isinstance(command_id,str) or not 1<=len(command_id)<=160:raise ValueError('Camera command identity required')
+        with self.lock:
+            _,camera=self.manual_camera(key)
+            if camera is None:raise ValueError('This live job has no active camera operator')
+            camera.require_active()
+            return self.store.command(key,'manual-fastcam:'+command_id,'manual-fastcam:'+fingerprint(data),
+                lambda:camera.submit(command_id,data),validate=lambda:camera.check_submission(data))
+    def camera_frame(self,key):
+        _,camera=self.manual_camera(key)
+        if camera is None:raise ValueError('Camera preview requires an active live job')
+        camera.require_active()
+        return camera.client.frame()
 
 
 def make_handler(manager,token):
@@ -90,6 +119,8 @@ def make_handler(manager,token):
                     if not 0<length<=65536:raise ValueError('Invalid request size')
                     data=json.loads(self.rfile.read(length))
                 if parts==['v1','catalog'] and not post:result=manager.catalog()
+                elif parts==['v1','fastcam-defaults'] and not post:
+                    result=fastcam_defaults(manager.config['controller_url'])
                 elif len(parts)>=3 and parts[:2]==['v1','jobs']:
                     key=parts[2]
                     if len(parts)==3:
@@ -107,6 +138,17 @@ def make_handler(manager,token):
                         self.end_headers();self.wfile.write(body)
                         return
                     elif len(parts)==4 and parts[3]=='commands' and post:result=manager.command(key,data.get('id'),data.get('action'))
+                    elif len(parts)==5 and parts[3]=='fastcam':
+                        if parts[4]=='status' and not post:result=manager.camera_status(key)
+                        elif parts[4]=='commands' and post:
+                            if not isinstance(data,dict) or set(data)-{'id','action','settings','operator'}:raise ValueError('Unknown camera command fields')
+                            result=manager.camera_command(key,data.get('id'),{k:v for k,v in data.items() if k!='id'})
+                        elif parts[4]=='frame' and not post:
+                            body=manager.camera_frame(key)
+                            self.send_response(200);self.send_header('Content-Type','image/jpeg')
+                            self.send_header('Content-Length',str(len(body)));self.send_header('Cache-Control','no-store')
+                            self.send_header('X-Content-Type-Options','nosniff');self.end_headers();self.wfile.write(body);return
+                        else:raise KeyError('Unknown camera endpoint')
                     else:raise KeyError('Unknown endpoint')
                 else:raise KeyError('Unknown endpoint')
                 self.respond(200,result)

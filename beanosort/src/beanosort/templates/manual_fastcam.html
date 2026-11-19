@@ -1,0 +1,25 @@
+{% extends 'base.html' %}{% block title %}Manual high-speed camera · BeanoSort{% endblock %}{% block content %}
+<div class="page-head"><div><p class="eyebrow">Live sorting · high-speed camera</p><h1>Manual FastCamUSB controls</h1><p><a href="/jobs/{{ op.id }}">Return to sorting job</a> · <span class="identity">{{ op.id }}</span></p></div></div>
+<section id="manual-fastcam" class="card" data-url="/jobs/{{ op.id }}/fastcam" data-csrf="{{ csrf }}" data-prefix="{{ newkey() }}">
+<p>Use these controls during this job without taking over its machine control lease. Start/stop affect the USB camera and its GPIO33 triggers. The existing GPIO33 timing is shown below; change timing before a run in Sorter Controls.</p>
+<p data-camera-state role="status">Reading camera status…</p><p class="notice" data-camera-error hidden></p>
+<div data-camera-takeover><p>Switching to manual ends any automatic camera window and stops that recording first. It will not resume automatically. Sorting continues.</p><button type="button" data-camera-action="take_manual">Use manual camera controls</button></div>
+<p data-camera-command role="status"></p>
+<div class="actions"><button type="button" data-camera-action="start" disabled>Start camera</button><button type="button" data-camera-action="record" disabled>Record</button><button type="button" class="secondary" data-camera-action="stop_recording" disabled>Stop recording</button><button type="button" class="danger" data-camera-action="stop_camera" disabled>Stop camera</button></div>
+<p data-camera-trigger></p><p data-camera-metrics></p><p data-camera-diagnostics></p><p data-camera-files class="identity"></p>
+<form data-camera-settings><fieldset disabled><legend>Camera settings</legend><p>Stop the USB camera to change acquisition settings. Status polling preserves your unsaved edits.</p><div class="grid three">
+<label>Resolution<select name="width"><option value="1280">1280 × 720</option><option value="640">640 × 480</option></select></label>
+<label>Stream / AVI playback rate (fps)<input name="fps" type="number" min="1" max="200" step="any" required></label>
+<label>Exposure (µs)<input name="exposure_us" type="number" min="100" max="100000" step="100" required></label>
+<label>Preview rate (fps)<input name="preview_fps" type="number" min="1" max="60" step="1" required></label>
+<label>Device (blank = automatic)<input name="device" maxlength="4096"></label>
+<label>Output folder on Raspberry Pi<input name="output_folder" maxlength="4096" required></label></div>
+<label class="check"><input type="checkbox" name="external_trigger">External triggering from current GPIO33 configuration</label>
+<label class="check"><input type="checkbox" name="disable_preview">Disable camera preview</label>
+<label class="check"><input type="checkbox" name="disable_preview_during_recording">Disable camera preview during recording</label>
+<button type="submit" class="secondary">Apply camera settings</button><span data-camera-unsaved></span></fieldset></form>
+<label class="check"><input type="checkbox" data-camera-show-preview checked>Show preview in this tab (up to 5 frames/s)</label>
+<p data-camera-preview-note>Camera preview is not available yet.</p><img data-camera-preview alt="Live FastCamUSB preview" style="max-width:100%;height:auto" hidden>
+<p class="muted">Closing this tab leaves the camera running. Job END/STOP, failure or completion cleans up its manual camera session. Saved USB video is separate from tracked-bean population evidence.</p>
+</section><script src="/static/manual_fastcam.js" defer></script>
+{% endblock %}

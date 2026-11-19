@@ -1,0 +1,5 @@
+<div class="population-focus-header" id="population-distributions">
+<p class="eyebrow">Population evidence · enlarged chart</p><h1>{{ chart_spec.title }} · {{ chart_spec.unit }}</h1>
+<p><a class="button secondary" href="{{ chart_back_url }}" data-chart-back>← Back to population evidence</a></p>
+<p>Click an interval to view matching bean photographs and colour samples beneath the chart.<br><small>{% if report.measurement_evidence %}Image-derived observations; output membership is intended, not physically verified.{% elif report.single_population or report.combination %}Inherited population estimates; archived photos do not verify current physical membership.{% else %}Expected or simulated populations; photos show archived source beans, not verified bin arrivals.{% endif %}</small></p>
+</div>

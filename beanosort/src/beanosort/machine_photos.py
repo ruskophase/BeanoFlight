@@ -19,11 +19,14 @@ def reference(event):
 
 def references(session,job,sequences):
     if job.request.get('image_mode')!='stereo' or job.state not in {'completed','failed'} or not sequences:return {}
-    rows=session.execute(select(MachineEvent.sequence,MachineEvent.data).where(
-        MachineEvent.operation_id==job.operation_id,MachineEvent.data['kind'].as_string()=='images',
-        MachineEvent.data['data']['bean_sequence'].as_integer().in_(sequences)))
+    beans=list({seq for seq in sequences if type(seq) is int})
+    def records():
+        for start in range(0,len(beans),250):
+            yield from session.execute(select(MachineEvent.sequence,MachineEvent.data).where(
+                MachineEvent.operation_id==job.operation_id,MachineEvent.data['kind'].as_string()=='images',
+                MachineEvent.data['data']['bean_sequence'].as_integer().in_(beans[start:start+250])))
     result={}
-    for sequence,event in rows:
+    for sequence,event in records():
         ref=reference(event)
         if not ref:continue
         bean=ref['bean_sequence'];old=result.get(bean)

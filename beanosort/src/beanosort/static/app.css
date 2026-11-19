@@ -39,3 +39,15 @@
 
 #machine-prepare label.check { display: flex; align-items: center; gap: .65rem; }
 #machine-prepare input[type="radio"] { width: auto; flex: 0 0 auto; margin: 0; }
+
+/* Enlarged evidence view: full-width plot followed by matching photos/colours. */
+main.population-focus-page{max-width:none}
+.population-focus-header{scroll-margin-top:20px}
+.population-focus-provenance{padding:12px 16px;border:1px solid var(--line);border-radius:8px;background:white}
+.population-focus .population-chart-grid{grid-template-columns:minmax(0,1fr)}
+.population-focus.inspecting{grid-template-columns:minmax(0,1fr);gap:28px}
+.population-focus .population-inspector{padding:20px;position:static;max-height:none;overflow:visible}
+.population-focus .inspector-views{gap:12px}
+.population-focus .inspector-views small{font-size:12px}
+.population-focus .bean-colour-swatch{height:36px}
+.population-focus .inspection-beans{grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr));gap:20px}

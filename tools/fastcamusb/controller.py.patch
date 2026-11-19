@@ -1,0 +1,68 @@
+--- controller.py
++++ controller.py
+@@ -7,6 +7,7 @@
+ from types import SimpleNamespace
+ 
+ from capture_core import ROOT, CameraStream, VideoRecorder, capture_mode
++from recorder import buffer_policy
+ 
+ DEFAULTS = dict(device=None, width=1280, fps=180, exposure_ms=3, preview_fps=30,
+     output_folder=str(ROOT / 'recordings'), external_trigger=False,
+@@ -64,6 +65,7 @@
+             pass
+         self.stream = None
+         self.recorder = None
++        self.recorder_stream = None
+         self.last_error = None
+         self.closed = False
+ 
+@@ -78,12 +80,14 @@
+     def _frame(self, jpeg, timestamp, sequence):
+         # Do not take the controller lock here: stopping capture joins this thread.
+         recorder = self.recorder
+-        if recorder is not None:
++        if recorder is not None and self.recorder_stream is self.stream:
+             recorder.enqueue(jpeg, timestamp, sequence)
+ 
+     def _start(self):
+         if self.stream is not None and self.stream.running:
+             return
++        if self._recording():
++            raise ControlError("The previous recording is still finishing.")
+         args = SimpleNamespace(**self.settings)
+         args.height = 720 if args.width == 1280 else 480
+         self.stream = CameraStream(args, on_frame=self._frame)
+@@ -152,6 +156,8 @@
+                     time.sleep(.02)
+                 try:
+                     self.recorder = VideoRecorder(self.settings['output_folder'], self.stream.effective_fps, external)
++                    self.recorder_stream = self.stream
++                    self.last_error = None
+                 except (OSError, RuntimeError) as exc:
+                     self.last_error = str(exc)
+                     raise ControlError(f'Cannot {action}: {exc}') from exc
+@@ -178,11 +184,12 @@
+ 
+     def status(self):
+         with self.lock:
+-            stream, recorder = self.stream, self.recorder
++            stream = self.stream
++            recorder = self.recorder if self.recorder_stream is stream else None
+             running = stream is not None and stream.running
+             if self._recording() and not running:
+                 self._finish()
+-            active = self._recording()
++            active = recorder is not None and recorder.running
+             finishing = active and recorder.stopping.is_set()
+             external = self.settings['external_trigger']
+             ready = running and stream.ready
+@@ -198,6 +205,9 @@
+                 exposure_ms=stream.exposure_ms if stream else self.settings['exposure_ms'],
+                 camera_mode_fps=stream.camera_fps if stream else capture_mode(self.settings['exposure_ms']),
+                 playback_fps=stream.effective_fps if stream else min(self.settings['fps'], capture_mode(self.settings['exposure_ms'])),
++                recorder=recorder.diagnostics() if recorder else None,
++                recorder_policy=buffer_policy(stream.effective_fps if stream else min(self.settings["fps"], capture_mode(self.settings["exposure_ms"]))),
++                previous_recording=self.recorder.diagnostics() if self.recorder is not None and recorder is None else None,
+                 recorded_frames=recorder.frames if recorder else 0,
+                 video_path=str(recorder.path) if recorder else None,
+                 timestamp_path=str(recorder.timing_path) if recorder else None,

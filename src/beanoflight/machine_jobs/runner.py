@@ -13,6 +13,8 @@ import time
 
 from .store import encode, utc, fingerprint
 from .controller import Controller
+from .fastcam import CameraHTTP,ScheduledCapture
+from .manual_fastcam import ManualCamera
 
 
 class Journal:
@@ -46,9 +48,13 @@ class Runner:
         self.thread=threading.Thread(target=self.run,name='machine-job-'+key,daemon=True)
         self.root=Path(config['data_root'])/key
         self.raw_bundle=None;self.raw_report=None;self.source_stats={};self.paused_at=None;self.pause_ready=False
+        self.fastcam=None
+        self.manual_fastcam=None
     def command(self,action):
         if action not in {'pause','resume','end','stop'}:raise ValueError('Unknown command')
         self.commands.put(action)
+        if action in {'stop','end'} and self.fastcam:self.fastcam.request_stop()
+        if action in {'stop','end'} and self.manual_fastcam:self.manual_fastcam.request_stop()
         if action=='stop' and self.controller and self.controller.owned:
             self.controller.api('stop')
         return {'accepted':True,'action':action}
@@ -61,6 +67,8 @@ class Runner:
             'raw_recording_report':self.raw_report,
             'source_statistics':self.source_stats,'pause_drained':self.pause_ready,
             'images_location':'Jetson only; image bytes are not exported',
+            'fastcam':self.fastcam.snapshot() if self.fastcam else {'state':'disabled'},
+            'manual_fastcam':self.manual_fastcam.snapshot() if self.manual_fastcam else None,
             'decision_basis':'All Pass-through; no measurements required and no valve plans issued'}
     def persist(self):self.store.status(self.key,self.status())
     def run(self):
@@ -170,6 +178,9 @@ class Runner:
                 if self.request.get('configuration',{}).get('id')!=fingerprint(actual):
                     raise RuntimeError('Calibration changed before capture startup')
                 self.controller=Controller(self.config['controller_url'],self.key);self.controller.acquire()
+                fastcam_plan=self.request.get('fastcam')
+                if fastcam_plan and fastcam_plan['settings']['external_trigger']:
+                    self.controller.api('high-speed/config',**fastcam_plan['trigger'])
                 self.controller.configure(bundle)
                 self.controller.verify_configuration(bundle)
                 paths={c:Path('/dev/shm')/('beano-job-'+self.key+'-'+c+'.raw') for c in ('CamL','CamR')}
@@ -201,9 +212,16 @@ class Runner:
             # The live source reserves frame zero explicitly after its empty
             # background is ready. Do this before any feeder start or resume.
             if live:source.prime()
+            if live and self.request.get('fastcam'):
+                self.fastcam=ScheduledCapture(CameraHTTP(self.config['controller_url'],self.controller.client_id),self.request['fastcam'],emit)
+                self.fastcam.prepare()  # Feeding is still off; worker owns all camera IO.
+            if live:
+                self.manual_fastcam=ManualCamera(CameraHTTP(self.config['controller_url'],self.controller.client_id),
+                    lambda:self.state in {'running','paused'} and self.controller.owned,self.fastcam,emit)
             initially_paused=self.request.get('start_paused',False)
             if self.controller:
                 if not initially_paused:self.controller.feed(True)
+                if not initially_paused and self.fastcam:self.fastcam.begin(time.monotonic())
                 self.controller.watch_progress=True
             self.state='paused' if initially_paused else 'running'
             last_tick=time.monotonic();replay_origin=last_tick
@@ -229,12 +247,14 @@ class Runner:
                         self.state='paused';self.paused_at=tick;emit('state',{'state':'paused'})
                     if action=='resume' and self.state=='paused':
                         if self.controller:self.controller.feed(True)
+                        if self.fastcam:self.fastcam.begin(time.monotonic())
                         replay_origin+=tick-self.paused_at
                         self.state='running';self.pause_ready=False;emit('state',{'state':'running'})
                     if action=='end' and self.state in {'running','paused'}:self.state='draining'
                 if self.state=='running' and self.active>=self.request['duration_seconds']:self.state='draining'
                 if self.state=='draining' and drain_until is None:
                     if self.controller:self.controller.feed(False)
+                    if self.fastcam:self.fastcam.request_stop()
                     drain_until=tick+2 if live else tick
                     emit('state',{'state':'draining'})
                 collect()
@@ -322,6 +342,7 @@ class Runner:
                 for seq in beans:finalize(seq)
             except Exception:pass
         finally:
+            if self.manual_fastcam:self.manual_fastcam.request_stop()
             workers.shutdown(wait=True);images.shutdown(wait=True)
             if measurer:measurer.close()
             if producer:
@@ -332,6 +353,12 @@ class Runner:
             if source:
                 try:source.close()
                 except Exception as exc:self.error=self.error or str(exc)
+            if self.fastcam:
+                try:self.fastcam.finish()
+                except Exception as exc:self.error=self.error or 'FastCamUSB cleanup: '+str(exc)
+            if self.manual_fastcam:
+                try:self.manual_fastcam.close()
+                except Exception as exc:self.error=self.error or 'Manual FastCamUSB cleanup: '+str(exc)
             if self.controller:
                 try:self.controller.close()
                 except Exception as exc:self.error=self.error or str(exc)

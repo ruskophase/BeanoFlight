@@ -1,5 +1,109 @@
 # Operator walkthrough and evidence semantics
 
+## Enlarging a population chart
+
+On a portion's population evidence page, click a chart's **title** to open that
+chart on its own. The chart fills the available page width, with matching
+bean photos and colour samples in a responsive grid beneath it. Click an interval, or focus
+the chart and use ← / → then Enter. **Clear selection** clears those matches while
+keeping the inspector available. Photo availability and evidence meanings are
+unchanged; the inspector's expandable evidence note retains the detailed caveats.
+
+**← Back to population evidence** returns to the page and chart you opened it from,
+including its historical profile, contribution/collection or combined-contents
+scope. Selected lines, vertical scale, evidence basis and inspected interval/page
+are carried through the link. The focused view also works after refreshing or
+opening its URL directly. Photos use ordinary page scrolling beneath the chart
+on all screen sizes. This works for machine observations, archived-reference sorting results
+and retained portion populations. It does not recalculate or rewrite stock evidence.
+
+## Manual high-speed camera during sorting
+
+On a live sorting job, click **Manual high-speed camera ↗** to open a separate
+tab. The live job page can keep updating while you edit camera settings. This
+also works for live jobs that did not request an automatic camera recording.
+The tab uses the sorting job's existing machine lease through a camera-only API;
+do not release sorting control or take over the ESP32 in another GUI.
+
+Click **Use manual camera controls**. This ends any automatic FastCamUSB window
+and waits for its recording/camera cleanup before enabling manual actions. That
+automatic window will not resume. An unrelated existing camera session is not
+silently taken over. Opening the tab alone only reads status.
+
+1. Adjust camera settings if needed and click **Apply camera settings**. Values
+   start from the current Pi/Waveform Generator settings; polling preserves edits.
+2. Click **Start camera**, wait until ready, then **Record** (or **Record (arm)**
+   with external triggering). **Stop recording** keeps the camera available for
+   preview and another recording. **Stop camera** closes the USB session.
+3. Toggle **Show preview in this tab** to pause browser preview requests. The
+   preview is capped at five frames/s and pauses while the tab is hidden. Camera
+   preview settings can also disable it during recording; acquisition settings
+   require the USB camera to be stopped first.
+
+External mode enables GPIO33 on camera start using its **existing** trigger and
+illumination configuration, then disables it when the camera stops. Timing cannot
+be reconfigured through this tab during a sorting run; free-running mode needs no
+GPIO33 trigger. These controls do not change the conveyor, vibration motor, stereo
+camera timing, valves or sorting recipe. Requested and acknowledged camera actions,
+operator identities, failures and reported files are retained in the job journal.
+The preview/video is separate from tracked-bean features and chute verification.
+
+Closing the tab leaves the recording running. Job END/STOP, failure or completion
+cleans up its manual camera session before releasing control. Lost activation
+acknowledgements are not retried automatically. A disconnected tab shows unknown
+status and disables actions; unsaved edits survive reconnection. Prepared,
+finished and replay jobs cannot issue manual camera commands. During a live job,
+controls are available while feeding or paused. No direct browser access to the
+Pi is needed, including when the browser connects over WireGuard.
+
+## Optional FastCamUSB recording during a live job
+
+In **Prepare a sorting job**, choose the live-machine recipe and **Live cameras**.
+Expand **Optional FastCamUSB recording** to load the most recent Waveform Generator
+camera/listener settings. The section starts collapsed, and recording starts
+unchecked. External triggering starts checked; other settings use the current GUI
+values. You can edit resolution, playback/stream fps, exposure, preview rate,
+device, output folder, preview options and GPIO33 trigger timing. Loading defaults
+or preparing a job sends no camera or GPIO command. Offline defaults show a retry
+message; leaving recording unchecked keeps the ordinary sorting workflow.
+
+Check **Record with FastCamUSB during this job**, then enter **Start + seconds**
+and **End + seconds**. +10 to +40 requests a 30-second window. Times use elapsed
+seconds from the first feed-start acknowledgement, including pauses; they are
+independent of the active-feeding counter. The window must end within the planned
+feeding duration. END/STOP or an interrupted job can shorten or cancel it. The
+AVI playback fps and actual capture timing are distinct; use the saved timestamp
+CSV for actual frame timing rather than assuming an exact video duration.
+
+On START, the optional camera is prepared before feeding: requested settings and
+GPIO33 configuration must be acknowledged, and the USB camera must become ready.
+An existing unmanaged camera session is not taken over. External mode arms the
+camera and enables GPIO33 for the window, then disables GPIO33 and disarms it;
+free-running mode uses RECORD/STOP. The camera is stopped during cleanup. The job
+page shows requested timing, reported recording state, early termination/errors,
+acknowledgements and reported AVI/CSV paths on the Raspberry Pi.
+
+New recordings also show buffered frames/bytes and their peaks, longest recorder
+write, write-stall count and any rejected/abandoned frames. The recorder uses a
+five-second frame budget (900 frames at 180 fps) and a 64 MiB compressed-byte cap,
+whichever is reached first. This absorbs brief output stalls but still fails
+explicitly if output cannot recover. A diagnostics JSON path accompanies the AVI
+and CSV. The Pi's first recorder-failure time and when the job received that failure
+are separate; failure does not masquerade as a successful full recording window.
+An old run without diagnostics says they are unavailable. Lost status polling
+shows stale/unknown telemetry rather than treating retained values as live.
+
+Camera network work runs separately from tracking and the machine heartbeat.
+An auxiliary recording error after feeding starts is reported separately; it does
+not introduce a new automatic sorter-stop policy. Lost activation replies are
+not retried. Shutdown uncertainty remains an error, not proof that recording
+stopped. Existing controller lease/failsafe behaviour still applies.
+
+This USB recording is separate from CamL/CamR bean crops used by population
+charts. Its frames are not automatically associated with tracked beans, and its
+files are not downloaded into inventory records. Keep Pi recordings with your
+external evidence backups. Replay jobs cannot activate this physical camera.
+
 ## Live-machine population charts
 
 From a completed All Pass-through machine job, open its Pass-through container or
@@ -16,17 +120,39 @@ units, bin edges, denominators, mean/median and population SD are visible. Missi
 features remain unknown. Input and intended Pass-through coincide in an all-pass
 run; neither proves arrival in a bin or a complete physical census.
 
-These charts describe the recorded run contribution. They do not measure prior
-contents in an occupied destination or unprocessed material returned to the source.
-A saved profile opens its historical evidence cutoff rather than silently including
-later received observations. Replay is labelled separately from live observations;
-live cameras do not convert training inventory into real inventory.
+For an addition into an occupied container, the portion view includes earlier
+observations from its pinned additive contents history. Compare **Latest addition
+observations**, **Earlier contents observations**, and **Combined retained
+observations**. **Recorded contributions and photograph settings** links each
+source's frozen profile/run view and shows its own image-saving mode. A latest
+**No image saves** choice does not remove earlier photographs.
 
-**No image saves** means no bean photographs were saved. Numerical measurements
-and recorded colour swatches still work. Even when image saving was enabled,
-this view only consumes the numerical journal; RAW frames/crops remain on the
-machine and are not downloaded by this page. Chart browsing changes no stock mass,
-profile, recipe, machine settings or outputs.
+When inspecting the combined series, records with saved crop references appear
+first; records without photos remain in pagination and the matching totals.
+Each card shows its original run and image mode. Photos are never borrowed across
+runs, even if their local bean numbers match. Choose a contribution link to see
+that run alone. Combined histograms/statistics describe count-weighted retained
+observations, not mass-weighted composition or a physical census of the vessel.
+Earlier material without independently scoped observations remains explicitly
+unknown. Splits/re-sorting do not imply individual bean recognition or photo matches.
+
+A saved profile uses its historical evidence cutoff rather than silently including
+later received observations. Prior contributions use their pinned profile versions.
+Replay is labelled separately from live observations; live cameras do not convert
+training inventory into real inventory. Unprocessed source material remains unknown.
+
+With **Save stereo bean crops**, click a chart interval after the run completes to
+see available CamL/CamR photos alongside the colour swatches. Each track uses its
+earliest saved crop pair; its chart measurements may aggregate several frames.
+Click a photo to open it at full size. Photos load on demand through the server;
+the source files stay on the machine. Missing files or a disconnected machine show
+an unavailable-photo message without removing the colour sample.
+
+**No image saves** means no bean photographs were saved. **Save RAW frames** does
+not create individual bean crops for this inspector. Numerical measurements and
+recorded colour swatches still work in either case. Chart/photo browsing changes
+no stock mass, profile, recipe, machine settings or outputs. Images are camera
+observations, not verified bin arrival.
 
 ## Waiting for longer actions
 

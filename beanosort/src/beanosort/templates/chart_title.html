@@ -1,0 +1,1 @@
+<h3>{% if chart_links and not chart_focus %}<a href="{{ chart_links[key] }}" data-chart-link="{{ key }}" title="Open larger chart" aria-label="Open {{ spec.title }} chart in larger view">{{ spec.title }} · {{ spec.unit }}</a>{% else %}{{ spec.title }} · {{ spec.unit }}{% endif %}</h3>

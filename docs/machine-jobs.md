@@ -2,8 +2,9 @@
 
 BeanoSort controls jobs through the Jetson job service on port 8091. The existing
 manual ESP controller stays on port 8000. BeanoSort may run on a Raspberry Pi 5;
-only JSON configuration, commands, status and numerical evidence cross the LAN.
-The API intentionally has no image-download endpoint.
+JSON configuration, commands, status and numerical evidence cross the LAN.
+Saved stereo crops of terminal runs can also be requested on demand through the
+authenticated API. RAW recordings stay local; no per-bean image upload is added.
 
 ## Operator workflow
 
@@ -32,6 +33,55 @@ Pausing replay freezes its recorded timeline; it cannot recreate the physical
 effect of stopping a feeder on an already-recorded scene.
 The inventory environment banner still applies: actual live measurements do not
 turn training stock into real inventory.
+
+## Optional FastCamUSB window
+
+Expand **Optional FastCamUSB recording** during live-job preparation to prefill
+the current Waveform Generator camera and GPIO33 settings. Recording is unchecked;
+external triggering is preselected. Enabling the option pins settings and an
+elapsed-time start/end window in the job request (`beano-fastcam-plan/v1`).
++10 to +40 requests 30 seconds from the first feed-start acknowledgement, including
+pauses. End must be within the planned feeding duration. Replay cannot opt in.
+
+The existing controller's FastCamUSB bridge must be available; its listener address
+remains configured by `BEANO_FASTCAM_URL`. The job applies optional GPIO33 timing
+before paired capture startup, then verifies USB-camera readiness before feeding.
+The separate schedule worker performs ARM → GPIO33 on → GPIO33 off → DISARM in
+external mode, or RECORD → STOP in free-running mode, then stops its camera session.
+It never puts camera HTTP calls into frame processing or the lease heartbeat.
+
+Requested times/settings, reported configuration, activation/stop acknowledgements,
+early termination, errors and AVI/CSV paths are journalled. A startup failure
+prevents feeding; later auxiliary failures are displayed without inventing a new
+sorter-stop policy. Lost activation replies are not retried, and service restart
+does not restart the timer. An existing unmanaged camera session is not taken over.
+The Pi listener has no hardware failsafe; unreachable shutdown remains unconfirmed.
+USB recordings stay on the Pi and are separate from tracked-bean stereo crops.
+
+The Pi recorder now defaults to a five-second frame budget and a 64 MiB compressed
+byte cap, including its in-flight JPEG. A separate read-only monitor polls compact
+queue/write diagnostics about once per second, without holding up the schedule
+worker's STOP deadline. Actual first failure time, first received job elapsed time,
+recording failure and shortened planned windows remain separate. Missing polls show
+unknown/stale telemetry. STOP acknowledgement can succeed while a recorder error
+remains recorded. The GUI shows buffer peaks, write stalls and diagnostics-file
+path; old runs without those fields remain explicitly unavailable. Recorder source,
+guarded Pi integration, configuration, offline tests and rollback are documented in
+[`../tools/fastcamusb/README.md`](../tools/fastcamusb/README.md). This does not change
+the main sorter's network-loss policy or issue a new camera/motor/valve action.
+
+## Manual FastCamUSB during live sorting
+
+Live job pages also link **Manual high-speed camera ↗** in a new tab. Its scoped
+`/v1/jobs/{id}/fastcam/{status,commands,frame}` API uses the active runner's existing
+controller lease; no browser lease takeover or generic hardware proxy is added.
+Explicit manual takeover finishes any automatic recording window first. Start,
+record/arm, stop recording, stop camera and USB settings are serialized on a
+separate worker; preview is bounded and separate from frame processing. External
+mode toggles GPIO33 using its existing timing only. Job cleanup closes the camera
+before releasing control. Prepared/terminal/replay jobs cannot activate it. Commands
+are durable by identity but never automatically replayed after uncertainty/restart.
+See the [operator walkthrough](../beanosort/docs/operator.md) for the button flow.
 
 ## Images and measurements
 
@@ -65,12 +115,17 @@ converted into kilograms.
 BeanoSort now exposes **Population charts & measurement evidence** from the job
 and its Pass-through portion/container. It plots retained lightness, chroma,
 major axis, projected area and volume proxy, including missing-feature counts.
-Clicking a bin shows the matching tracked records and recorded camera mean-RGB
-swatches. One track is counted once regardless of measurement sample count.
+Clicking a bin shows the matching tracked records, recorded camera mean-RGB
+swatches and available stereo crops. One track is counted once regardless of measurement sample count.
 Input and intended Pass-through coincide for this recipe; bin arrival is not
 independently verified. Historical profiles retain their evidence-receipt cutoff.
 Charts cover the run contribution, not prior destination contents or unprocessed
-source material. No image-download endpoint or hardware action was added.
+source material. Crop reads add no hardware action. Authenticated GET
+`/v1/jobs/{id}/crops/{journal_sequence}/{CamL|CamR}` serves only committed
+`images` event paths from a completed/failed stereo run. Directory containment,
+camera/path matching, a 4 MiB limit and PNG checks prevent arbitrary file reads.
+The BeanoSort server proxies these bytes with private caching; browsers do not
+receive the machine API token. Missing crops retain a labelled colour-only view.
 
 ## Reliability and boundaries
 
@@ -116,14 +171,17 @@ The example uses HTTP with a bearer token for a trusted LAN. Do not expose eithe
 machine service publicly. RAW preflight reserves space for active duration plus
 maximum pause allowance and startup/drain margin; low storage stops the job.
 Current limits: 1–1800 active seconds, 600 seconds pause allowance, plus 60 seconds
-startup/drain margin. Replays and image saves remain local to the Jetson.
+startup/drain margin. Replay sources and saved originals remain on the Jetson;
+terminal-job stereo crops can be viewed on demand. Optional USB AVI/CSV files
+remain in the configured Pi output folder. Back up those external evidence
+directories along with the machine journal and BeanoSort database.
 To offer several settings bundles, supply `settings_files` as an array of JSON
 paths in the machine configuration. Each offered bundle has a content hash;
 settings and calibration changes after preparation require a new job.
 
 ## Validation scope
 
-Tests cover authenticated numerical-only API access, pinned identities, duplicate
+Tests cover authenticated numerical API/crop access, pinned identities, duplicate
 commands/batches, LAN failure, journal gaps/final watermarks, crash recovery,
 synthetic-evidence isolation, camera-independent lease handling, pause/resume and
 automatic duration stop with fake devices, and browser-to-HTTP-to-database flows.

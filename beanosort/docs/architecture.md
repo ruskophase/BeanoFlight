@@ -1,9 +1,103 @@
 # Architecture and reversible decisions
 
+## Single-chart population evidence views
+
+`chart_view.options` provides presentation-only `?chart=<feature>` links for
+machine evidence, reference sorting results and retained portion pages. Existing
+handlers still resolve the report, historical profile and inspection URL using the
+same scope. Only known report features are accepted. The return URL is built from
+the current local path/query, excluding `chart`; no arbitrary return target or
+Referer is used. No schema, ledger, evidence aggregation or crop API change.
+
+The templates render one SVG and collapse background provenance. They retain the
+full report JSON and show an explicit evidence summary. `populations.js` reuses the
+same interval/photo inspector, carries optional `view_*` presentation parameters
+through title/back links and restores valid choices without changing observations.
+SVG coordinates resize with the focused plot; ordinary chart coordinates remain
+unchanged. Focused layout uses the full page width for the chart, followed by a
+responsive photo/colour grid in normal page flow. The DOM and keyboard order match
+this chart-first layout on all screens; there is no sticky sidebar or inner photo
+scroll area. Detailed evidence stays expandable. Images stay on-demand and
+retain their original source identity, availability and evidence labels.
+
+## Job-scoped manual high-speed camera
+
+`manual_fastcam.html`/`manual_fastcam.js` provide a separate operator tab linked
+from live jobs. Authenticated role/CSRF-protected BeanoSort routes proxy status,
+bounded JPEG preview and explicit commands to the job's pinned machine endpoint.
+They never expose the machine bearer token or controller client ID to the browser.
+Camera commands have unique request IDs and no activation outbox/retry worker.
+
+`machine_jobs.manual_fastcam.ManualCamera` is attached only to live runners. Its
+single worker serializes camera-only requests with the runner's existing lease
+identity; it never acquires a second ESP32 lease or touches feed/valve/stereo timing
+controls. A `take_manual` boundary joins the scheduled capture worker's cleanup
+before enabling manual actions, so the old timer cannot stop a later manual
+recording. The immutable original plan remains; manual changes are explicit journal
+events. GPIO33 enable/disable uses existing validated controller timing, with no
+mid-run timing configuration endpoint. The runner owns final cleanup.
+
+The machine API persists command identity/intent before queueing work, deduplicates
+identical requests and rejects reused IDs with changed payloads. Validation of busy
+state happens before reserving a new ID. Network calls run outside capture and
+heartbeat threads and database transactions. A failed/lost reply is not retried
+automatically. Camera state, requested/result events and shutdown uncertainty remain
+separate; none establishes physical bin membership or changes stock quantities.
+Status GETs are read-only; late replies cannot overwrite a newer command result.
+The UI preserves dirty fields, avoids replacing its form, caps preview at 5 fps,
+pauses preview in hidden tabs and shows unavailable state on connection loss.
+
+## Optional FastCamUSB scheduling
+
+The collapsed `fastcam_prepare.html` section loads current camera defaults lazily
+through authenticated `/machine-fastcam/defaults` → machine API
+`/v1/fastcam-defaults` → existing Waveform Generator `/api/fastcam/status` and
+`/api/state`. These are GETs, not settings application. External triggering is the
+only forced default. `beanosort.fastcam.plan` validates operator fields and pins a
+`beano-fastcam-plan/v1` object inside the existing immutable job manifest. The
+machine validates it again before accepting a new run. No new migration/settings
+service is required. Unchecked plans are omitted; replay rejects them.
+
+`beanoflight.machine_jobs.fastcam.ScheduledCapture` runs bounded camera HTTP IO on
+its own worker. The existing controller lease authorizes it. Optional GPIO33 timing
+is configured while all capture outputs are off, before paired-camera startup.
+After live source priming, camera/settings readiness is verified with feeding off.
+The first acknowledged feed start fixes a monotonic epoch; resume never resets it.
+The recording window uses elapsed time through pauses, not accumulated feed time.
+External recording arms before enabling GPIO33 and disables it before disarming.
+Early end/stop signals the worker without network IO in the frame path; cleanup
+finishes outside frame processing and before releasing the controller.
+
+Requested settings/times, reported settings/trigger state, command acknowledgements,
+actual request/ack offsets, failures and file references remain separate in journal
+events/status. These are command/recorder reports, not independently verified
+physical captures. The auxiliary worker never issues valve plans. Startup camera
+failure prevents feeding; a later auxiliary error does not invent a new machine
+network-loss policy. Activation is not retried after uncertainty. Repeated job-start
+requests use the existing manifest identity and cannot create a second worker;
+restart recovery never silently resumes the recording timer. Pi files stay external
+to relational rows. USB and tracking clocks/identities are not automatically joined.
+
+Recorder hardening is maintained under `tools/fastcamusb/`: a compressed-frame
+writer, checksum-guarded patches for the standalone Pi app, installer and tests.
+The bounded queue includes in-flight frames and bytes, defaults to 5 seconds/64 MiB,
+and writes a versioned diagnostics sidecar with first-failure time, counts, queue
+peaks and bounded write-stall/sample histories. `CameraStream` stays unchanged.
+Controller status scopes a recorder to its owning stream, preventing historical
+errors from poisoning the next session. No schema or inventory mutation is involved.
+
+`ScheduledCapture` additionally has a read-only telemetry monitor. Its GET can
+time out independently while the schedule worker issues STOP on its own deadline;
+late replies after cleanup starts are ignored. Source failure timestamps and
+server observation time remain distinct, and monitoring loss means unknown state.
+Recording failure and planned-window interruption are separate status fields.
+Shutdown can be acknowledged despite a persisted recorder error. No later auxiliary
+error changes the main sorter's continue/stop policy.
+
 ## Read-only machine population charts
 
 `measurement_charts.py` reads the already ingested `Particle` feature aggregates
-for a `MachineJob`/`Run`; it does not query a controller, open images or import a
+for a `MachineJob`/`Run`; it does not query a controller or import a
 capture/hardware startup path. Authenticated GET routes under
 `/jobs/{id}/measurements` provide five histograms and a paginated numeric/colour
 inspector. `populations.js` shares the reference view's interactive charts and
@@ -23,10 +117,39 @@ is not assumed. All-pass membership is intended, not physically confirmed.
 Historical views filter by the profile's server evidence-receipt time, independently
 of source event time. Frozen tracked counts must match retained records; a mismatch
 is an explicit error. Where a collection exists its existing sequence boundary
-scopes the chart; unknown association is rejected. Combined/shared-source profiles
-show only the run contribution, with an explicit limitation on whole-container
-coverage. Remainders do not receive an invented per-bean chart. This is derived
+scopes the chart; unknown association is rejected. Shared-source profiles retain
+an explicit limitation on unprocessed material. Remainders do not receive an invented per-bean chart. This is derived
 display data and performs no writes, re-simulation or mass/count reconciliation.
+
+For combined machine output profiles, `context` follows only the immutable
+`destination_combination.previous_profile_id` chain. It checks the pinned portion,
+profile chronology and cycles, and reads each run at its own profile cutoff and
+collection boundary. Stable particle IDs prevent double-counting retained records.
+It does not sweep arbitrary feed ancestry, assign old photos to re-sorted tracks,
+or claim a known subset after an unobserved split. Unsupported/unprofiled earlier
+contents remain an explicit limitation linked to their portion.
+
+The derived v2 combined report aligns bins for latest/previous/combined observation
+series and retains contributing run/profile/configuration references. It weights
+records, not stock masses or assumed physical source fractions. Differing source
+or machine/settings/calibration references are flagged; compatibility is not
+inferred. `scope=run` preserves the single-run view. Neither report changes stored
+profile versions or their composition/release assertions.
+
+`machine_photos.py` separately links the retained `images` events to each record's
+originating run/bean identity. It chooses the earliest saved frame, returns authenticated
+same-origin crop URLs, and fetches bytes only when a visible image is requested.
+`Transport.crop` performs a bounded, timed PNG GET against the job's pinned machine
+endpoint, outside the database read transaction. The machine API resolves only
+committed crop events of terminal stereo jobs under that run's directory; arbitrary
+paths, RAW files and symlink escapes are rejected. It limits each image to 4 MiB.
+No capture code, per-bean upload or inventory write is added. Photos supplement
+the frozen numerical profile; an image sample need not equal its multi-frame
+aggregate. Combined interval inspection resolves references per original job,
+orders saved-crop records first and retains missing-photo records in pagination.
+Reference lookups are chunked to respect SQLite parameter limits; image bytes
+still load only on demand. Failed photo loads retain the RGB swatch and an
+unavailable message.
 
 ## Browser waiting feedback
 

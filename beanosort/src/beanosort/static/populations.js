@@ -6,6 +6,8 @@ if (populationData) {
   const scale = document.querySelector('[data-population-scale]');
   const tooltip = document.querySelector('[data-chart-tooltip]');
   const explorer = document.querySelector('[data-population-explorer]');
+  const focusFeature = explorer.dataset.focusFeature || '';
+  const view = new URLSearchParams(window.location.search);
   const inspector = document.querySelector('[data-population-inspector]');
   const chooser = document.querySelector('[data-inspector-population]');
   const status = document.querySelector('[data-inspector-status]');
@@ -23,7 +25,6 @@ if (populationData) {
   }
   const ns = 'http://www.w3.org/2000/svg';
   const number = value => Number(value).toLocaleString(undefined, {maximumFractionDigits: 3});
-  const left = 54, right = 580, top = 22, bottom = 256;
   const keyboardBins = new Map();
   let selection = null, controller = null, requestId = 0;
   function visible() { return series.filter(s => toggles.some(t => t.dataset.populationToggle === s.key && t.checked)); }
@@ -42,8 +43,26 @@ if (populationData) {
   }
   function closeInspector() {
     controller?.abort(); requestId++; selection = null;
-    inspector.hidden = true; explorer.classList.remove('inspecting');
+    inspector.hidden = !focusFeature; explorer.classList.toggle('inspecting',Boolean(focusFeature));
+    if(focusFeature){
+      gallery.replaceChildren();status.textContent='Click a chart interval to view matching beans and colour samples.';
+      document.querySelector('[data-inspector-interval]').textContent='Choose an interval';
+      document.querySelector('[data-inspector-evidence]').textContent='';
+      document.querySelector('[data-inspector-page]').textContent='';
+      inspector.setAttribute('aria-busy','false');retry.hidden=true;previous.disabled=next.disabled=true;
+    }
     render();
+  }
+  function viewLink(link, feature) {
+    const url=new URL(link.href,window.location.origin);
+    for(const key of ['view_feature','view_bucket','view_population','view_page'])url.searchParams.delete(key);
+    url.searchParams.set('view_basis',basis.value);url.searchParams.set('view_scale',scale.value);
+    url.searchParams.set('view_lines',visible().map(s=>s.key).join(','));
+    if(selection&&(!feature||selection.feature===feature)){
+      url.searchParams.set('view_feature',selection.feature);url.searchParams.set('view_bucket',selection.bucket);
+      url.searchParams.set('view_population',selection.population);url.searchParams.set('view_page',selection.page||1);
+    }
+    link.href=url.pathname+url.search+url.hash;
   }
   function renderBean(bean, data) {
     const card = html('article');
@@ -71,6 +90,10 @@ if (populationData) {
     }
     card.append(views, html('strong',bean.bean_id), html('small',`${data.title}: ${number(bean.feature_value)} ${data.unit}`));
     if (bean.photo_frame_index !== undefined) card.append(html('small',`Saved crop frame ${bean.photo_frame_index}; features aggregate ${bean.sample_count ?? 'unknown'} sample(s)`));
+    if (bean.origin_run_id) {
+      const origin=html('a',bean.origin_run_id,'identity');origin.href=bean.origin_url;
+      card.append(html('small',`${bean.origin_source==='live'?'Live observations':'Recorded replay'} · ${bean.origin_image_mode==='stereo'?'Stereo crop mode':bean.origin_image_mode==='none'?'No image saves':'RAW frames'}`),origin);
+    }
     const expected = data.basis === 'expected' && data.population !== 'input';
     card.append(html('small', `${number(bean.count)} ${data.count_unit || (expected ? 'expected passages' : data.run_id ? 'simulated passages' : 'reference bean')}`));
     if (expected && data.run_id) card.append(html('small',`${number(bean.recorded_passages)} candidate passages; destination probabilistic`));
@@ -105,6 +128,8 @@ if (populationData) {
       const title = series.find(s => s.key === data.population).title;
       status.textContent = data.measurement_evidence ? `${title}: ${number(data.matching_count)} matching tracked records.` :
         `${title}: ${number(data.matching_count)} ${data.count_basis} · ${number(data.reference_bean_count)} reference bean(s).`;
+      if (data.measurement_evidence && data.photographed_count !== undefined) status.textContent+=
+        ` ${number(data.photographed_count)} with saved crop records; ${number(data.missing_photo_reference_count)} without. ${data.photo_ordering}.`;
       document.querySelector('[data-inspector-evidence]').textContent =
         data.measurement_evidence ? data.evidence_label : (data.retained ? 'Retained joint population estimate; physical membership and mixing uniformity are unverified. ' : data.collection ? 'Count-weighted combined composition estimate; actual uniformity and physical membership are unverified. ' : data.basis === 'expected' && data.population !== 'input' ?
           'Expected contributors weighted by capture probability; these are possible destinations, not verified arrivals. ' :
@@ -124,7 +149,7 @@ if (populationData) {
   function inspect(feature, bucket, population) {
     selection = {feature,bucket,population};
     loadInspection();
-    if (window.matchMedia('(max-width: 950px)').matches) inspector.scrollIntoView({block:'start'});
+    if (window.matchMedia(`(max-width: ${focusFeature?1050:950}px)`).matches) inspector.scrollIntoView({block:'start'});
   }
   function describeBin(feature, bucket) {
     const spec = report.definitions[feature];
@@ -138,6 +163,10 @@ if (populationData) {
     if (selection) chooser.value = selection.population;
     for (const svg of document.querySelectorAll('[data-population-chart]')) {
       const feature = svg.dataset.populationChart, spec = report.definitions[feature], edges = spec.edges;
+      const width=focusFeature?Math.max(320,Math.round(svg.clientWidth)):600;
+      const height=focusFeature?Math.max(360,Math.min(650,Math.round(width*.58))):300;
+      const left=focusFeature?64:54,right=focusFeature?width-24:580,top=focusFeature?30:22,bottom=focusFeature?height-50:256;
+      if(focusFeature)svg.setAttribute('viewBox',`0 0 ${width} ${height}`);
       const x = value => left+(value-edges[0])/(edges[edges.length-1]-edges[0])*(right-left);
       const values = shown.map(s => {
         const pop = report.populations[populationKey(s.key)];
@@ -164,7 +193,7 @@ if (populationData) {
         points.forEach((value,i) => {path+=`${i?'L':'M'}${x(edges[i])},${y(value||0)} L${x(edges[i+1])},${y(value||0)} `;});
         svg.append(node('path',{d:path,fill:'none',stroke:shown[index].colour,'stroke-width':2.5,'data-population-series':shown[index].key}));
       });
-      if (!shown.length) svg.append(node('text',{x:300,y:135,'text-anchor':'middle','font-size':15,fill:'#61716b'},'Select a population line above.'));
+      if (!shown.length) svg.append(node('text',{x:width/2,y:height/2,'text-anchor':'middle','font-size':15,fill:'#61716b'},'Select a population line above.'));
       if (feature === report.recipe.feature && report.recipe.relation !== 'pass_all') {
         const bounds=report.recipe.relation==='below'?['lower']:report.recipe.relation==='above'?['upper']:['lower','upper'];
         for (const bound of bounds) {
@@ -203,6 +232,8 @@ if (populationData) {
         } else if (event.key==='Escape') closeInspector();
       };
     }
+    for(const link of document.querySelectorAll('[data-chart-link]'))viewLink(link,link.dataset.chartLink);
+    const back=document.querySelector('[data-chart-back]');if(back)viewLink(back);
   }
   toggles.forEach(toggle=>toggle.addEventListener('change',()=>{
     const shown=visible();
@@ -217,5 +248,24 @@ if (populationData) {
   retry.addEventListener('click',()=>loadInspection(selection?.page||1));
   basis.addEventListener('change',()=>{render();if(selection)loadInspection();});
   scale.addEventListener('change',render);
-  render();
+  if([...basis.options].some(o=>o.value===view.get('view_basis')))basis.value=view.get('view_basis');
+  if([...scale.options].some(o=>o.value===view.get('view_scale')))scale.value=view.get('view_scale');
+  if(view.has('view_lines')){
+    const chosen=new Set(view.get('view_lines').split(','));
+    for(const toggle of toggles)toggle.checked=chosen.has(toggle.dataset.populationToggle);
+  }
+  if(focusFeature){
+    document.querySelector('main').classList.add('population-focus-page');explorer.classList.add('population-focus');
+    explorer.append(inspector); // Keep reading/tab order aligned with chart-first layout.
+    const clear=document.querySelector('[data-inspector-close]');clear.textContent='Clear selection';clear.setAttribute('aria-label','Clear bean inspection');
+    closeInspector();
+    let lastWidth=0;
+    new ResizeObserver(entries=>{const width=Math.round(entries[0].contentRect.width);if(width!==lastWidth){lastWidth=width;render();}}).observe(document.querySelector('.population-charts'));
+  }
+  const initialFeature=focusFeature||view.get('view_feature'),bucket=Number(view.get('view_bucket'));
+  if(view.has('view_bucket')&&report.definitions[initialFeature]&&Number.isInteger(bucket)&&bucket>=0&&bucket<report.definitions[initialFeature].edges.length-1&&visible().length){
+    selection={feature:initialFeature,bucket,population:visible().find(s=>s.key===view.get('view_population'))?.key||visible()[0].key};
+    keyboardBins.set(initialFeature,bucket);
+    const page=Number(view.get('view_page'));loadInspection(Number.isInteger(page)&&page>0?page:1);
+  }else render();
 }

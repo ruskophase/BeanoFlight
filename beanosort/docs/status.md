@@ -1,4 +1,307 @@
-# Phase status — 2026-11-18
+# Phase status — 2026-11-19
+
+## Full-width chart with bean photos underneath — 2026-11-19
+
+The enlarged evidence page now gives the chart the full available page width.
+Matching bean photos and colour samples appear underneath in a responsive grid,
+using ordinary page scrolling. The chart comes first in DOM/keyboard order too.
+The previous sidebar and its inner scroll area are removed only from focused
+views; ordinary evidence pages keep their existing arrangement.
+
+The existing browser acceptance check was updated to verify full-width chart and
+inspector alignment, photos below the chart at all four widths, desktop rows of
+bean cards, unchanged report JSON, image/colour loading and restored choices on
+return. It passed both against a read-only preview and the authenticated LAN app
+at 1440/1920/768/390 px, with no JS errors or horizontal overflow. The plot is now
+1338 × 650 px at 1440 and 1818 × 650 px at 1920. Only login and GET requests were
+used. Domain/database tests were not rerun for this layout-only change.
+
+Changed components: focused CSS, inspector DOM placement, header hint, existing
+browser layout assertions and operator/architecture notes. The running server
+served the updated assets/template without a restart; web, machine and actuator
+services remained running. No backend accounting, schema, inventory, evidence or
+hardware-control change. QA results/screenshots are under ignored
+`var/qa/full-width-charts/`. The next check is operator acceptance of the new layout.
+
+## Enlarged population evidence charts — 2026-11-19
+
+Chart titles on portion evidence pages now open one enlarged chart with a wider
+photo/colour inspector and an explicit **Back to population evidence** link.
+Machine observation views, archived-reference sorting results and retained portion
+populations share the same inspector. Focused pages collapse background provenance
+and detailed inspector evidence, keep an explicit evidence summary visible, and
+show only interval-matched bean photos. Normal evidence pages keep their layout.
+
+The validated `chart` query changes presentation only. Links preserve the original
+profile, run/contribution, collection, contents and population scope. Valid line,
+scale, basis and selected interval/page choices survive opening/returning. The
+same full report JSON and source photo endpoints are retained. Focused SVG geometry
+resizes with the available space; on narrow screens the chart is above the inspector.
+Unknown properties, missing images and evidence labels keep their prior meanings.
+
+Validation: **35 focused tests passed** across machine evidence, interval inspection,
+retained populations and four new focus-view checks. The new tests cover all three
+evidence-page types, exact report equality, historical/source scope in both links,
+invalid feature rejection and unchanged profiles, ledger and particle payloads.
+The existing synthetic reference browser workflow passed, including further sorting,
+combined contents and interval photo/colour inspection. A read-only SQLite preview
+also loaded actual retained bean crops and colour samples, restored the selected
+interval on return and passed desktop/tablet/phone checks with no JS errors or
+overflow. Tested widths: 1440, 1920, 768 and 390 px. The plot grew from the overview
+tile to 856 × 496 px at a 1440 px viewport, and 1091 × 633 px at 1920 px.
+
+Only the idle WebGUI was reloaded after the verified backup
+`var/backups/training-before-enlarged-charts-20261119T070448Z.db`.
+Material/configuration/profile tables, current run particles and the machine
+journal matched before/after. Machine job and actuator services stayed running;
+outputs were reported off and no hardware command was issued. No schema migration,
+historical evidence rewrite or sorter/camera integration change. PostgreSQL was
+not rerun; the existing TestClient deprecation warning remains.
+Authenticated LAN browser checks also loaded saved bean photos/colour samples in
+the deployed focused page, returned to the original frozen evidence scope with
+view choices restored, and passed all four viewport widths without JS errors.
+Only login and GET requests were used. Material/profile/current-particle and journal
+hashes still matched the pre-reload snapshot after those browser checks.
+
+Changed components: `chart_view.py`, shared render context, chart-title/focus-header
+partials, the three evidence view templates/shared reference view, `populations.js`,
+focused CSS, tests and documentation. QA artifacts and screenshots are under ignored
+`var/qa/enlarged-charts/` with test logs in `var/qa/enlarged-chart-*.log`.
+The next check is operator acceptance of the larger chart and photo layout.
+
+## Manual high-speed camera tab during live sorting — 2026-11-19
+
+Live jobs now link **Manual high-speed camera ↗** in a separate tab, including jobs
+without an automatic USB-camera plan. The tab supports explicit manual takeover,
+USB settings, start, record/arm, stop recording, stop camera and bounded live preview.
+Polling preserves unsaved edits and reports disconnection; preview pauses when the
+tab is hidden. Taking manual control finishes the automatic window first, which
+will not resume. An unrelated active camera session is not silently taken over.
+
+The camera-only machine API uses the live runner's current ESP32 lease identity,
+so it does not compete with sorting for control. The browser receives neither
+lease ID nor machine API token. GPIO33 enable/disable uses its existing validated
+timing; acquisition settings require the USB camera to be stopped, while preview
+options remain editable. Camera readiness is confirmed before enabling external
+triggers. Conveyor, vibration, stereo timing, recipe and valve controls are excluded.
+Requested/result events retain operator identity and settings in the existing
+journal. Command identity prevents repeated activation; uncertain requests have no
+automatic retry/outbox. Job cleanup closes the manual session before lease release.
+Closing the tab leaves recording running until explicit stop or job cleanup.
+
+Validation: **57 focused tests passed**: 38 machine journal/lifecycle/scheduled and
+manual-camera tests, plus 19 BeanoSort form/permission/CSRF/workflow/chart tests.
+Fakes cover the existing ESP lease gate via HTTP, free-running/external modes,
+automatic-to-manual handover beyond the original timer deadline, readiness ordering,
+busy rejection, duplicate/changed command IDs, lost acknowledgements, cleanup and
+late status replies. Replay, terminal and unstarted jobs cannot activate the camera.
+Existing capture/machine lifecycle regression checks passed without hardware.
+The existing TestClient deprecation warning remains; PostgreSQL was not rerun.
+
+A real Chromium test rendered the actual templates/JS with synthetic HTTP camera
+responses. It opened the new tab from the continuously updating job page, retained
+edits through polling and reconnection, exercised start/record/stop and preview,
+and passed 1440/768/390 px layout checks with no JS errors or overflow. All recording
+and preview data in this test was synthetic; no physical camera was activated.
+
+Deployed by reloading only the idle machine job and web services after verified
+backups `var/backups/training-before-manual-fastcam-20261119T064411Z.db` and
+`var/backups/machine-journal-before-manual-fastcam-20261119T064411Z.db`.
+Material/configuration/profile tables, current run particles and machine journal
+matched before/after reload. The actuator and ESP controller PIDs stayed unchanged;
+outputs were reported off and no operational hardware command was issued. No Pi
+or ESP code/service change, schema migration or historical profile rewrite.
+Authenticated LAN Chromium checks confirmed the deployed new-tab link, template
+and JS, disabled controls for an existing terminal job, and responsive layouts
+without JS errors. Only login and GET requests were used. The Pi listener PID
+and settings hash also matched the prior verified deployment; the camera stayed idle.
+
+Changed components: `machine_jobs/manual_fastcam.py`, runner lifecycle, narrow
+machine API routes/preview reads, validated command intent hook, BeanoSort proxy
+routes, manual template/JS and live-job link/status, tests and documentation.
+QA evidence is under ignored `var/qa/manual-fastcam/` with focused test logs in
+`var/qa/manual-fastcam-*.log`. The next check is an operator-controlled live manual
+recording during sorting; this implementation session did not operate hardware.
+
+## FastCamUSB recorder buffer and failure diagnostics — 2026-11-19
+
+The Pi recorder now has a five-second frame budget (900 at 180 fps) and a separate
+64 MiB compressed-JPEG cap, including the in-flight frame. It absorbs transient
+output stalls while retaining explicit overflow failure and ordered draining;
+it cannot solve indefinitely slow storage. ffmpeg still stream-copies the existing
+JPEGs. CameraStream/native capture, exposure/rate/trigger settings, disk mounts
+and main-sorter control policy are unchanged.
+
+Compact status and a versioned diagnostics JSON sidecar retain queue/byte peaks,
+accepted/written/rejected/abandoned counts, write-stall timing and the first actual
+recorder-failure time. A new session no longer inherits a previous recorder's
+error or saved counts. A separate read-only monitor publishes diagnostics during
+the window, without letting a blocked GET delay the scheduled STOP worker. Source
+Pi time and Jetson first-observed elapsed time remain separate. Lost monitoring
+shows stale/unknown state. Confirmed STOP can coexist with a recorded capture error.
+Old runs have no fabricated diagnostics or rewritten outcome.
+
+Validation: **52 focused automated tests passed** (10 recorder/controller tests,
+also passed on the Pi; 25 machine schedule/lifecycle tests; 17 BeanoSort plan,
+workflow and measurement-history tests). Event-controlled fake output covers
+in-flight frame/byte bounds, order-preserving recovery beyond the old cap,
+overflow, broken output, mux failure, stable failure timestamps and session scoping.
+Scheduler tests cover early error reporting, stale replies/network loss, STOP
+independence from a blocked monitor and acknowledgement despite a recorder error.
+Chromium checks with synthetic HTTP status exercised queue/stall display, failure
+time, stale telemetry and absent historical diagnostics without hardware commands.
+The existing TestClient deprecation warning remains.
+
+A saved-frame replay on the Pi's actual Lexar output filesystem submitted 5,400
+historical JPEGs at 180 fps with an injected 1.3-second writer pause. All frames
+were retained in a valid 30.0-second AVI; the observed longest write was 2,059.5 ms
+and peak backlog 371 frames / 8,177,221 bytes, below the new limits and above the
+old 180-frame limit. The source AVI remained unchanged. No camera was opened.
+This validates recorder recovery, not simultaneous live-camera/sorter load or
+hardware timing. No physical sorting run or PostgreSQL test was performed.
+
+Deployed while idle: Pi listener, machine job service and WebGUI. Pi source backups
+are under `FastCamUSB/recorder-backups/20261119T054132538775Z/`; verified SQLite
+backups are `var/backups/training-before-fastcam-buffer-20261119T054137Z.db` and
+`var/backups/machine-journal-before-fastcam-buffer-20261119T054137Z.db`.
+Material/configuration/profile tables, current run particles and machine journal
+matched before/after restart; Pi settings hash stayed unchanged. Actuator and
+Waveform Generator/controller PIDs stayed unchanged, outputs were reported off,
+and no camera/GPIO/motor/valve command was issued. Credentials are unchanged.
+Authenticated LAN Chromium checks then confirmed the existing failed run retained
+its original error, historical diagnostics remained unavailable, new JS and current
+defaults were served, and 1440/768/390 px layouts had no overflow or JS errors.
+Only login and GET requests were used; there were no operational POSTs.
+
+Changed components: maintained recorder/integration patches/installer/offline
+replay tool in `tools/fastcamusb/`, scheduler telemetry monitor, job status
+template/JS, focused tests and documentation. No schema migration. QA logs,
+sidecars/results and screenshots are under ignored
+`var/qa/fastcam-storage-review-20261119/`. Next milestone: inspect new diagnostics
+from the next operator-controlled live job; profile simultaneous load only if
+the new evidence shows continuing stalls or overflows.
+
+## Mixed photograph availability after container additions — 2026-11-19
+
+The population view previously opened only the latest run contribution. A later
+**No image saves** addition therefore appeared to remove all photos, although the
+earlier crop files and references remained intact. Combined machine portions now
+follow their pinned previous-contents profile chain and compare latest, previous
+and combined retained observations. Each record resolves photographs using its
+own original job/bean identity and shows that run/image mode. Saved-crop records
+appear first in interval inspection; records without photos remain in the totals
+and pagination. The contribution table links frozen single-run views.
+
+Combined report v2 retains run/profile/configuration references, aligns histogram
+bins and counts observation records without mass scaling or invented physical
+source fractions. Frozen profile cutoffs remain in effect. Cycles/mismatched
+pinned profiles are rejected; absent or unscoped earlier observations remain an
+explicit limitation. Arbitrary feed ancestry, unobserved splits and re-sorting
+do not create individual photo matches. Comparability differences are flagged.
+No material quantities, persisted profiles or image evidence were rewritten.
+
+Validation: **37 focused domain/HTML tests passed**, followed by **8 chart tests**
+after adding explicit report provenance/schema metadata. Tests cover three
+successive additions (no photos → crops → no photos), identical local bean numbers
+in different runs, correct original photo endpoint, records without photos,
+single-run/historical scopes, unknown earlier stock, cycles and unchanged stock,
+particles and profiles. The reference browser chain passed with its synthetic
+fixture. A read-only SQLite preview loaded actual earlier crops from the three-run
+historical profile (867 records), including source selection and responsive
+1440/768/390 px layouts with no JS errors/overflow.
+
+The LAN WebGUI was reloaded after a verified backup at
+`var/backups/training-before-mixed-photo-evidence-20261119T044618Z.db`.
+A final web-only reload enabled the derived report metadata. Material/configuration/
+profile tables, the latest run's particles and machine journal matched before/after.
+The machine API and actuator processes stayed running. Authenticated live browser
+checks also loaded earlier crop images from the current four-addition portion:
+2,228 retained records, 2,118 with lightness and 110 unknown. Selecting its latest
+1,361-record addition correctly showed no saved crops. No operational POST,
+camera/GPIO command, physical sorting run or PostgreSQL check was performed.
+The known TestClient deprecation warning remains. Credentials are unchanged.
+
+Changed components: `measurement_charts.py`, per-source crop-reference lookup,
+chart template/shared inspector, focused tests and operator/architecture/integration
+documentation. No schema migration or sorter control change. Screenshots, read-only
+preview/live results and deployment checks are under ignored `var/qa/mixed-photos/`.
+The next check is operator acceptance of this mixed-evidence view; richer evidence
+inheritance across unobserved withdrawals/re-sorting remains separate work.
+
+## Optional FastCamUSB recording window — 2026-11-18
+
+Live-machine preparation now has a collapsed **Optional FastCamUSB recording**
+section. Expanding it lazily reads the current Waveform Generator camera/listener
+and GPIO33 settings. Recording is unchecked; external triggering alone is forced
+on as a default. All supported camera/preview/device/storage controls and trigger
+timing are editable. A validated, versioned plan is pinned to the job manifest.
+Replay cannot activate it, and unchecked jobs omit the plan entirely.
+
++10 to +40 requests a 30-second elapsed window after the first feed-start
+acknowledgement, including pauses. Resume never moves the epoch. Optional trigger
+configuration is applied before paired capture startup; after source priming the
+camera/settings must be confirmed before feeding. A separate worker owns timed
+ARM/RECORD, GPIO33 on/off, DISARM/STOP and cleanup, without camera network work in
+tracking or heartbeat threads. Reported settings, requested/acknowledged times,
+early termination, errors and Pi AVI/CSV paths remain distinct. Later auxiliary
+failures are visible and do not invent a new sorter-stop policy. Lost activation
+replies are not retried; restart recovery does not restart a timer.
+
+Validation: **27 machine/crop/schedule tests and 9 BeanoSort tests passed**.
+Fakes cover the 10/40 window, free-running/external modes, resume, cancellation,
+early end, settings mismatch, occupied camera, uncertain activation, cleanup and
+live-source priming before camera setup. HTML tests pin the plan without issuing
+commands. Live Chromium checks covered collapsed/unchecked defaults, lazy current
+settings, external-trigger default, native timing validation, replay exclusion,
+listener-error recovery and 1440/768/390 px layouts with no JS errors/overflow.
+Only authenticated GETs and login were used against operational services. The
+existing TestClient deprecation warning remains; PostgreSQL and actual USB
+recording/GPIO timing were not exercised.
+
+The idle machine API and WebGUI were reloaded after verified backups
+`var/backups/training-before-fastcam-schedule-20261118T060824Z.db` and
+`var/backups/machine-journal-before-fastcam-schedule-20261118T060824Z.db`.
+Final machine-only reload brought the reported-settings checks into service.
+Material/configuration/profile hashes, current particles and journal stayed
+unchanged; the actuator was left running and no camera/GPIO/motor command was sent.
+Actual saved crop reads and GUI defaults remained available. Artifacts are under
+ignored `var/qa/fastcam-schedule/`; credentials are unchanged.
+
+Changed components: optional-plan parser/defaults route, preparation template/JS,
+job status display, machine API validation/defaults, separate schedule worker and
+runner lifecycle hooks, fake-device tests and documentation. No schema migration
+or inventory accounting change. Pi recordings remain external and are not joined
+to particle identities. The next concrete check is a supervised opted-in live job
+and inspection of its reported AVI/CSV paths and actual frame timing.
+
+## Saved live bean photographs in chart inspection — 2026-11-18
+
+Saved stereo crops now load alongside RGB swatches when an operator clicks a
+chart interval. The immutable machine `images` events associate run, tracked bean,
+frame and camera. The earliest saved pair is used per track, without changing its
+multi-frame feature aggregate or stock/profile history. Missing images retain a
+label and the available colour evidence. No images are synthesized or substituted.
+
+The machine API adds authenticated, bounded PNG reads for terminal stereo jobs.
+BeanoSort proxies them on demand, outside DB transactions; tokens remain on the
+server. Arbitrary paths, cross-run events, unsupported cameras, active runs, RAW
+downloads, symlink escapes and oversized/non-PNG files are rejected. No capture
+loop, controller or valve logic was changed for photo viewing.
+
+Validation: **15 machine/crop tests and 26 BeanoSort domain/HTML tests passed**.
+The reference browser chain passed with its synthetic fixture. Authenticated live
+Chromium checks loaded actual bean images and RGB swatches from the latest run
+(272 tracks, 261 measured, 262 saved stereo pairs), with no JS errors/overflow at
+1440/768/390 px. No physical run or machine command was sent. Existing TestClient
+deprecation warning remains; PostgreSQL was not rerun.
+
+The idle machine API and WebGUI were restarted; the actuator stayed running.
+Backups: `var/backups/training-before-crop-viewing-20261118T055236Z.db` and
+`var/backups/machine-journal-before-crop-viewing-20261118T055236Z.db`.
+Material/configuration/profile hashes, latest run particles and machine journal
+matched before/after restart. Credentials remain unchanged. Evidence and screenshots
+are under ignored `var/qa/machine-crops/`. RAW-to-crop generation remains outside
+this inspector; historical no-image runs still have no photographs.
 
 ## Live-machine population evidence charts — 2026-11-18
 

@@ -96,7 +96,8 @@ def test_restart_recovers_measured_active_beans(tmp_path):
 
 @pytest.mark.parametrize('start_paused',[False,True])
 @pytest.mark.parametrize('prime_failure',[False,True])
-def test_live_lifecycle_with_fake_devices_pause_keeps_cameras_and_duration_excludes_pause(tmp_path,monkeypatch,start_paused,prime_failure):
+@pytest.mark.parametrize('with_fastcam',[False,True])
+def test_live_lifecycle_with_fake_devices_pause_keeps_cameras_and_duration_excludes_pause(tmp_path,monkeypatch,start_paused,prime_failure,with_fastcam):
     from beanoflight.machine_jobs.provenance import configuration
     import beanoflight.live_source as live
     import beanoflight.analysis as analysis
@@ -108,14 +109,14 @@ def test_live_lifecycle_with_fake_devices_pause_keeps_cameras_and_duration_exclu
     c['maximum_pause_seconds']=10
     class Device:
         instance=None
-        def __init__(self,*a):Device.instance=self;self.owned=False;self.error=None;self.calls=[]
+        def __init__(self,*a):Device.instance=self;self.owned=False;self.error=None;self.calls=[];self.client_id='fake-job'
         def acquire(self):self.owned=True;self.calls.append('acquire')
         def configure(self,b):self.calls.append('configure')
         def verify_configuration(self,b):self.calls.append('verified')
         def feed(self,on):
             if on:assert Source.instance.primed,'Live source must be primed before feeding starts'
             self.calls.append(('feed',on))
-        def api(self,path):self.calls.append(path)
+        def api(self,path,**data):self.calls.append(path)
         def close(self):self.owned=False;self.calls.append('release')
     class Producer:
         instance=None
@@ -152,10 +153,22 @@ def test_live_lifecycle_with_fake_devices_pause_keeps_cameras_and_duration_exclu
     monkeypatch.setattr(calibration.MetricPlaneCalibration,'from_pinkplane',lambda *a,**k:object())
     monkeypatch.setattr(nozzle,'resolve_gate_layout',lambda *a:SimpleNamespace(to_dict=lambda:{}))
     monkeypatch.setattr(measurement,'Measurements',lambda *a:SimpleNamespace(close=lambda:None))
+    class Capture:
+        instance=None
+        def __init__(self,*args):Capture.instance=self;self.prepared=False;self.origin=None;self.finished=False
+        def prepare(self):assert Source.instance.primed;self.prepared=True
+        def begin(self,origin):
+            assert self.prepared
+            if self.origin is None:self.origin=origin
+        def request_stop(self):pass
+        def snapshot(self):return {'state':'test-only'}
+        def finish(self):self.finished=True
+    monkeypatch.setattr(module,'ScheduledCapture',Capture)
     # The runner records the homography hash, even with fake devices.
     pack=Path(c['calibration_pack']);(pack/'geometry').mkdir();(pack/'geometry/homography.json').write_text('{}')
     b={'cameras':{'frame_rate_hz':60}}
     req={'source':'live','image_mode':'none','duration_seconds':.3,'settings':b,'settings_sha256':fingerprint(b),'configuration':configuration(c),'start_paused':start_paused}
+    if with_fastcam:req['fastcam']={'settings':{'external_trigger':True},'trigger':{'mode':'multiple'}}
     s=Store(tmp_path/'journal.db');key=str(uuid4());s.create(key,req);r=Runner(s,key,req,c);r.thread.start()
     if prime_failure:
         r.thread.join(5)
@@ -165,6 +178,7 @@ def test_live_lifecycle_with_fake_devices_pause_keeps_cameras_and_duration_exclu
         assert Source.instance.prime_calls==1 and Source.instance.indices==[] and Source.instance.closed
         assert Producer.instance.closed and Device.instance.calls[-1]=='release'
         assert r.active==0 and s.job(key)['final_sequence'] is not None
+        assert Capture.instance is None  # USB camera never starts after failed source priming.
         return
     def wait(state):
         limit=time.monotonic()+5
@@ -178,8 +192,10 @@ def test_live_lifecycle_with_fake_devices_pause_keeps_cameras_and_duration_exclu
     r.command('resume');wait('running');r.thread.join(6)
     assert r.state=='completed',r.error
     assert .3<=r.active<.4 and r.status()['elapsed_seconds']>.5
-    assert Device.instance.calls[:4]==['acquire','configure','verified',('feed',True)]
+    calls=[item for item in Device.instance.calls if item!='high-speed/config']
+    assert calls[:4]==['acquire','configure','verified',('feed',True)]
     assert ('feed',False) in Device.instance.calls and Device.instance.calls[-1]=='release'
     assert Producer.instance.closed and s.job(key)['final_sequence'] is not None
     assert Source.instance.prime_calls==1 and Source.instance.indices[0]==0 and Source.instance.closed
     assert not list((tmp_path/'jobs'/key).rglob('*.png'))
+    if with_fastcam:assert Capture.instance.prepared and Capture.instance.origin is not None and Capture.instance.finished
