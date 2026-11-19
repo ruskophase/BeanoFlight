@@ -1,0 +1,16 @@
+[Unit]
+Description=Beano Jetson All Pass-through job service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/doceave/Beano/BeanoFlight
+ExecStart=/home/doceave/Beano/BeanoFlight/.venv/bin/python -m beanoflight.machine_jobs.server --config /home/doceave/Beano/BeanoFlight/var/machine-jobs/config.json
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=50
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=default.target

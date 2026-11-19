@@ -1,0 +1,9 @@
+{% extends 'base.html' %}{% from 'macros.html' import tokens %}
+{% block content %}
+<p class="eyebrow">Storage location · revision {{ location.revision }}</p><h1>Edit {{ location.name }}</h1>
+<form class="card" action="/locations/{{ location.id }}/edit" method="post">{{ tokens(csrf) }}
+<input type="hidden" name="revision" value="{{ location.revision }}">
+<label>Location name<input name="name" value="{{ location.name }}" maxlength="200" required></label>
+<p>Renaming updates the displayed location for its containers. Their placement and contents stay recorded under the same identities.</p>
+<div class="actions"><button>Save location changes</button><a class="button secondary" href="/locations/{{ location.id }}">Cancel</a></div>
+</form>{% endblock %}

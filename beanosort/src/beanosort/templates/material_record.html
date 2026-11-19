@@ -1,0 +1,23 @@
+{% extends 'base.html' %}{% from 'macros.html' import portion_link with context %}{% block content %}
+<p class="eyebrow">Material handling · Completed</p><h1>{{ 'Movement recorded' if op.kind == 'contents_move' else 'Weighing recorded' }}</h1>
+<p>{{ op.created_at|localtime }} · <span class="identity">{{ op.id }}</span></p>
+<section class="card">
+{% if op.kind == 'contents_move' %}
+{% set recorded_transfer = record.transfer_basis|default('measured_net_mass') == 'recorded_source_balance' %}
+<p><strong>{{ record.moved_mg|kg }} kg</strong> {{ 'transferred using the recorded source balance; no new weighing' if recorded_transfer else 'measured net transfer' }}.</p>
+<div class="table-wrap"><table><thead><tr><th>Container</th><th>Before</th><th>After</th></tr></thead><tbody>
+<tr><td>Source: <a href="/containers/{{ record.source.container_id }}">{{ record.source.label }}</a></td><td>{{ record.source.mass_mg|kg }} kg recorded</td><td>{{ record.source_after_mg|kg }} kg {{ '— emptied' if record.empty_source else 'calculated remainder' }}</td></tr>
+<tr><td>Destination: <a href="/containers/{{ record.destination.container_id }}">{{ record.destination.label }}</a></td><td>{{ record.destination.mass_mg|kg }} kg recorded</td><td>{{ record.destination_after_mg|kg }} kg {{ 'calculated total' if record.destination.portion_id else 'recorded transfer' if recorded_transfer else 'measured transfer' }}</td></tr></tbody></table></div>
+{% else %}
+<p>Container: <a href="/containers/{{ record.container.container_id }}">{{ record.container.label }}</a></p>
+<p>Previous contents: <strong>{{ record.before_mg|kg }} kg</strong> → Current net contents: <strong>{{ record.after_mg|kg }} kg</strong>.</p>
+<p>Scale reading: {{ record.reading_mg|kg }} kg {{ record.weighing_basis }}{% if record.weighing_basis == 'gross' %}; tare {{ record.container.tare_mg|kg }} kg deducted{% endif %}.</p>
+{% if record.above_nominal_mg %}<p class="notice">The measured contents exceed this container's nominal capacity by {{ record.above_nominal_mg|kg }} kg.</p>{% endif %}
+{% endif %}
+{% if not recorded_transfer|default(false) %}<p>Recorded weight adjustment: <strong>{{ '+' if record.weight_adjustment_mg > 0 else '' }}{{ record.weight_adjustment_mg|kg }} kg</strong>.</p>{% endif %}
+{% if record.reason %}<p>Reason: {{ record.reason }}</p>{% endif %}
+<p class="muted">{% if recorded_transfer|default(false) %}Population evidence is retained when all contributing contents have known evidence.{% else %}{{ 'Population estimates assume representative material.' if record.representative else 'No representative-material assumption was accepted; composition after changed quantities is unknown.' }}{% endif %} Existing quality holds remain in force.</p>
+</section>
+<section class="card"><h2>Resulting contents</h2>{% for output in record.outputs %}<p>{% if output.portion_id %}{{ portion_link(output.portion_id) }} · {{ output.mass_mg|kg }} kg · {{ output.quality }}{% else %}Container recorded empty{% endif %}<br><small>{{ output.mass_basis }}</small></p>{% endfor %}</section>
+<div class="actions"><a class="button" href="{{ '/handling/contents' if op.kind == 'contents_move' else '/handling/reconcile' }}">{{ 'Move more contents' if op.kind == 'contents_move' else 'Weigh another container' }}</a><a class="button secondary" href="/handling">Material handling</a></div>
+{% endblock %}

@@ -1,0 +1,23 @@
+{% extends 'base.html' %}{% from 'macros.html' import tokens,operation_note with context %}{% block content %}
+<p class="eyebrow">Sorting / Paused workflow</p><h1>Change output containers</h1>
+<span class="identity">{{ op.id }}</span>{{ operation_note(op.id) }}
+{% with fill_heading='Current container fill' %}{% include 'job_fill_bars.html' %}{% endwith %}
+{% if machine_job %}<p class="notice">The machine has confirmed its feed pause and measurement drain. Its numerical journal is synchronized. Keep feeding paused while changing containers, then resume from the job page.</p>{% else %}<p class="notice">This page records workflow state. Use the existing machine controls to stop feeding and clear beans already in flight into the current bins before removing them. BeanoSort sends no stop/resume command.</p>{% endif %}
+<p>Keep either current container, or replace one or both. Unchanged bins continue the same collection. Removed bins remain reserved until reconciliation and cannot be reused in this job. Recipe: <strong>{{ recipe.name }} v{{ recipe.version }}</strong>.</p>
+<p>Continue feeding only the reserved source <a href="/containers/{{ source_container.id }}">{{ source_container.label }}</a>. Another source population needs a separately recorded job/input.</p>
+<form action="/jobs/{{ op.id }}/change-containers" method="post" class="card" data-hopper-emptying="{{ 'true' if hopper_emptying else 'false' }}" data-source-container="{{ source_container.id }}">{{ tokens(csrf) }}
+<div class="grid two">{% for stream,title in [('selected','Selected'),('pass_through','Pass-through')] %}{% if stream != 'selected' or not hopper_emptying %}
+<label>{{ title }} container<select name="{{ stream }}_id" required data-sort-destination>
+<option value="{{ bindings[stream].id }}" selected>{{ container_description(bindings[stream]) }} · keep current collection</option>
+{% for c in candidates %}<option value="{{ c.id }}">{{ container_description(c) }}</option>{% endfor %}
+</select></label>{% endif %}{% endfor %}</div>
+{% if machine_job %}<p>The new collection begins at the next machine bean ordinal. Earlier measurements remain with their original container.</p>{% elif simulation %}<p>The boundary uses the last committed simulation particle sequence. Replay does not move previous particles to replacement bins.</p>{% else %}
+<p>Use a local sorter sequence only when it was recorded at the cleared boundary. Leave it blank if unavailable: bin-level composition/counts will remain unknown. Server receipt time is not a machine boundary.</p>
+<div class="grid two"><label>First local particle sequence after change (optional)<input name="first_sequence" type="number" min="0"></label><label>Recorded local boundary time with timezone (optional)<input name="source_at" placeholder="2026-11-13T12:00:00+02:00"></label></div>{% endif %}
+<label class="check"><input name="capacity_override" type="checkbox">Allow a replacement already at or above nominal capacity. Resuming explicitly overrides its current fill threshold.</label>
+<label>Reason<input name="reason" required value="Output container full; replacement in place"></label>
+<label class="check"><input name="feeding_stopped" type="checkbox" required>Feeding has been stopped using the machine controls.</label>
+<label class="check"><input name="in_flight_clear" type="checkbox" required>Beans already in flight have cleared into the current containers.</label>
+<label class="check"><input name="ready" type="checkbox" required>Destination containers are in place and ready to accept sorting outputs.</label>
+<button>Record replacements</button><p>The job remains paused for review. Resume after the replacements are physically ready.</p></form>
+<p><a href="/jobs/{{ op.id }}">Return to paused job</a></p>{% endblock %}

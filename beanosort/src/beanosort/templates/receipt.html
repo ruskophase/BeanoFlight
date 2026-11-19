@@ -1,0 +1,11 @@
+{% extends 'base.html' %}{% from 'macros.html' import history as show_history, portion_link, portion_note with context %}
+{% block content %}
+<p class="eyebrow">Receipt recorded</p><h1>Beans received into stock</h1>
+<p>{{ loads|length }} container{{ '' if loads|length == 1 else 's' }} · <strong>{{ (operation.boundary_mg|kg) if operation.boundary_mg % 1000 else (operation.boundary_mg|kg3) }} kg</strong> net beans received.</p>
+<p class="identity">{{ receipt.id }} · Source lot {{ receipt.source_lot_id }}</p>
+<section class="card"><h2>Source details</h2><dl>{% for field in ['supplier','supplier_lot','origin','bean_type','purchase_date','received_date','notes'] %}<dt>{{ field|replace('_',' ')|title }}</dt><dd>{{ receipt[field] or 'Unknown' }}</dd>{% endfor %}</dl></section>
+<section class="card"><h2>Received containers</h2><div class="table-wrap"><table><thead><tr><th>Container</th><th>Net beans received</th><th>Current location</th><th>Contents</th></tr></thead><tbody>
+{% for row in loads %}<tr><td>{% if row.container %}<a href="/containers/{{ row.container.id }}">{{ row.container.label }}</a>{% else %}See portion history{% endif %}</td><td>{{ (row.link.mass_mg|kg) if row.link.mass_mg % 1000 else (row.link.mass_mg|kg3) }} kg</td><td>{% if row.container and not row.container.deleted %}<a href="/locations/{{ row.container.location_id }}">{{ row.container.location }}</a>{% else %}Removed from service{% endif %}</td><td>{{ portion_link(row.portion.id) }}<small>{{ row.portion.status }} · {{ row.portion.quality }}</small></td></tr>{% endfor %}
+</tbody></table></div><p>Particle count, composition, dimensions, moisture and other bean properties remain unknown until further evidence is recorded. Net mass was entered from the scale after each empty container was zeroed.</p></section>
+<div class="actions"><a class="button" href="/">View stock</a><a class="button secondary" href="/receive">Receive more beans</a></div>
+{{ show_history(history) }}{% endblock %}

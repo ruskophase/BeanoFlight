@@ -1,0 +1,9 @@
+[Unit]
+Description=Forward historical job requests from the Pi to their original Jetson
+Requires=beanosort-legacy-jobs.socket
+After=beanosort-legacy-jobs.socket
+
+[Service]
+EnvironmentFile=%h/Beano/BeanoFlight/beanosort/var/testing.env
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=60s ${BEANOSORT_LEGACY_JETSON}
+NoNewPrivileges=yes

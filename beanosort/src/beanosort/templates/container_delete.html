@@ -1,0 +1,20 @@
+{% extends 'base.html' %}{% from 'macros.html' import tokens %}
+{% block content %}
+<p class="eyebrow">Container management</p><h1>Delete {{ container.label }}</h1>
+<p class="identity">{{ container.id }}</p>
+<section class="card">
+{% if usage.occupied %}
+<p class="notice">This container contains recorded material ({{ usage.mass_mg|kg }} kg). Move or account for its contents before deleting the container.</p>
+{% elif usage.locked %}
+<p class="notice">This container is reserved or in an active job. Finish the job or delete its unstarted preparation before deleting the container.</p>
+{% else %}
+<p>Delete this empty container from the register. Its material history and old labels will remain traceable.</p>
+<form action="/containers/{{ container.id }}/delete" method="post">{{ tokens(csrf) }}
+<input type="hidden" name="revision" value="{{ container.revision }}">
+<label class="check"><input name="confirmed" type="checkbox" required>I confirm this container is physically empty and should be deleted.</label>
+<button class="danger">Delete container</button>
+</form>
+{% endif %}
+<p><a href="/containers/{{ container.id }}">Back to container</a> · <a href="/containers">All containers</a></p>
+</section>
+{% endblock %}

@@ -1,0 +1,42 @@
+{% extends 'base.html' %}
+{% from 'macros.html' import tokens %}
+{% block content %}
+<p class="eyebrow">Configuration / assumptions</p><h1>Simulation Settings</h1>
+<p>Set the mean mass used to estimate input particles and the probability that a targeted bean reaches Selected. Changes apply to new jobs. Earlier jobs and accepted receipt estimates retain their original settings.</p>
+{% if current %}
+<div class="metrics">
+  <div><small>Assumed mean bean mass</small><strong>{{ current.mean_mass_g }} g</strong><small>{{ current.record.material_label }}</small></div>
+  <div><small>Sorting realization rate</small><strong>{{ current.capture_percent }}%</strong><small>Assumed capture probability</small></div>
+  <div><small>Estimated particles / kg</small><strong>≈ {{ current.per_kg|integer }}</strong><small>Calculated prediction, not a census</small></div>
+</div>
+<section class="card"><h2>Current defaults · version {{ current.record.version }}</h2>
+<p>Estimated particles = net mass in grams ÷ assumed mean bean mass in grams. At these settings, 20 kg gives approximately <strong>{{ current.per_20kg|integer }} particles</strong>.</p>
+{% if user.role == 'admin' %}
+<form action="/simulation-settings" method="post">{{ tokens(csrf) }}
+<input type="hidden" name="previous_id" value="{{ current.record.id }}">
+<div class="grid three">
+  <label>Material described by this mean<input name="material_label" value="{{ current.record.material_label }}" maxlength="120" required></label>
+  <label>Mean bean mass (g)<input name="mean_mass_g" type="number" min="0.000001" max="1000" step="0.000001" value="{{ current.mean_mass_g }}" required></label>
+  <label>Sorting realization rate (%)<input name="capture_percent" type="number" min="0" max="100" step="0.0001" value="{{ current.capture_percent }}" required></label>
+</div>
+<label>Reason / source for these assumptions<textarea name="reason" maxlength="2000" placeholder="For example: representative 100-bean sample weighed 15.8 g; use 0.158 g per bean" required></textarea></label>
+<button>Save new settings version</button>
+</form>
+{% else %}<p>An administrator can save a new settings version.</p>{% endif %}
+</section>
+{% else %}<p class="notice">Simulation settings have not been initialized. Run the documented BeanoSort init command after migration.</p>{% endif %}
+<section class="card"><h2>What these values mean</h2>
+<p><strong>99% capture probability</strong> means a targeted bean has a 99% chance of reaching Selected and a 1% chance of continuing into Pass-through. A seeded simulation draws one outcome per bean. It does not force exactly one miss per hundred. Intentionally passed beans stay in Pass-through.</p>
+<p>Expected profiles use fractional counts from this probability. Simulated outcomes remain synthetic. Neither changes recorded mass nor confirms a physical capture. This setting does not change real machine controls or the capture model of an existing job.</p>
+<p>The mean is specific to the material described above. New simulated runs use the intended processing mass to estimate their particle count, rounded to the nearest integer. Receiving records net mass and source details; particle count and other bean properties remain unknown at that stage. A smaller test count can be entered explicitly when starting a simulation.</p>
+</section>
+<section class="card"><h2>Basis for the initial 0.15 g green coffee assumption</h2>
+<p>{{ research_note }}</p>
+<ul>{% for source in research %}<li><a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{{ source.title }}</a> — {{ source.finding }}</li>{% endfor %}</ul>
+<p>Research informs the initial mass assumption. The 99% capture rate is an operating assumption requested for testing, not a measured result from these studies.</p>
+</section>
+<section class="card"><h2>Settings history</h2><div class="table-wrap"><table>
+<thead><tr><th>Version</th><th>Material / mean</th><th>Capture probability</th><th>Recorded</th><th>Reason</th></tr></thead>
+<tbody>{% for entry in settings_history %}<tr id="{{ entry.record.id }}"><td>v{{ entry.record.version }}</td><td>{{ entry.record.material_label }} · {{ entry.mean_mass_g }} g</td><td>{{ entry.capture_percent }}%</td><td>{{ entry.record.created_at|localtime }}<small>{{ entry.record.operator_id }}</small></td><td>{{ entry.record.reason }}</td></tr>{% endfor %}</tbody>
+</table></div></section>
+{% endblock %}

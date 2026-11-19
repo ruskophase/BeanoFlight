@@ -1,0 +1,10 @@
+{
+  "capture_core.py": {
+    "before": "e431de61688134b2ce475b3ac36da4483059d7d82734d7b17c312ec5bfd9f96c",
+    "after": "9bc577233e8f7b99c5a553e44ad1dfa2e415014f40bd2635e15de908040bddd7"
+  },
+  "controller.py": {
+    "before": "866d00fff4b0bc827ef1bc8c0ff8ad37688e71f3374c1601c25412dc2dc30eca",
+    "after": "ea55ff1111218a0159fb66a822cbd6ecec965b9a89f5fa71e6f7c9ff5808e3c1"
+  }
+}

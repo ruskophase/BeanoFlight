@@ -1,0 +1,17 @@
+{% extends 'base.html' %}{% from 'macros.html' import tokens %}
+{% block content %}
+<p class="eyebrow">Sorting configuration</p><h1>Sorting recipes</h1>
+<p>Inspect designed recipes, their reference populations and exact selection thresholds. Each saved version stays fixed for the jobs that use it.</p>
+<section class="card"><h2>Recipe catalogue</h2><div class="table-wrap"><table><thead><tr><th>Recipe</th><th>Version</th><th>Selection rule</th><th>Use</th></tr></thead><tbody>
+{% for recipe in recipes %}<tr><td><a href="/recipes/{{ recipe.id }}">{{ recipe.name }}</a></td><td>{{ recipe.version }}</td><td>{% if recipe.data.operation_mode == 'hopper_emptying' %}All beans to Pass-through · No Selected container{% elif recipe.data.schema == 'beanosort-reference-recipe/v1' %}{{ recipe.data.statistics.title }} · {{ recipe.data.relation }} · {{ recipe.data.sigma }}σ from median{% else %}Legacy fixture / recorded configuration{% endif %}</td><td>{{ 'Reference-data simulation' if recipe.data.execution_scope == 'simulation_only' else 'Legacy configuration' }}</td></tr>{% else %}<tr><td colspan="4">No recipes yet.</td></tr>{% endfor %}
+</tbody></table></div></section>
+<section class="card"><h2>Reference populations</h2>{% for dataset in datasets %}<div class="job-row"><strong>{{ dataset.name }}</strong><span>{{ dataset.metadata_json.bean_count|integer }} distinct tracked beans · {{ dataset.metadata_json.sample_count|integer }} stereo samples · {{ dataset.metadata_json.representative_photo_count|integer }} representative photos</span></div>{% else %}<p>No reference dataset has been registered yet.</p>{% endfor %}<p class="muted">Reference measurements describe archived beans. Sampling these records creates an isolated synthetic population; it does not measure the current container.</p></section>
+{% if user.role == 'admin' and datasets %}<section class="card"><h2>Design a recipe version</h2><form action="/recipes" method="post">{{ tokens(csrf) }}
+<label>Recipe name<input name="name" required maxlength="120" placeholder="e.g. Dark outliers"></label>
+<div class="grid two"><label>Reference population<select name="dataset_id">{% for dataset in datasets %}<option value="{{ dataset.id }}">{{ dataset.name }}</option>{% endfor %}</select></label>
+<label>Property<select name="feature">{% for key,spec in metrics.items() %}<option value="{{ key }}">{{ spec.title }} · {{ spec.unit }}</option>{% endfor %}</select></label>
+<label>Select beans<select name="relation"><option value="below">Below median minus nσ</option><option value="above">Above median plus nσ</option><option value="within">Within median ± nσ</option><option value="outside">Outside median ± nσ</option></select></label>
+<label>Standard-deviation multiplier<input name="sigma" type="number" min="0.001" max="10" step="0.001" value="2" required></label></div>
+<p>σ is the population standard deviation (ddof=0) of the known reference values. Comparisons are strict. Missing values remain unresolved. Saving the same recipe name creates another version.</p><button>Save new recipe version</button>
+</form></section>{% endif %}
+{% endblock %}

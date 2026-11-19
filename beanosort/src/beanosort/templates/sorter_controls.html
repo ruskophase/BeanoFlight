@@ -1,0 +1,14 @@
+{% extends 'base.html' %}{% from 'macros.html' import tokens %}{% block content %}
+<p class="eyebrow">Machine / Manual operation</p><h1>Sorter Controls</h1>
+<p class="notice">These controls operate the physical machine, including when the inventory is in simulation mode. Take control in the panel below to operate its outputs. Closing this page releases control and stops outputs.</p>
+<section class="card"><h2>Machine connection</h2>
+{% if user.role in ['admin','supervisor'] %}
+<form action="/sorter-controls/connection" method="post">{{ tokens(csrf) }}<input type="hidden" name="connection_id" value="{{ connection.id }}">
+<div class="grid two"><label>Machine IP address or hostname<input name="host" value="{{ connection.host }}" required maxlength="253" autocomplete="off"></label><label>Port<input name="port" type="number" min="1" max="65535" step="1" value="{{ connection.port }}" required></label></div>
+<button>Save connection</button></form>
+{% else %}<p>Machine: {{ connection.host }} · port {{ connection.port }}. An administrator or supervisor can change this connection.</p>{% endif %}
+<p class="muted">Machine service: {{ connection.url }}. The address is reached from the BeanoSort server. Release control before changing it.</p>
+</section>
+<p>After manual preparation, release control here, then <a href="/jobs/new">prepare an All Pass-through job</a>. Machine jobs keep control independently of the browser and stop feeding at their specified duration.</p><iframe class="sorter-controls-frame" src="/sorter-controls/panel" title="Manual sorter control panel" data-sorter-frame></iframe>
+<script src="/static/sorter_controls_frame.js" defer></script>
+{% endblock %}

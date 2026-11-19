@@ -1,0 +1,27 @@
+{% extends 'base.html' %}
+{% from 'macros.html' import tokens with context %}
+{% from 'material_form.html' import choices with context %}
+{% block content %}
+<p class="eyebrow">Material handling · Packaging desk</p><h1>Package as product</h1>
+{% if environment == 'simulation' %}<p class="notice">Isolated simulation: enter the scale reading represented by this training operation.</p>{% endif %}
+<form class="card" method="post" action="/handling/package" data-material-form="product_packaging">{{ tokens(csrf) }}
+{% for row in rows %}<input type="hidden" name="state_{{ row.container.id }}" value="{{ row.token }}">{% endfor %}
+<p>Package the desired contents for sale, then weigh either the contents removed or what remains in the source container. The packaged mass is recorded as <strong>Final product</strong> leaving inventory.</p>
+<p><strong>Station:</strong> Packaging desk. Individual packets and their quantities are not tracked.</p>
+<label>Source container<select name="container_id" required>{{ choices(true) }}</select></label>
+<div class="grid two">
+<label>Scale reading reflects<select name="weighing_basis"><option value="gross">Container + remaining contents (gross)</option><option value="net">Remaining contents only (net, scale already tared)</option><option value="removed">Mass of contents removed</option></select></label>
+<label>Scale reading<input name="weight" type="number" inputmode="decimal" min="0" step="0.000001" required></label>
+</div>
+<p class="muted">Enter readings in kilograms (kg). For Mass of contents removed, weigh only the removed contents with any packaging tared; the source container does not need weighing. For an empty source container, use its tare in gross mode, zero in remaining-net mode, or the full removed mass.</p>
+<section class="prediction" data-material-preview role="status" aria-live="polite"><p>Choose a source container and enter the scale reading to review the final-product mass.</p></section>
+<label>Packaging notes (optional)<textarea name="reason" rows="2" maxlength="2000" placeholder="Any observations about this packaging"></textarea></label>
+<details data-population-assumption><summary>Population estimates for remaining contents</summary>
+<label class="check"><input name="representative" type="checkbox" checked>Assume the remaining contents are representative of the source.</label>
+<p>Existing population evidence and photographs are retained as estimates for the remaining mass. Clear this for selective packaging; the remaining composition will be recorded as unknown. Weighing does not identify individual beans.</p></details>
+<p class="muted">Record final product confirms packaging and the selected weighing are complete. All removed mass is attributed to final product. Use Reconciliation separately for spills or weight corrections; do not record this packaging removal twice. Material on quality hold or committed to active jobs is unavailable.</p>
+<button>Record final product</button>
+</form>
+<p><a href="/handling">Back to material handling</a></p>
+<script src="/static/material.js" defer></script>
+{% endblock %}

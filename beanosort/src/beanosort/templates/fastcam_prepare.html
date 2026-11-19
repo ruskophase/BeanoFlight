@@ -1,0 +1,17 @@
+<details data-fastcam-options><summary>Optional FastCamUSB recording</summary>
+<p>Prefill from the latest Waveform Generator camera settings. External triggering starts selected. Nothing is applied until you start this live job.</p>
+<p data-fastcam-message role="status">Expand to load the current camera settings.</p><button type="button" class="secondary" data-fastcam-reload>Reload current GUI settings</button>
+<label class="check"><input type="checkbox" name="fastcam_enabled" disabled>Record with FastCamUSB during this job</label>
+<fieldset data-fastcam-fields disabled><legend>USB camera recording window</legend>
+<div class="grid two"><label>Start + seconds<input name="fastcam_start_seconds" type="number" min="0" max="1800" step="0.001" value="10" required></label><label>End + seconds<input name="fastcam_end_seconds" type="number" min="0.001" max="1800" step="0.001" value="40" required></label></div>
+<p class="muted">Elapsed seconds after feeding first starts, including pauses. +10 to +40 requests 30 seconds. The window must fit within the planned feeding duration; END or STOP can cut it short. Actual acknowledgements and file paths are recorded separately.</p>
+<div class="grid three"><label>Resolution<select name="fastcam_width" required><option value="1280">1280 × 720</option><option value="640">640 × 480</option></select></label>
+<label>Stream / AVI playback rate (fps)<input name="fastcam_fps" type="number" min="1" max="200" step="any" required></label>
+<label>Exposure (µs)<input name="fastcam_exposure_us" type="number" min="100" max="100000" step="100" required></label>
+<label>Preview rate (fps)<input name="fastcam_preview_fps" type="number" min="1" max="60" step="1" required></label>
+<label>Device (blank = automatic)<input name="fastcam_device" maxlength="4096"></label><label>Output folder on Raspberry Pi<input name="fastcam_output_folder" maxlength="4096" required></label></div>
+<label class="check"><input name="fastcam_external_trigger" type="checkbox" checked>External triggering</label>
+<label class="check"><input name="fastcam_disable_preview" type="checkbox">Disable preview</label><label class="check"><input name="fastcam_disable_preview_during_recording" type="checkbox">Disable preview during recording</label>
+<fieldset data-fastcam-trigger><legend>GPIO33 trigger settings from Waveform Generator</legend><p>External recording enables this output for the recording window, then disables it. Timing is configured before paired-camera startup.</p>
+<div class="grid three"><label>Trigger mode<select name="fastcam_trigger_mode"><option value="multiple">Multiple of paired-camera rate</option><option value="fixed">Fixed rate</option></select></label><label>Rate multiplier<input name="fastcam_trigger_multiplier" type="number" min="1" max="16" step="1" required></label><label>Fixed rate (Hz)<input name="fastcam_trigger_fixed_frequency_hz" type="number" min="1" max="199.999" step="any" required></label><label>Trigger pulse (µs)<input name="fastcam_trigger_pulse_us" type="number" min="1" max="1000000" step="1" required></label></div><label class="check"><input name="fastcam_trigger_illumination" type="checkbox">Shared illumination at trigger rate</label></fieldset>
+</fieldset></details><script src="/static/fastcam_prepare.js" defer></script>

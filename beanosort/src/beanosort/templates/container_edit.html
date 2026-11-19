@@ -1,0 +1,20 @@
+{% extends 'base.html' %}{% from 'macros.html' import tokens %}
+{% block content %}
+<p class="eyebrow">Container details · revision {{ container.revision }}</p>
+<h1>Edit {{ container.label }}</h1>
+<p class="identity">{{ container.id }}</p>
+<form class="card" action="/containers/{{ container.id }}/edit" method="post">{{ tokens(csrf) }}
+<input type="hidden" name="revision" value="{{ container.revision }}">
+<div class="grid two">
+<label>Name / human-readable label<input name="label" value="{{ container.label }}" maxlength="120" required></label>
+{% if locations is defined %}<label>Storage location<select name="location_id" required>{% for place in locations %}<option value="{{ place.id }}"{% if place.id == container.location_id %} selected{% endif %}>{{ place.name }}</option>{% endfor %}</select></label>{% else %}<label>Location<input name="location" value="{{ container.location }}" maxlength="200" required></label>{% endif %}
+<label>Vessel type<input name="kind" value="{{ container.kind }}" maxlength="40" list="vessel-types" required><datalist id="vessel-types"><option value="bin"><option value="bag"><option value="hopper"><option value="tote"></datalist></label>
+<label>Container tare weight (kg)<input name="tare_mass" type="number" min="0.000001" step="0.000001" value="{{ container.tare_mg|kg if container.tare_mg is not none else '' }}" required></label>
+<label>Material capacity (kg)<input name="capacity" type="number" min="0.000001" step="0.000001" value="{{ container.capacity_mg|kg if container.capacity_mg is not none else '' }}" required></label>
+</div>
+{% if usage.occupied %}<p>Current material: {{ usage.mass_mg|kg }} kg. Capacity must cover this net material mass.</p>{% endif %}
+<p class="muted">Tare is the empty container's weight. Capacity is nominal net material mass. Changes are recorded in history; existing material measurements retain their recorded tare basis.</p>
+<label>Edit notes (optional)<input name="reason" maxlength="2000"></label>
+<div class="actions"><button>Save container changes</button><a class="button secondary" href="/containers/{{ container.id }}">Cancel</a></div>
+</form>
+{% endblock %}

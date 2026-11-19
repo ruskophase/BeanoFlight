@@ -14,12 +14,18 @@ from .background import BackgroundProvenance
 from .calibration import MetricPlaneCalibration
 from .detection import BeanDetector
 from .events import EventBus
-from .models import FrameAnalysis, Observation
+from .models import AnalysisTimings, BeanRef, FrameAnalysis, Observation
+from .nozzle_map import resolve_gate_layout
 from .prediction import GateLayout, TrajectoryPredictor
+from .registry_models import prediction_to_dict
 from .source import RecordingVideoSource
 from .tracking import TrackerSettings, TrackManager
 
 ProgressCallback = Callable[[int, int, FrameAnalysis], None]
+PositionMapper = Callable[[tuple[float, float]], tuple[float, float]]
+PositionsMapper = Callable[
+    [tuple[tuple[float, float], ...]], tuple[tuple[float, float], ...]
+]
 
 
 class RegistryWriter(Protocol):
@@ -35,6 +41,7 @@ class AnalysisRun:
     background: BackgroundProvenance = field(
         default_factory=lambda: BackgroundProvenance("unspecified", ())
     )
+    nozzle_layout: dict = field(default_factory=dict)
 
     @property
     def mean_processing_ms(self) -> float:
@@ -59,16 +66,28 @@ class AnalysisEngine:
         *,
         tracker_settings: TrackerSettings | None = None,
         gate_layout: GateLayout | None = None,
+        nozzle_map_path: Path | None = None,
         events: EventBus | None = None,
         registry: RegistryWriter | None = None,
+        position_mapper: PositionMapper | None = None,
+        positions_mapper: PositionsMapper | None = None,
     ) -> None:
         self.calibration = calibration
         self.detector = detector
         self.background_bgr = background_bgr
         self.tracker_settings = tracker_settings or TrackerSettings()
-        self.gate_layout = gate_layout or GateLayout(calibration.sorting_line_y())
+        if gate_layout is not None and nozzle_map_path is not None:
+            raise ValueError(
+                "Supply either a resolved layout or a nozzle map, not both"
+            )
+        self.gate_layout = gate_layout or resolve_gate_layout(
+            calibration, nozzle_map_path
+        )
         self.events = events
         self.registry = registry
+        self.position_mapper = position_mapper or calibration.pixel_to_mm
+        self.positions_mapper = positions_mapper
+        self.last_registry_revisions: dict[BeanRef, int] = {}
         self.tracker = TrackManager(
             top_y_mm=calibration.top_y_mm,
             bottom_y_mm=calibration.bottom_y_mm,
@@ -84,47 +103,90 @@ class AnalysisEngine:
             ),
         )
 
-    def process(self, frame_bgr, frame_index: int, timestamp_ns: int) -> FrameAnalysis:
+    def process(
+        self,
+        frame_bgr,
+        frame_index: int,
+        timestamp_ns: int,
+        *,
+        on_tracked: Callable[[FrameAnalysis], None] | None = None,
+    ) -> FrameAnalysis:
         started = time.perf_counter_ns()
         detection_result = self.detector.detect(frame_bgr, self.background_bgr)
+        detection_finished = time.perf_counter_ns()
+        centroids = tuple(
+            detection.centroid_px for detection in detection_result.detections
+        )
+        positions = (
+            self.positions_mapper(centroids)
+            if self.positions_mapper is not None
+            else tuple(self.position_mapper(point) for point in centroids)
+        )
+        if len(positions) != len(detection_result.detections):
+            raise ValueError("batch coordinate mapper returned the wrong point count")
         observations = tuple(
             Observation(
                 frame_index=frame_index,
                 timestamp_ns=timestamp_ns,
                 detection=detection,
-                position_mm=self.calibration.pixel_to_mm(detection.centroid_px),
+                position_mm=position_mm,
             )
-            for detection in detection_result.detections
+            for detection, position_mm in zip(detection_result.detections, positions)
         )
+        mapping_finished = time.perf_counter_ns()
         tracks = self.tracker.update(observations, timestamp_ns)
+        tracking_finished = time.perf_counter_ns()
+        if on_tracked is not None:
+            on_tracked(
+                FrameAnalysis(
+                    frame_index,
+                    timestamp_ns,
+                    detection_result.detections,
+                    self.tracker.last_rejections,
+                    tracks,
+                    (),
+                    (tracking_finished - started) / 1_000_000.0,
+                )
+            )
+        crop_finished = time.perf_counter_ns()
         predictions = tuple(
             prediction
             for track in tracks
             if (prediction := self.predictor.predict(track)) is not None
         )
+        prediction_finished = time.perf_counter_ns()
         if self.registry is not None:
             prediction_by_ref = {
                 prediction.bean_ref: prediction for prediction in predictions
             }
-            self.registry.update_tracks(
-                tuple(
-                    (
-                        track,
-                        prediction_by_ref.get(track.bean_ref),
-                        ":".join(
-                            (
-                                "track",
-                                track.bean_ref.run_id,
-                                str(track.bean_ref.sequence),
-                                str(frame_index),
-                                track.status.value,
-                            )
-                        ),
-                    )
-                    for track in tracks
+            updates = tuple(
+                (
+                    track,
+                    prediction_by_ref.get(track.bean_ref),
+                    ":".join(
+                        (
+                            "track",
+                            track.bean_ref.run_id,
+                            str(track.bean_ref.sequence),
+                            str(frame_index),
+                            track.status.value,
+                        )
+                    ),
                 )
+                for track in tracks
             )
-        processing_ms = (time.perf_counter_ns() - started) / 1_000_000.0
+            compact_update = getattr(self.registry, "update_track_revisions", None)
+            if compact_update is None:
+                records = self.registry.update_tracks(updates)
+                self.last_registry_revisions = {
+                    record.bean_ref: record.revision for record in records
+                }
+            else:
+                self.last_registry_revisions = compact_update(updates)
+        else:
+            self.last_registry_revisions = {}
+        finished = time.perf_counter_ns()
+        processing_ms = (finished - started) / 1_000_000.0
         return FrameAnalysis(
             frame_index=frame_index,
             timestamp_ns=timestamp_ns,
@@ -133,6 +195,14 @@ class AnalysisEngine:
             tracks=tracks,
             predictions=predictions,
             processing_ms=processing_ms,
+            timings=AnalysisTimings(
+                detection_ms=(detection_finished - started) / 1_000_000.0,
+                coordinate_mapping_ms=(mapping_finished - detection_finished)
+                / 1_000_000.0,
+                tracking_ms=(tracking_finished - mapping_finished) / 1_000_000.0,
+                prediction_ms=(prediction_finished - crop_finished) / 1_000_000.0,
+                registry_ms=(finished - prediction_finished) / 1_000_000.0,
+            ),
         )
 
 
@@ -161,6 +231,7 @@ def analyse_source(
         exact_timestamps=source.metadata.exact_timestamps,
         frames=tuple(frames),
         background=background_provenance or BackgroundProvenance("unspecified", ()),
+        nozzle_layout=engine.gate_layout.to_dict(),
     )
 
 
@@ -172,6 +243,7 @@ def export_run_json(run: AnalysisRun, path: Path) -> None:
         "run_id": run.run_id,
         "source_path": str(run.source_path),
         "exact_timestamps": run.exact_timestamps,
+        "nozzle_layout": run.nozzle_layout,
         "background": {
             "method": run.background.method,
             "frame_indices": list(run.background.frame_indices),
@@ -214,6 +286,7 @@ def _frame_json(frame: FrameAnalysis) -> dict[str, object]:
         "predictions": [
             {
                 "bean_id": str(prediction.bean_ref),
+                "prediction": prediction_to_dict(prediction),
                 "line_y_mm": prediction.line_y_mm,
                 "crossing_timestamp_ns": prediction.crossing_timestamp_ns,
                 "x_mean_mm": prediction.x_mean_mm,
