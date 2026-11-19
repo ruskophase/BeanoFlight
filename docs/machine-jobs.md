@@ -154,6 +154,9 @@ this new journal is the authoritative numerical export for these jobs.
 
 ## Deployment
 
+For a Pi-hosted BeanoSort WebGUI and a Jetson-hosted sorter, see the
+[Pi deployment and cutover guide](deployment/beanosort-pi.md).
+
 Jetson: use the existing BeanoFlight Python environment. Run
 `python -m beanoflight.machine_jobs.server --config /absolute/path/config.json`.
 See `deployment/machine-jobs-config.example.json` and the systemd service example.

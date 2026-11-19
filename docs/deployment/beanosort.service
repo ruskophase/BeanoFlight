@@ -1,0 +1,14 @@
+[Unit]
+Description=BeanoSort inventory and workflow WebGUI
+After=network.target
+
+[Service]
+WorkingDirectory=%h/Beano/BeanoFlight/beanosort
+EnvironmentFile=%h/Beano/BeanoFlight/beanosort/var/testing.env
+ExecStart=%h/Beano/BeanoFlight/beanosort/.venv/bin/uvicorn beanosort.web:create_app --factory --host 0.0.0.0 --port 8090
+UMask=0077
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
